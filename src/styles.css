@@ -1,0 +1,527 @@
+/* LivePatch shell styles. Canvas visuals are theme-driven (src/ui/theme.ts);
+   this file only styles the DOM chrome: docks, panels, menus, modals. */
+:root {
+  --bg: #14161a;
+  --panel: #1d2026;
+  --panel2: #23272f;
+  --border: #343a45;
+  --text: #d6dae2;
+  --text-dim: #8b93a1;
+  --accent: #4da3ff;
+  --danger: #ff5d5d;
+  /* Application chrome scale — see src/ui/uiscale.ts. */
+  --ui-scale: 1;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; overflow: hidden; }
+body { background: var(--bg); color: var(--text); user-select: none; }
+
+/* Zoom scales layout, text and hit areas as one unit. Percentages inside a
+   zoomed element already resolve in its zoomed space, so 100% is exactly one
+   viewport — compensating for the zoom here would shrink the shell twice. */
+#app { display: flex; flex-direction: column; zoom: var(--ui-scale); }
+#topbar {
+  display: flex; align-items: center; gap: 2px; padding: 4px 8px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  flex: 0 0 auto; z-index: 20;
+}
+#workspace { display: flex; flex: 1 1 auto; min-height: 0; }
+#center { position: relative; flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+/* touch-action:none — the canvas handles its own pan/zoom/long-press via
+   pointer events; without this the browser eats touch drags as scroll/zoom.
+   overscroll-behavior:none stops a stray swipe from navigating/bouncing. */
+#canvas { flex: 1 1 auto; display: block; width: 100%; height: 100%; outline: none; touch-action: none; overscroll-behavior: none; }
+
+#breadcrumb {
+  position: absolute; top: 8px; left: 10px; z-index: 5; display: flex; gap: 4px;
+  align-items: center; pointer-events: auto;
+}
+.crumb {
+  background: rgba(30, 34, 41, 0.9); border: 1px solid var(--border); border-radius: 4px;
+  padding: 3px 10px; cursor: pointer; color: var(--text-dim);
+}
+.crumb:hover { color: var(--text); border-color: var(--accent); }
+.crumb.current { color: var(--text); font-weight: 600; cursor: default; }
+.crumb-sep { color: var(--text-dim); }
+
+#statusbar {
+  position: absolute; bottom: 6px; left: 10px; z-index: 5;
+  background: rgba(30, 34, 41, 0.85); border: 1px solid var(--border);
+  border-radius: 4px; padding: 3px 10px; color: var(--text-dim); pointer-events: none;
+}
+#statusbar .dirty { color: #ffc44d; }
+#statusbar .saved { color: #6fd48a; }
+
+/* ---- Top bar ---- */
+.tb-btn {
+  background: none; border: 1px solid transparent; color: var(--text); padding: 4px 10px;
+  border-radius: 4px; cursor: pointer; font: inherit;
+}
+.tb-btn:hover { background: var(--panel2); border-color: var(--border); }
+.tb-btn.active { background: var(--panel2); border-color: var(--accent); color: var(--accent); }
+.tb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
+.tb-title { font-weight: 700; letter-spacing: 0.5px; margin-right: 10px; color: var(--accent); }
+.tb-spacer { flex: 1; }
+
+/* ---- Dock zones & panels ---- */
+/* min-width/height 0: a flex item defaults to min-content sizing, which would
+   let a dock refuse to shrink and squeeze the canvas away — most visible at a
+   large UI scale, where the docks are magnified but the display is not. */
+.dock-zone { display: flex; flex: 0 0 auto; background: var(--bg); z-index: 10; min-width: 0; min-height: 0; }
+.dock-v { flex-direction: column; height: 100%; }
+.dock-h { flex-direction: row; width: 100%; }
+.dock-zone:empty { display: none; }
+
+.panel {
+  display: flex; flex-direction: column; background: var(--panel);
+  border: 1px solid var(--border); min-width: 180px; min-height: 120px; overflow: hidden;
+}
+.dock-v .panel { flex: 1 1 0; width: 100%; min-width: 0; }
+.dock-h .panel { flex: 1 1 0; height: 100%; }
+.panel.floating {
+  position: absolute; z-index: 40; border-radius: 6px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5); resize: both;
+}
+.panel-header {
+  display: flex; align-items: center; padding: 5px 8px; gap: 6px;
+  background: var(--panel2); border-bottom: 1px solid var(--border); cursor: grab;
+  flex: 0 0 auto;
+}
+.panel-header .title { flex: 1; font-weight: 600; }
+.panel-header button {
+  background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 1px 5px;
+  border-radius: 3px; font: inherit;
+}
+.panel-header button:hover { color: var(--text); background: var(--border); }
+.panel-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 8px; }
+.dock-splitter { flex: 0 0 5px; background: transparent; z-index: 11; }
+.dock-splitter:hover, .dock-splitter.dragging { background: var(--accent); }
+.dock-v > .dock-splitter { cursor: ns-resize; }
+#workspace > .dock-splitter { cursor: ew-resize; flex: 0 0 5px; }
+.zone-splitter { cursor: ew-resize; }
+#dock-bottom-splitter { cursor: ns-resize; height: 5px; }
+#dock-bottom-splitter:hover { background: var(--accent); }
+
+/* ---- Library (professional block browser) ---- */
+.lib-panel { outline: none; }
+.lib-header {
+  position: sticky; top: 0; z-index: 3; background: var(--panel);
+  display: flex; flex-direction: column; gap: 6px; padding-bottom: 6px;
+  margin: -2px 0 4px; border-bottom: 1px solid var(--border);
+}
+.lib-search { display: flex; gap: 4px; align-items: center; }
+.lib-search input {
+  flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px; padding: 5px 8px; font: inherit; font-size: 12px;
+}
+.lib-search input:focus { border-color: var(--accent); outline: none; }
+.lib-search-clear, .lib-density {
+  flex: 0 0 auto; background: var(--panel2); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 5px; cursor: pointer; font: inherit; font-size: 12px; padding: 4px 8px;
+}
+.lib-search-clear:hover, .lib-density:hover { color: var(--text); border-color: var(--accent); }
+.lib-filters { display: flex; gap: 4px; flex-wrap: wrap; }
+.lib-filter {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 999px; padding: 1px 9px; cursor: pointer; font: inherit; font-size: 10px;
+}
+.lib-filter::before {
+  content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 5px; vertical-align: middle; background: currentColor; opacity: 0.55;
+}
+.lib-filter-audio { --pk: #5fb2ff; } .lib-filter-cv { --pk: #c9a2ff; }
+.lib-filter-midi { --pk: #7ee08a; } .lib-filter-tape { --pk: #e8a13d; }
+.lib-filter::before { background: var(--pk); }
+.lib-filter:hover { color: var(--text); }
+.lib-filter.on { color: var(--text); border-color: var(--pk); background: color-mix(in srgb, var(--pk) 16%, var(--panel2)); }
+
+.lib-tabs { display: flex; flex-wrap: wrap; gap: 3px; }
+.lib-tab {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 4px; padding: 2px 8px; cursor: pointer; font: inherit; font-size: 11px;
+}
+.lib-tab:hover { color: var(--text); }
+.lib-tab.active { color: var(--accent); border-color: var(--accent); }
+
+.lib-results { display: flex; flex-direction: column; }
+.lib-section {
+  position: sticky; top: 0; background: var(--panel); z-index: 1;
+  font-weight: 600; color: var(--text-dim); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.8px; padding: 8px 2px 4px;
+}
+.lib-subsection { color: var(--text-dim); font-size: 10px; opacity: 0.8; padding: 5px 2px 2px; }
+.lib-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 2px 0 4px; }
+.lib-actions button {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 5px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 11px;
+}
+.lib-actions button:hover { border-color: var(--accent); }
+.lib-divider { height: 1px; background: var(--border); margin: 8px 4px; }
+
+.lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; padding: 2px 0 4px; }
+.lib-grid.list { display: flex; flex-direction: column; gap: 2px; }
+.lib-tile {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 6px 5px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+  cursor: grab; transition: border-color 0.1s, background 0.1s;
+}
+.lib-tile:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel2)); }
+.lib-tile.hot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.lib-thumb { width: 100%; height: auto; border-radius: 4px; pointer-events: none; }
+.lib-label {
+  font-size: 10px; color: var(--text-dim); text-align: center; line-height: 1.15;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lib-grid.list .lib-tile { flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px; padding: 3px 8px 3px 22px; }
+.lib-grid.list .lib-thumb { width: 40px; height: 24px; flex: 0 0 auto; }
+.lib-grid.list .lib-label { flex: 1; text-align: left; }
+
+.lib-star {
+  position: absolute; top: 2px; left: 2px; background: transparent; border: none;
+  color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 1px 3px; opacity: 0.5;
+}
+.lib-tile:hover .lib-star { opacity: 1; }
+.lib-star.on { color: #ecc94b; opacity: 1; }
+.lib-del {
+  position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,0.5); border: none;
+  color: var(--text-dim); border-radius: 3px; cursor: pointer; font-size: 10px; padding: 0 4px; opacity: 0;
+}
+.lib-tile:hover .lib-del { opacity: 1; }
+.lib-del:hover { color: var(--danger); }
+.lib-grid.list .lib-del { position: static; opacity: 0.5; margin-left: auto; }
+
+.lib-hovercard {
+  position: fixed; z-index: 300; display: none; width: 192px; pointer-events: none;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 8px; padding: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5); font-size: 11px; color: var(--text);
+}
+.lib-hover-thumb { width: 100%; height: auto; border-radius: 4px; display: block; }
+.lib-hover-title { font-weight: 600; margin: 6px 0 2px; }
+.lib-hover-desc { color: var(--text-dim); line-height: 1.25; }
+.lib-hover-ports { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.lib-portchip {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-dim);
+  background: var(--panel2); border-radius: 999px; padding: 1px 7px;
+}
+.lib-portdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+
+/* ---- Forms (properties / preferences) ---- */
+.form-section { margin-bottom: 10px; }
+.form-section > h3 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--text-dim); padding: 4px 0; border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.form-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; min-height: 24px; }
+.form-row > label { flex: 0 0 42%; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.form-row > input, .form-row > select {
+  flex: 1 1 auto; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font: inherit;
+}
+.form-row > input[type='range'] { padding: 0; accent-color: var(--accent); }
+.form-row > input[type='checkbox'] { flex: 0 0 auto; accent-color: var(--accent); }
+.form-row > input[type='color'] { padding: 0 2px; height: 22px; flex: 0 0 52px; }
+.form-row .val { flex: 0 0 52px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.form-row button, .form-actions button {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit;
+}
+.form-row button:hover, .form-actions button:hover { border-color: var(--accent); }
+.form-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.form-hint { color: var(--text-dim); font-size: 11px; margin: 4px 0; line-height: 1.4; }
+
+/* ---- Port / CV cards in Properties ---- */
+.port-card {
+  border: 1px solid var(--border); border-radius: 5px; background: var(--panel2);
+  padding: 5px 6px; margin-bottom: 6px; display: flex; flex-direction: column; gap: 4px;
+}
+.port-card-row { display: flex; align-items: center; gap: 6px; min-height: 22px; }
+.port-card-row > label { flex: 0 0 auto; color: var(--text-dim); font-size: 11px; min-width: 52px; }
+.port-card-row > input[type='text'], .port-card-row > input[type='number'], .port-card-row > select {
+  flex: 1 1 auto; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 2px 5px; font: inherit;
+}
+.port-card-row > input[type='range'] { flex: 1 1 auto; min-width: 0; padding: 0; accent-color: var(--accent); }
+.port-card-row .val { flex: 0 0 40px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+.port-card-row > button {
+  flex: 0 0 auto; background: none; border: 1px solid transparent; color: var(--text-dim);
+  border-radius: 4px; padding: 1px 6px; cursor: pointer; font: inherit;
+}
+.port-card-row > button:hover { color: var(--danger); border-color: var(--border); }
+.port-card-title { flex: 1 1 auto; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.port-dir { flex: 0 0 auto; color: var(--text-dim); }
+.port-tag {
+  flex: 0 0 auto; font-size: 10px; border-radius: 3px; padding: 1px 5px; font-weight: 600;
+  background: rgba(95, 178, 255, 0.16); color: #5fb2ff;
+}
+.port-tag.cv { background: rgba(201, 162, 255, 0.16); color: #c9a2ff; }
+.port-tag.midi { background: rgba(126, 224, 138, 0.16); color: #7ee08a; }
+.port-lbl-toggle { display: flex; align-items: center; gap: 4px; color: var(--text-dim); font-size: 11px; flex: 0 0 auto; }
+.port-lbl-toggle input { accent-color: var(--accent); }
+.port-add-row { margin-top: 2px; }
+.port-add-row > button {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 3px 10px; cursor: pointer; white-space: nowrap;
+}
+.port-add-row > button:hover { border-color: var(--accent); color: var(--text); }
+
+/* ---- Scene browser ---- */
+.scene-list { display: flex; flex-direction: column; gap: 4px; }
+.scene-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 5px; cursor: pointer;
+}
+.scene-item:hover { border-color: var(--accent); }
+.scene-item .name { flex: 1; font-weight: 600; }
+.scene-item .when { color: var(--text-dim); font-size: 11px; }
+.scene-item .del { color: var(--text-dim); background: none; border: none; cursor: pointer; padding: 2px 6px; }
+.scene-item .del:hover { color: var(--danger); }
+
+/* ---- Context menu ---- */
+.ctx-menu {
+  position: fixed; z-index: 100; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px; min-width: 180px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+.ctx-item { padding: 5px 12px; border-radius: 4px; cursor: pointer; display: flex; gap: 10px; }
+.ctx-item:hover { background: var(--panel2); }
+.ctx-item.disabled { color: var(--text-dim); cursor: default; }
+.ctx-item.disabled:hover { background: none; }
+.ctx-item .key { margin-left: auto; color: var(--text-dim); font-size: 11px; }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+/* ---- Custom shape editor ---- */
+.shape-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.shape-toolbar button, .shape-toolbar select {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit;
+}
+.shape-toolbar button:hover { border-color: var(--accent); }
+.shape-toolbar button.active { border-color: var(--accent); color: var(--accent); }
+.shape-canvas { display: block; border: 1px solid var(--border); border-radius: 6px; touch-action: none; }
+
+/* ---- Modal dialogs ---- */
+#modal-layer:empty { display: none; }
+#modal-layer {
+  position: fixed; inset: 0; z-index: 200; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  min-width: 340px; max-width: 560px; max-height: 80vh; display: flex; flex-direction: column;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+}
+.modal-header { padding: 10px 14px; font-weight: 700; border-bottom: 1px solid var(--border); }
+.modal-body { padding: 14px; overflow-y: auto; }
+.modal-body input[type='text'] {
+  width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px; font: inherit;
+}
+.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.modal-footer button {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; padding: 5px 14px; cursor: pointer; font: inherit;
+}
+.modal-footer button.primary { background: var(--accent); border-color: var(--accent); color: #0b1520; font-weight: 600; }
+.modal-footer button:hover { filter: brightness(1.15); }
+
+/* ---- The Dock (bottom panel: Clip / Widgets / Advanced) ----
+   Pinned to the bottom zone, so it is resized by dragging its top edge via the
+   existing #dock-bottom-splitter. The tab selector is a vertical rail on the
+   left — deliberately unlike the Library's horizontal chips, and it stays
+   usable when the Dock is short. */
+.panel[data-panel='dockpanel'] { min-height: 120px; }
+.dockpanel-body { padding: 0; overflow: hidden; }
+.dockpanel { display: flex; height: 100%; min-height: 0; }
+
+.dock-rail {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 4px; background: var(--panel2); border-right: 1px solid var(--border);
+  overflow-y: auto; overflow-x: hidden;
+}
+.dock-rail-btn {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 1px;
+  width: 54px; padding: 7px 2px 6px; border: 1px solid transparent; border-radius: 5px;
+  background: none; color: var(--text-dim); cursor: pointer; font: inherit; line-height: 1.1;
+}
+.dock-rail-btn .ic { font-size: 15px; }
+.dock-rail-btn .lb { font-size: 10px; letter-spacing: 0.2px; }
+.dock-rail-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+.dock-rail-btn.on { color: var(--accent); background: var(--panel); border-color: var(--border); }
+/* The active marker is an accent bar on the rail's inner edge. */
+.dock-rail-btn.on::before {
+  content: ''; position: absolute; left: -5px; top: 6px; bottom: 6px; width: 3px;
+  border-radius: 0 2px 2px 0; background: var(--accent);
+}
+.dock-rail-btn:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+
+.dock-pane { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; }
+.dock-tab { position: absolute; inset: 0; display: none; flex-direction: column; min-width: 0; min-height: 0; }
+.dock-tab.on { display: flex; }
+
+/* Tab chrome shared by Clip and Widgets. */
+.dock-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 4px 6px; background: var(--panel2); border-bottom: 1px solid var(--border);
+}
+.dock-btn {
+  background: none; border: 1px solid var(--border); color: var(--text); padding: 2px 8px;
+  border-radius: 4px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap;
+}
+.dock-btn:hover { background: var(--panel); border-color: var(--accent); }
+.dock-btn.on { color: var(--accent); border-color: var(--accent); }
+.dock-btn.rec { color: var(--danger); }
+.dock-sep { width: 1px; height: 15px; background: var(--border); margin: 0 3px; }
+.dock-hint { color: var(--text-dim); font-size: 11px; margin-left: 4px; }
+.dock-select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 4px; font: inherit; font-size: 12px; max-width: 160px;
+}
+.clip-info { font-size: 12px; color: var(--text); margin-right: 4px; white-space: nowrap; }
+
+/* Rig tab inspector: compact labelled fields for the selected speaker. The
+   canvas is for feel, these are for "the manual says 110°". */
+.rig-field {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 11px; color: var(--text-dim); white-space: nowrap;
+}
+.rig-num, .rig-name {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 4px; font: inherit; font-size: 12px;
+}
+.rig-num { width: 56px; }
+.rig-name { width: 62px; }
+.rig-field input:disabled { opacity: 0.45; }
+.dock-rig .dock-canvas-wrap { overflow: hidden; }
+
+/* Canvas surfaces. The Widgets field scrolls (it can be larger than the pane);
+   the clip view always fits and does its own zooming. */
+.dock-canvas-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; }
+.clip-wrap { overflow: hidden; }
+.dock-canvas { display: block; outline: none; touch-action: none; }
+
+/* ---- App banner (MIDI learn and friends) ----
+   In #float-layer, so it is UI-zoomed with the rest of the chrome — a prompt
+   drawn on the 1:1 canvas reads as tiny at any scale > 1. */
+.app-banner {
+  position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; z-index: 120;
+  background: rgba(20, 22, 28, 0.96); border: 1px solid var(--accent);
+  color: var(--accent); border-radius: 8px; padding: 9px 14px;
+  font-weight: 600; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55); white-space: nowrap;
+}
+.app-banner button {
+  background: none; border: 1px solid currentColor; color: inherit; font: inherit;
+  font-weight: 600; border-radius: 4px; padding: 2px 10px; cursor: pointer;
+}
+.app-banner button:hover { background: rgba(255, 255, 255, 0.1); }
+
+/* ---- Colour chooser ---- */
+.swatch-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-bottom: 12px; }
+.swatch {
+  aspect-ratio: 1; border: 2px solid transparent; border-radius: 5px; cursor: pointer; padding: 0;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.swatch:hover { border-color: rgba(255, 255, 255, 0.5); }
+.swatch.on { border-color: #fff; }
+.color-row { display: flex; gap: 8px; align-items: center; }
+.color-row input[type='color'] {
+  width: 44px; height: 30px; padding: 0; border: 1px solid var(--border);
+  border-radius: 4px; background: var(--bg); cursor: pointer;
+}
+.color-row input[type='text'] {
+  flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px; font: inherit;
+}
+
+/* ---- Image library (modal picker + manager) ---- */
+.img-manager .img-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
+  margin-bottom: 10px;
+}
+.img-cell {
+  position: relative; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); padding: 4px; cursor: pointer; overflow: hidden;
+}
+.img-cell:hover { border-color: var(--accent); }
+.img-cell.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.img-thumb {
+  height: 68px; display: flex; align-items: center; justify-content: center;
+  /* A checkerboard so transparent PNGs read as transparent, not as black. */
+  background-image:
+    linear-gradient(45deg, rgba(255, 255, 255, 0.06) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(255, 255, 255, 0.06) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(255, 255, 255, 0.06) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(255, 255, 255, 0.06) 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  border-radius: 3px;
+}
+.img-thumb img { max-width: 100%; max-height: 68px; display: block; }
+.img-name {
+  font-size: 11px; color: var(--text-dim); margin-top: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.img-del {
+  position: absolute; top: 3px; right: 3px; width: 18px; height: 18px; line-height: 1;
+  border: 1px solid var(--border); border-radius: 4px; background: rgba(0, 0, 0, 0.65);
+  color: var(--text-dim); font: inherit; font-size: 11px; cursor: pointer; padding: 0;
+  opacity: 0; transition: opacity 0.12s;
+}
+.img-cell:hover .img-del { opacity: 1; }
+.img-del:hover { color: #ff8080; border-color: #ff8080; }
+/* Armed for deletion: the second click on ✓ commits. */
+.img-cell.arm { border-color: #ff8080; }
+.img-cell.arm .img-name { color: #ff8080; }
+.img-cell.arm .img-thumb { opacity: 0.35; }
+.img-cell.arm .img-del { opacity: 1; color: #ff8080; border-color: #ff8080; }
+.img-rename {
+  width: 100%; margin-top: 4px; font: inherit; font-size: 11px; padding: 1px 3px;
+  background: var(--panel2); color: var(--text); border: 1px solid var(--accent); border-radius: 3px;
+}
+
+/* ---- Advanced tab (foundation only) ---- */
+.dock-advanced { overflow: hidden; }
+.adv-host { position: relative; flex: 1 1 auto; min-height: 0; overflow: auto; }
+.adv-view { display: none; height: 100%; }
+.adv-view.on { display: block; }
+.adv-placeholder { padding: 14px 16px; max-width: 620px; }
+.adv-title { font-weight: 700; margin-bottom: 6px; }
+.adv-body { color: var(--text-dim); font-size: 12px; line-height: 1.5; margin-bottom: 8px; }
+.adv-list { color: var(--text); font-size: 12px; margin-left: 18px; }
+
+/* ---- Advanced: EQ Curve deep editor ---- */
+/* Display is owned by the dock's .adv-view / .adv-view.on toggle; scope the
+   flex layout to .on so a deselected editor still hides (equal-specificity
+   .adveq would otherwise override .adv-view{display:none}). */
+.adveq { gap: 6px; padding: 6px; box-sizing: border-box; }
+.adv-view.adveq.on { display: flex; flex-direction: column; height: 100%; }
+.adveq-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.adveq-canvaswrap { position: relative; flex: 1 1 auto; min-height: 90px; }
+.adveq-canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0d0f13; touch-action: none; }
+.adveq-insp { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-height: 26px; }
+.adveq-insp-head { font-weight: 700; color: var(--accent); margin-right: 4px; }
+.adveq-hint { color: var(--text-dim); font-size: 11px; }
+.adveq-field { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.adveq-cap { white-space: nowrap; }
+.adveq-num { width: 58px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.adveq-select { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.adveq-cv { width: 18px; height: 18px; line-height: 1; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); color: var(--text-dim); cursor: pointer; }
+.adveq-cv.on { border-color: #b478ff; color: #b478ff; }
+.adveq-btn, .adveq-tgl { background: var(--panel); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 3px 8px; cursor: pointer; }
+.adveq-btn:hover, .adveq-tgl:hover { border-color: var(--accent); }
+.adveq-tgl.on { border-color: var(--accent); color: var(--accent); }
+/* A/B: `on` on a store button means "this slot holds something", on a recall
+   button means "these are the settings you are looking at". Disabled = empty
+   slot, so an empty slot can't be silently recalled. */
+.adveq-btn.on { border-color: var(--accent); color: var(--accent); }
+.adveq-btn:disabled { opacity: 0.4; cursor: default; border-color: var(--border); }
+.adveq-btn:disabled:hover { border-color: var(--border); }
+.adveq-del { color: #ff8a8a; }
+.adveq-del:hover { border-color: #ff8a8a; }
+.adveq-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+::-webkit-scrollbar-track { background: transparent; }

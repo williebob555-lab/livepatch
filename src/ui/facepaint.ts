@@ -1,0 +1,338 @@
+// ============================================================================
+// Shared face-widget painting.
+//
+// A "face ref" ('param:gain', 'link:b3:freq', 'expose:b4', 'visual') can be
+// drawn in two places now: on a block's face on the workspace canvas, and as a
+// mirrored clone in the Dock's Widgets tab. Both go through here so the two
+// surfaces cannot drift apart — same widget geometry, same live CV/MIDI
+// markers, same binding badges. (docs/07-ui.md invariant: renderer and editor
+// share widget hit geometry; the Dock is a third consumer of the same math.)
+//
+// This module paints WIDGETS only. Live visuals (scope/spectrogram/meter) stay
+// on the Renderer because they own per-node offscreen caches — callers reach
+// them through `Renderer.drawVisualAt`.
+// ============================================================================
+import { Block, ControlStyle, ParamValue, Theme } from '../core/types';
+import { ParamSpec, VisualKind, getDef, paramSpec } from '../core/registry';
+import { doc } from '../core/graph';
+import { runtime } from '../engine/runtime';
+import { getCassettePeaks } from '../core/cassettes';
+import { resolveAssetFor } from './tape';
+import { SWAPPABLE_WIDGETS, linkTarget, widgetSize } from './layout';
+import {
+  SampleHandle,
+  drawKeys,
+  drawSampleView,
+  drawSeqGrid,
+  drawWave,
+  paintWidget,
+  parseSteps,
+  parseWaveStr,
+  pressedKeys,
+  val2norm,
+  xyAxes,
+} from './widgets';
+
+export type Rect = { x: number; y: number; w: number; h: number };
+
+/**
+ * How far a knob/fader drag travels: pixels for the full 0..1 sweep. Shared so
+ * a widget feels identical on the canvas and in the Dock — if these diverge,
+ * the same knob turns at two different speeds depending on where you grab it.
+ */
+export const WIDGET_DRAG_PX = 140;
+
+/** Normalized value after dragging `delta` px from `startNorm` (unclamped —
+ *  norm2val clamps). `delta` is +up / +right, as both surfaces compute it. */
+export const dragNorm = (startNorm: number, delta: number): number => startNorm + delta / WIDGET_DRAG_PX;
+
+/**
+ * A face ref resolved against its host block: which block actually owns the
+ * parameter, its spec, the compiled node id to talk to, and the container
+ * block whose CV ports may target it.
+ */
+export interface ResolvedRef {
+  host: Block;
+  /** Non-null for 'link:'/'expose:' refs — the block inside host.graph. */
+  child: Block | null;
+  /** The block whose `params` this ref reads and writes. */
+  target: Block;
+  spec?: ParamSpec;
+  /** Display name (link name override / exposed child's own name). */
+  name: string;
+  /** Set instead of `spec` when the ref paints a live visual. */
+  visual?: VisualKind;
+  /** Compiled node id of `target`. */
+  nodeId: string;
+  /**
+   * Block whose `cv:<child>:<param>` ports may modulate this param: the host
+   * for mirrored child widgets, the enclosing subgraph container for a block's
+   * own params, null at the root.
+   */
+  container: Block | null;
+}
+
+/**
+ * Resolve a ref against a block addressed by its **absolute path** from the
+ * scene root. Used by the Dock, which must resolve widgets living anywhere in
+ * the patch regardless of which subgraph is currently open — so it cannot use
+ * `runtime.nodeId`, which is relative to the open path.
+ *
+ * Returns null when anything in the chain is missing; callers treat that as
+ * "this dock entry is stale" rather than an error.
+ */
+export function resolveRefAtPath(path: string[], ref: string): ResolvedRef | null {
+  const host = doc.blockByPath(path);
+  if (!host) return null;
+  const hostNode = path.join('/');
+  const def = getDef(host.type);
+
+  if (ref === 'visual') {
+    if (!def.visual) return null;
+    return {
+      host,
+      child: null,
+      target: host,
+      name: host.name,
+      visual: def.visual,
+      nodeId: hostNode,
+      container: doc.blockByPath(path.slice(0, -1)) ?? null,
+    };
+  }
+  if (ref.startsWith('param:')) {
+    const spec = paramSpec(host, ref.slice(6));
+    if (!spec) return null;
+    return {
+      host,
+      child: null,
+      target: host,
+      spec,
+      name: spec.name,
+      nodeId: hostNode,
+      container: doc.blockByPath(path.slice(0, -1)) ?? null,
+    };
+  }
+  if (ref.startsWith('link:')) {
+    const t = linkTarget(host, ref);
+    if (!t) return null;
+    const link = host.paramLinks?.find((l) => l.childId === t.child.id && l.paramId === t.spec.id);
+    return {
+      host,
+      child: t.child,
+      target: t.child,
+      spec: t.spec,
+      name: link?.name || t.spec.name,
+      nodeId: hostNode + '/' + t.child.id,
+      container: host,
+    };
+  }
+  if (ref.startsWith('expose:')) {
+    const child = host.graph?.blocks.find((c) => c.id === ref.slice(7));
+    if (!child) return null;
+    const cdef = getDef(child.type);
+    const nodeId = hostNode + '/' + child.id;
+    if (cdef.visual)
+      return { host, child, target: child, name: child.name, visual: cdef.visual, nodeId, container: host };
+    const spec = cdef.params[0];
+    if (!spec) return null;
+    return { host, child, target: child, spec, name: child.name, nodeId, container: host };
+  }
+  return null;
+}
+
+/** Natural size for a resolved ref — the Dock's default clone size. */
+export function refSize(r: ResolvedRef, cs?: ControlStyle): { w: number; h: number } {
+  if (r.visual)
+    return r.visual === 'meter'
+      ? { w: 26, h: 92 }
+      : r.visual === 'eq'
+        ? { w: 210, h: 120 }
+        : r.visual === 'midimon'
+          ? { w: 180, h: 96 }
+          : { w: 156, h: 88 };
+  if (!r.spec) return { w: 60, h: 24 };
+  const kind = SWAPPABLE_WIDGETS.has(r.spec.widget) && cs?.kind ? cs.kind : r.spec.widget;
+  return { ...widgetSize[kind] };
+}
+
+/**
+ * Effective widget kind + variant for a clone, given a standalone
+ * `ControlStyle` rather than a block's `controls` map. Mirrors `controlOf`
+ * (which is keyed on the block) so the Dock honours the same swap rules.
+ */
+export function controlOfStyle(spec: ParamSpec, cs?: ControlStyle): { kind: ParamSpec['widget']; variant?: string } {
+  if (!SWAPPABLE_WIDGETS.has(spec.widget)) return { kind: spec.widget, variant: cs?.variant };
+  const kind = cs?.kind && SWAPPABLE_WIDGETS.has(cs.kind) ? cs.kind : spec.widget;
+  return { kind, variant: cs?.variant };
+}
+
+/**
+ * Live post-CV value for a param, if a CV port targets it — either the block's
+ * own `cv:<param>` port, or a `cv:<block>:<param>` port on `container` (the
+ * subgraph around it). MIDI-learned params get a live marker too; the engine
+ * streams learned values tagged src:'midi' and `paintWidget` colors per source.
+ */
+export function modOf(b: Block, paramId: string, nodeId: string, container: Block | null): number | null {
+  if (hasCvPort(b, paramId, container) || b.midiMaps?.[paramId]) return runtime.modValueFor(nodeId, paramId);
+  return null;
+}
+
+/** Marker color source for a param's live indicator ('cv' wins over midi). */
+export function modSrcOf(b: Block, paramId: string, container: Block | null): 'cv' | 'midi' | null {
+  if (hasCvPort(b, paramId, container)) return 'cv';
+  return b.midiMaps?.[paramId] ? 'midi' : null;
+}
+
+export function hasCvPort(b: Block, paramId: string, container: Block | null): boolean {
+  return (
+    b.ports.some((p) => p.modParam === paramId && !p.modChild) ||
+    !!container?.ports.some((p) => p.modChild === b.id && p.modParam === paramId)
+  );
+}
+
+/** Binding badges: corner dots showing what drives a widget — a CV port
+ *  (theme.cvIndicatorColor) and/or a learned MIDI binding. */
+export function drawBindingBadges(
+  g: CanvasRenderingContext2D,
+  b: Block,
+  paramId: string,
+  rect: Rect,
+  theme: Theme,
+  container: Block | null,
+): void {
+  const cv = hasCvPort(b, paramId, container);
+  const midi = !!b.midiMaps?.[paramId];
+  if (!cv && !midi) return;
+  let x = rect.x + rect.w - 4;
+  const y = rect.y + 4;
+  g.strokeStyle = 'rgba(0,0,0,0.55)';
+  g.lineWidth = 1;
+  const dot = (color: string): void => {
+    g.fillStyle = color;
+    g.beginPath();
+    g.arc(x, y, 2.6, 0, Math.PI * 2);
+    g.fill();
+    g.stroke();
+    x -= 7;
+  };
+  if (cv) dot(theme.cvIndicatorColor);
+  if (midi) dot(theme.midiIndicatorColor);
+}
+
+export interface WidgetPaintOpts {
+  /** Being dragged right now (brighter accent). */
+  hot?: boolean;
+  /** sampleview only: the handle under the cursor/being dragged. */
+  sampleHandle?: SampleHandle | null;
+  /** Per-instance appearance: `block.controls[ref]` on a face, `dw.control`
+   *  in the Dock. The Dock's copy is deliberately separate. */
+  cs?: ControlStyle;
+  /** Display-name override applied before `cs.label` (link/expose names). */
+  name?: string;
+  /** Skip the CV/MIDI corner dots (block-edit ghosting draws without them). */
+  noBadges?: boolean;
+}
+
+/**
+ * Paint one widget ref into `rect`. Handles every widget kind including the
+ * special painters (keys/wavedraw/seqgrid/sampleview) and the live post-CV
+ * markers + binding badges.
+ *
+ * `r` must be resolved against the right container (see ResolvedRef) — that is
+ * what makes a widget mirrored onto a custom block's face show the CV marker
+ * from the parent's port rather than nothing at all.
+ */
+export function paintFaceWidget(
+  g: CanvasRenderingContext2D,
+  rect: Rect,
+  r: ResolvedRef,
+  theme: Theme,
+  o: WidgetPaintOpts = {},
+): void {
+  const spec = r.spec;
+  if (!spec) return;
+  const t = r.target;
+
+  // `octave`/`length` are siblings of the widget's own param, so they come
+  // from the block that owns it — the child for a mirrored ref, not the host.
+  if (spec.widget === 'keys') {
+    drawKeys(g, rect, theme, Number(t.params.octave ?? 4), pressedKeys.get(t.id));
+    return;
+  }
+  if (spec.widget === 'wavedraw') {
+    drawWave(g, rect, parseWaveStr(t.params[spec.id]), theme);
+    return;
+  }
+  if (spec.widget === 'seqgrid') {
+    drawSeqGrid(
+      g,
+      rect,
+      parseSteps(t.params[spec.id], Number(t.params.length ?? 8)),
+      theme,
+      runtime.seqStepFor(r.nodeId),
+    );
+    return;
+  }
+  if (spec.widget === 'sampleview') {
+    const assetId = resolveAssetFor(t);
+    const peaks = assetId ? getCassettePeaks(assetId, Math.max(32, Math.round(rect.w))) : null;
+    drawSampleView(
+      g,
+      rect,
+      t.params,
+      peaks,
+      theme,
+      o.sampleHandle ?? null,
+      modOf(t, 'start', r.nodeId, r.container),
+      modOf(t, 'end', r.nodeId, r.container),
+    );
+    return;
+  }
+
+  const eff = controlOfStyle(spec, o.cs);
+  // An XY pad's two axes carry their own ranges (and per-block overrides), so
+  // they are resolved here — the painter takes X's range on `spec` and Y's
+  // value already normalized against Y's.
+  const axes = spec.widget === 'xy' ? xyAxes(t.params, spec, (id) => paramSpec(t, id)) : null;
+  const shown: ParamSpec = { ...(axes?.x ?? spec), widget: eff.kind, ...(o.name ? { name: o.name } : {}) };
+  const yRaw = spec.yParam ? Number(t.params[spec.yParam] ?? 0) : undefined;
+  const v2 = axes && yRaw != null ? val2norm(axes.y, yRaw) : yRaw;
+  const mod = modOf(t, spec.id, r.nodeId, r.container);
+  const modY = spec.yParam ? modOf(t, spec.yParam, r.nodeId, r.container) : null;
+  const mod2 = axes && modY != null ? val2norm(axes.y, modY) : modY;
+  paintWidget(
+    g,
+    rect,
+    shown,
+    t.params[spec.id],
+    theme,
+    !!o.hot,
+    v2,
+    mod,
+    mod2,
+    eff.variant,
+    o.cs,
+    modSrcOf(t, spec.id, r.container),
+    axes?.y,
+  );
+  if (!o.noBadges) drawBindingBadges(g, t, spec.id, rect, theme, r.container);
+}
+
+/**
+ * Write a param from a widget interaction: document + engine, in that order.
+ * The Dock's counterpart of `Editor.setParamLive` — a docked clone must reach
+ * the engine exactly like its origin widget, or the Dock would move the value
+ * on screen without moving the audio.
+ *
+ * Structural side effects (a portal's `kind`) are the editor's business and
+ * are not reachable from a docked widget: only params with face widgets can be
+ * docked, and that one is Properties-only.
+ */
+export function writeParam(r: ResolvedRef, spec: ParamSpec, v: ParamValue): void {
+  r.target.params[spec.id] = v;
+  runtime.sendParam(r.nodeId, spec.id, v);
+  doc.touch('param');
+}
+
+/** Convenience for the value a widget should display right now. */
+export const valueOf = (r: ResolvedRef, spec: ParamSpec): ParamValue => r.target.params[spec.id] ?? spec.def;

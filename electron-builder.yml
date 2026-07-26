@@ -1,0 +1,71 @@
+appId: com.livepatch.app
+productName: LivePatch
+directories:
+  output: release
+  buildResources: build
+
+# MUST stay false. The audio engine runs as its own process on a real node.exe
+# (audify's prebuilt binary access-violates inside electron.exe — verified
+# 0xC0000005), and plain Node cannot read inside an asar archive, so packing
+# would break `require('audify')` and the engine would never start.
+asar: false
+
+# Do NOT rebuild native modules against Electron's ABI. Both native deps
+# (audify, @julusian/midi) are required by the ENGINE, which runs on the
+# bundled node.exe — they must keep their Node-ABI prebuilds. Rebuilding also
+# needs Python/MSVC and fails outright on a path containing a space.
+npmRebuild: false
+
+files:
+  - dist/**            # renderer bundle (vite)
+  - dist-engine/**     # audio engine (tsc → CommonJS)
+  - electron/**        # main + preload
+  - package.json
+  - '!**/*.map'
+  # node_modules is added automatically from "dependencies"; audify and
+  # @julusian/midi must ship unpacked so their .node binaries are loadable.
+
+# The Node runtime that hosts the engine, so the app works on machines with no
+# Node installed. Populated by `npm run bundle:node`.
+extraResources:
+  - from: build/node.exe
+    to: node.exe
+  # Optional VST3 host addon. Built by `node scripts/build-vsthost.mjs`; the
+  # `filter` copies it only when present, so a build that never compiled it
+  # still packages (the app then degrades to "VST3 hosting isn't available in
+  # this build"). findVstAddon() resolves it at resources/vsthost.node.
+  - from: native/vsthost/build/Release/
+    to: .
+    filter: ['vsthost.node']
+
+win:
+  target: [nsis]
+
+# Per-user install: %LOCALAPPDATA%\Programs\LivePatch, no UAC prompt, no
+# Program Files. `allowElevation: false` keeps it that way — an elevated
+# install would put the app somewhere the updater cannot write, which is
+# exactly how silent auto-update failures happen.
+#
+# NSIS is also the ONLY Windows target electron-builder writes `latest.yml`
+# for (portable and zip pass isWriteUpdateInfo=false), and the only one
+# electron-updater knows how to install. Changing this target breaks
+# in-app updates. See docs/11-packaging.md.
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: LivePatch
+  # Scenes/cassettes live in %APPDATA%, not the install dir — never take them
+  # with the uninstaller.
+  deleteAppDataOnUninstall: false
+  artifactName: LivePatch-${version}-setup.${ext}
+
+# Where `--publish always` uploads and where the app looks for updates. Owner
+# and repo are derived from package.json "repository" — one place to change.
+# The repo (or at least its releases) must be public, otherwise asset
+# downloads need a token baked into the shipped app.
+publish:
+  provider: github

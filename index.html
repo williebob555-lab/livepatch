@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LivePatch</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="topbar"></div>
+      <div id="workspace">
+        <div id="dock-left" class="dock-zone dock-v"></div>
+        <div id="center">
+          <div id="breadcrumb"></div>
+          <canvas id="canvas"></canvas>
+          <div id="statusbar"></div>
+        </div>
+        <div id="dock-right" class="dock-zone dock-v"></div>
+      </div>
+      <div id="dock-bottom" class="dock-zone dock-h"></div>
+      <div id="float-layer"></div>
+      <div id="menu-layer"></div>
+      <div id="modal-layer"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

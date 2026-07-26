@@ -1,0 +1,140 @@
+# 11 — Build, Packaging & Updates
+
+_Last verified: 2026-07-26. Files: `package.json`, `electron-builder.yml`,
+`scripts/bundle-node.mjs`, `engine/postbuild.mjs`, `vite.config.ts`,
+`electron/main.cjs`, `src/ui/updates.ts`._
+
+## Scripts
+
+| script | does |
+|--------|------|
+| `npm run dev` | Vite dev server (renderer only) |
+| `npm run build:engine` | `tsc -p engine/tsconfig.json` → `dist-engine/` (CJS) + `postbuild.mjs` |
+| `npm run build` | `vite build` (→ `dist/`) then `build:engine` |
+| `npm run bundle:node` | copy the current `node.exe` → `build/node.exe` |
+| `npm run typecheck` | `tsc --noEmit` for **both** renderer and engine |
+| `npm run electron` | run Electron against the built app |
+| `npm run start` | `build` then Electron |
+| `npm run package` | `build` + `bundle:node` + `electron-builder --win` (NSIS, local only) |
+| `npm run package:dir` | same but an unpacked folder (faster to test) |
+| `npm run release` | same as `package`, plus uploads to GitHub Releases |
+
+Output: `release/LivePatch-<version>-setup.exe` (~95 MB) plus `latest.yml` and
+a `.blockmap` — the last two are the update feed and must be published
+alongside the installer.
+
+## Why packaging is not standard here
+
+The audio engine runs as a **separate `node.exe` process** because `audify`
+access-violates inside `electron.exe`. Three config choices all follow from that
+and are **load-bearing** (`electron-builder.yml`):
+
+1. **`asar: false`** — plain Node cannot read inside an asar archive, so packing
+   would break `require('audify')`/`require('@julusian/midi')` and the engine
+   would never start.
+2. **`npmRebuild: false`** — electron-builder's default rebuilds native modules
+   against Electron's ABI, which is exactly backwards (both native modules are
+   loaded by the bundled **Node**, not Electron). It also needs Python/MSVC and
+   fails outright on a path containing a space.
+3. **A bundled Node runtime** — `scripts/bundle-node.mjs` copies the building
+   machine's `node.exe` to `build/node.exe`, shipped via `extraResources`, and
+   `findNodeExe()` prefers `process.resourcesPath/node.exe` when
+   `app.isPackaged`. Without it, the packaged app launches silent on any machine
+   without Node.
+
+The `dist-engine` CJS marker (`postbuild.mjs` writes
+`dist-engine/package.json {"type":"commonjs"}`) is required because the root
+package is `"type":"module"`.
+
+## Why NSIS, and why per-user
+
+The target is **`nsis`, and that is load-bearing for updates**, not a style
+choice:
+
+- electron-builder writes the `latest.yml` update feed **only** for NSIS on
+  Windows. `ArchiveTarget` (zip) is constructed with `isWriteUpdateInfo = false`
+  outside macOS (`app-builder-lib/out/targets/targetFactory.js`), and NSIS opts
+  out for portable too (`isWriteUpdateInfo: !this.isPortable`,
+  `targets/nsis/NsisTarget.js`). A zip or portable release publishes no feed.
+- electron-updater's Windows path installs an NSIS setup `.exe`. There is no
+  folder-swap implementation to fall back on.
+
+Switching `win.target` back to `portable`/`zip` therefore silently disables
+in-app updates — the app will check, get a 404 for `latest.yml`, and report an
+error.
+
+`perMachine: false` + `allowElevation: false` installs to
+`%LOCALAPPDATA%\Programs\LivePatch` with no UAC prompt. This matters beyond
+convenience: an elevated install lands somewhere the (unelevated) updater
+cannot write, which is the classic "update downloads, restarts, nothing
+changed" failure.
+
+## Releasing
+
+1. Set `repository` in `package.json` to the real GitHub repo (currently
+   `CHANGEME`). It is the single source of truth — electron-builder derives
+   both the upload target and the `app-update.yml` baked into the app from it.
+   The repo, or at least its releases, must be **public**; private release
+   assets need a token compiled into the shipped app.
+2. `npm version patch|minor|major`
+3. `$env:GH_TOKEN = "<token>"` (PowerShell; a PAT with `repo` scope)
+4. `npm run release`
+
+That creates a draft release and uploads `LivePatch-<v>-setup.exe`,
+`latest.yml` and the `.blockmap`. **Publish the draft** — electron-updater
+ignores drafts, so installs will not see it until you do.
+
+The `.blockmap` is what keeps updates small: electron-updater diffs it against
+the installed version and downloads only changed blocks. With `asar: false` and
+the 88 MB `node.exe`, a renderer-only change is a few MB instead of ~95 MB — but
+only if the previous version's blockmap is still on the release page. Do not
+delete old releases.
+
+## Update flow
+
+`electron/main.cjs` owns electron-updater (`autoDownload = false`,
+`autoInstallOnAppQuit = true`) and exposes `updates:check` / `updates:download`
+/ `updates:install`. `src/ui/updates.ts` owns the prompts, reached from
+**Options ▸ Check for updates…**; `applyStartupPrefs()` also fires one quiet
+check 3 s after boot that only speaks if an update exists.
+
+**The engine must be dead before the installer runs.** The engine *is*
+`resources/node.exe`; while it lives NSIS cannot overwrite that file and the
+install fails silently. `updates:install` calls `stopEngineAndWait()` (waits for
+the real process exit, SIGKILL after 4 s, then 300 ms for Windows to drop the
+handle) before `quitAndInstall`. Do not replace that with plain `stopEngine()`,
+which is fire-and-forget.
+
+Testing without publishing: `LIVEPATCH_UPDATE_DEV=1` sets
+`forceDevUpdateConfig`, so a dev run reads the real GitHub feed and reports
+against `package.json`'s version. Bump the version down locally to see the
+"available" path.
+
+## Verifying a package (don't trust the build succeeding)
+
+- Inspect `release/win-unpacked/resources/` for `node.exe`, `app/dist-engine/
+  main.js`, `app/dist/index.html`, `app/node_modules/audify/build/Release/
+  audify.node`, and the `@julusian/midi` win32-x64 prebuild.
+- Run the packaged app headless:
+  `LIVEPATCH_ENGINE_SMOKE=1 release/win-unpacked/LivePatch.exe` and confirm the
+  `engine runtime: …\resources\node.exe` status line and a `devices` message
+  listing your WASAPI + ASIO drivers.
+- Then launch it with a window and click through the UI (the headless smoke does
+  **not** cover the renderer).
+
+Last verified package: reported the bundled `resources\node.exe`, enumerated
+27 WASAPI + 9 ASIO drivers, MIDI-direct found the MOTU.
+
+## Known follow-ups (not done)
+
+- **No icon** — drop a 256×256 `build/icon.ico` and electron-builder uses it.
+- **Unsigned** — SmartScreen warns on first install on other machines; needs a
+  code-signing cert for distribution. Auto-updates themselves are unaffected
+  (electron-updater only verifies a signature when there is a `publisherName`
+  to check against), but every user still clears one "unknown publisher" prompt
+  on the initial install.
+- **Size** — the 88 MB `node.exe` dominates. Rebuilding `audify` against
+  Electron's ABI (`@electron/rebuild` + cmake-js + MSVC) would let the app spawn
+  *itself* as Node and drop the bundle, at the cost of a real toolchain
+  dependency and a genuine risk of breaking audio. Not worth it unless size
+  matters.

@@ -1,0 +1,563 @@
+# 09 — Persistence, Assets, and the Tape System
+
+_Last verified: 2026-07-25. Files: `src/core/persist.ts`, `src/core/session.ts`,
+`src/core/cassettes.ts`, `src/core/rolls.ts`, `src/core/sampler.ts`,
+`src/core/customblocks.ts`, `src/core/prefs.ts`, `src/core/takehistory.ts`,
+`src/core/encode/*`,
+`src/ui/tape.ts`, `src/ui/clipview.ts`, `src/ui/pianoroll.ts`,
+`src/ui/imagepicker.ts`, `electron/main.cjs`._
+
+## Scenes (`persist.ts`)
+
+A scene is the `.lps` document (JSON `Scene`). `persist.ts` runs on the Electron
+bridge (`window.livepatchNative`) when present, and falls back to localStorage +
+browser file pickers so the renderer is fully usable in a plain browser.
+
+- Native scene registry: `userData/scenes/*.lps` (list/save/load/delete via IPC).
+- Import/export via native file dialogs (or a browser download/`<input>`).
+- `parseScene(json)` **migrates + fills defaults** so old/partial saves still
+  open: it merges `theme` over `defaultTheme()` and `normalizeGraph` backfills
+  per-block structure. One malformed block must never break rendering.
+
+## Session autosave (`session.ts`)
+
+The whole working state (scene incl. theme, open subpatch path, camera view) is
+autosaved to localStorage (debounced on change, flushed on close/hide) so
+relaunch reopens exactly where you left off. Custom blocks are stored separately
+(also localStorage) so they're available across all scenes.
+
+> **Dev note:** running the packaged/dev app with `LIVEPATCH_DEV_URL` shares the
+> origin's autosaved session. When scripting many test blocks into the running
+> app, reset the scene afterward or they persist into the user's workspace.
+
+## Custom blocks (`customblocks.ts`)
+
+A user-saved subgraph → `CustomBlockRecord` (a `Block` snapshot, id/pos
+stripped), stored in localStorage, shown in the Library's **Custom** tab.
+Instantiated via `doc.instantiateTemplate` (full id remap). Adding a new
+id-embedding field means updating that remap — see
+[`03-document-model.md`](03-document-model.md).
+
+## The Tape system — cassettes as audio assets
+
+The tape system replaces "pick a file each time" with reusable **cassette**
+assets and a `tape` signal kind.
+
+### Cassette store (`cassettes.ts`)
+
+A cassette is one audio file: its original-format bytes plus a small meta record.
+
+```ts
+interface CassetteMeta {
+  id;            // 'cas_' + timestamp36 + rand
+  name; ext; size;
+  durationSec?; sampleRate?; channels?;   // filled after first decode
+  createdAt; origin: 'import' | 'recording';
+  kind?: 'audio' | 'image' | 'midi';      // unset = audio
+  scratch?: boolean;                      // a recorder's uncommitted take
+}
+```
+
+- **Storage:** Electron → `userData/cassettes/<id>.<ext>` + `<id>.json` meta
+  (IPC: list/save/load/delete/updateMeta/importPaths/savePcm). Browser →
+  IndexedDB. Scene blocks reference a cassette by `params.asset` id only, so
+  scenes stay small and reload with audio intact.
+- **Caches:** decoded `AudioBuffer`s and waveform peaks are cached here and
+  shared by the renderer (waveform display) and the Web engine. `getCassetteBuffer`,
+  `getCassettePeaks`, `getCassetteBytes`.
+- **Import:** `importAudioFiles` (multi-select) / `importAudioFolder` (recursive
+  scan, Electron only). Folder/multi imports copy bytes **main-side**
+  (`cassettes:importPaths`) so large libraries never stream through the renderer.
+- **Image assets** share the same store: `meta.kind: 'image'` (unset = audio,
+  so every pre-existing record stays audio). `imageList()` lists them;
+  `cassetteList()` filters them out, which keeps them clear of every audio
+  list/decode/tape path — the engine never sees an image id. Imported via
+  `importImageFiles` (renderer file input; bytes still land in the shared
+  store, Electron main needed **no changes** — meta JSON round-trips as-is).
+  Used by block faces/skins; decoded bitmaps cached in `src/ui/images.ts`.
+
+### The play window — the start/stop bars
+
+**The bars are the transport.** A deck plays its cassette between `regStart` and
+`regEnd`; material outside them does not sound. There is one playback mode and
+one position domain, which is what keeps a reported playhead honest.
+
+| | |
+|---|---|
+| units | 0..1 of the **file** |
+| fades | `fadein`/`fadeout` hang off the bars, measured inward from each |
+| ▶ / loop | start at the start bar; loop returns to it |
+| `seek` | 0..1 of the file, so a scrub reaches material outside the bars too |
+
+They are ordinary CV-modulatable floats, so both engines and the Clip tab see
+exactly the same four numbers, and nothing else in the app moves them —
+`⇔ Bars → the whole file` in the Clip tab's context menu is the user asking.
+
+> **What used to be here.** Cassettes carried a `clips?: CassetteClip[]` marker
+> list, `file-player` carried a serialized `arr` arrangement param, rolls
+> carried `RollClip[]`, and the Clip tab was an arrangement editor: split, join,
+> move, crossfade, consolidate, flatten. **All of it was removed on 2026-07-23.**
+> It was an attempt to be Ableton inside a patching sandbox — the invariants it
+> needed (source range vs timeline position, occlusion, one-sided crossfades,
+> the "never re-fit the window" latch) were expensive to hold and bought nothing
+> the app is actually for. If you find yourself reaching for a timeline here,
+> that is the thing to reconsider, not to rebuild. See
+> [`README.md`](README.md) and the Sampler below for where that energy goes
+> instead.
+
+### Tape blocks
+
+- **`cassette`** — one asset; custom cassette-shell face; a `tape` output. Drag
+  onto a player/sampler/writer, or wire the `tape` port.
+- **`tape-reader`** — "Read Files…/Folder…" spawns one `cassette` block per file
+  beside the reader (and they appear in the Cassettes tab).
+- **`tape-recorder`** — see "The take model" below. A deck that writes: it
+  holds a live take, auditions it through an audio `out`, punches in at the
+  playhead, and is turned into a cassette by **Save As…**, never by ■.
+- **`tape-writer`** — encodes the inserted cassette to disk; pick filename +
+  format. Encoding runs renderer-side (`src/core/encode/`): WAV native, mp3/ogg
+  via `wasm-media-encoders`, flac via `libflacjs` — all **lazy `import()`** so
+  they stay out of the boot bundle.
+- **`file-player`** — plays the window between the bars, with the window's fades
+  and a Speed knob. The Web unit uses one `AudioBufferSourceNode` with
+  `loop`/`loopStart`/`loopEnd` (sample-accurate laps on the audio clock) and
+  schedules the window fades per lap on a separate gain node; the native kernel
+  walks `[s0,s1)` and applies the same fades from bounds it recomputes only on
+  change.
+
+### The Sampler — the one deliberate Ableton borrowing
+
+Sampling is where the interesting accidents happen, so this block is allowed to
+look like Simpler. **The mode decides what a note means, and nothing else
+branches on it:**
+
+| mode | a note is… |
+|---|---|
+| `classic` | a **gate**: the region plays under an ADSR, and with Loop on it cycles `[loopStart, loopStart+loopLen]` for as long as the key is held |
+| `oneshot` | a **trigger**: the region plays through and note-off is ignored, so a hit cannot be cut short by a short key press |
+| `slice` | a **key in a kit**: the region is cut at the slice points and slice *i* answers to `root + i`, at its own pitch (a slice is a piece of the recording, not a note to transpose) |
+
+- Region = `start`/`end` (0..1 of the file, driven by the `sampleview` widget on
+  the block face *and* by the play bars in the Clip tab — they are the same two
+  params). `fadein`/`fadeout` are **material** fades; A/D/S/R is the
+  **performance** envelope. Both apply, and in the Web unit they are two gain
+  nodes per voice on purpose: folding them into one curve would mean recomputing
+  every ramp on note-off.
+- **Loop points are clamped into the region at note-on**, in both engines, so
+  dragging the region can never leave the loop pointing at audio the region
+  excludes.
+- `loopFade` crossfades the loop seam by mixing in the material *before*
+  `loopStart` as the tail ramps out. **Native only.** An
+  `AudioBufferSourceNode` has loop points but no seam fade, and faking one needs
+  a second source per lap; the Web engine is the fallback path, so it loops
+  without the crossfade rather than growing a scheduler for it.
+- **Slice points are authored state, not derived** (`src/core/sampler.ts`): a
+  JSON array of 0..1 positions on the `slices` string param, exactly the way
+  `seqgrid` ships its steps — so `CompiledGraph` stays engine-agnostic and the
+  native kernel parses the same string itself. `divideEvenly` and
+  `detectTransients` fill it; the Clip tab drags, adds (Ctrl-click) and deletes
+  individual points.
+  - Only the **interior** points are stored. The edges are the region, so
+    moving a bar re-spaces nothing and every stored point keeps its meaning.
+  - A point the region no longer covers is **dropped, not clamped**. Clamping
+    would pile several markers onto the region edge and hand out silent keys.
+  - `detectTransients` runs on the peak envelope the waveform cache already
+    holds, so detection costs no extra decode — and it reads the same picture
+    the user is looking at, which is what makes the result predictable. It is a
+    rectified-energy onset detector with a trailing-average threshold, not a
+    beat tracker; every point it produces is draggable afterwards.
+  - **Detection awaits its scan** (`getCassettePeaksAsync`). The drawing only
+    warms the bucket counts it needs, and a button that gave up when its own
+    scan was cold did nothing the first time it was pressed.
+
+### The take model (both recorders)
+
+A recorder is a **deck that writes**, not a one-shot capture box. It holds one
+live *take*, and the same four buttons mean what they do on any tape machine:
+
+| | |
+|---|---|
+| ● Rec | starts writing **at the playhead**. That is the whole of punch-in: material before the head survives, material after it is overwritten in place, and the take extends if the pass runs past the end. A fresh recorder punches in at 0, which is an ordinary recording. |
+| ▶ Play | auditions the take between the bars, through the recorder's audio `out`. This is how you hear a take *before* keeping it. |
+| ■ Stop | ends capture and commits the take to a **scratch** asset (see below). |
+| Clear | drops the take. It deliberately does **not** delete anything already saved. |
+
+- **Only "Save As…" produces a Library asset.** The samples have to be
+  materialized somewhere — the Clip tab draws them and the audition re-reads
+  them — so ■ writes a real file, but its meta carries `scratch: true` and
+  `cassetteList()`/`rollListRaw()` filter those out. `saveTakeAs(id, name)`
+  **copies** the bytes into an ordinary listed asset: a copy, not a rename, so
+  the recorder keeps its take and can be punched into and saved again under
+  another name. Committing a *listed* asset on every ■ is what turned the
+  Cassettes tab into litter.
+- **The take draws itself while you record.** There is no cassette to scan
+  mid-take, so the recorder publishes the picture: `VisualFeed.wave` (min/max
+  pairs spanning the whole take) and `VisualFeed.notes` for MIDI. Both kernels
+  keep that incrementally — the dirty frame range is rescanned, and the bucket
+  size doubles as the take outgrows the fixed array — so a ten-minute take
+  costs exactly what a two-second one does. Rescanning on a timer would stall
+  the pump the engine process shares with its audio callback.
+- **The committed id reaches the document through `EngineAdapter.onAsset`.**
+  Engines own the samples and never the document; one handler in `main.ts`
+  writes the id onto the block's `asset` param.
+- **A punch-in rewrites bytes under a live id**, so the renderer's decode
+  cache and every waveform scan keyed on that id are stale.
+  `invalidateCassette(id)` drops them; the native path signals it with
+  `tape-created { rewrote: true }`. Forgetting this leaves the Clip tab drawing
+  the take as it was before the punch, indefinitely.
+- Capture allocates one ~0.5 MB chunk per ~2.7 s of recording (native) rather
+  than a slice per quantum, which is what the old accumulate-and-join recorder
+  did. Capture has to put samples *somewhere*; this is the least the audio path
+  can do it in, and the audition reads those chunks in place.
+- **Neither recorder has an asset output port any more.** `tape-recorder`'s
+  `tape` out and `midi-recorder`'s `roll` out were removed on 2026-07-23: a take
+  reaches the rest of the patch through the Library, once Save As… has named it.
+  `RETIRED_PORTS` in `persist.ts` drops them (and any wire that reached one)
+  from scenes saved before that — `backfillDefPorts` only ever *adds*, so a
+  retired port would otherwise live on forever in every existing scene, wired
+  and apparently working while the engine ignored it.
+- `node scripts/recorder-kernel-test.cjs` drives both kernels headless and
+  asserts capture, the punch (before survives / middle replaced / after
+  survives), the same-id rewrite, audition output, Clear keeping the asset, and
+  that the MIDI recorder records at all.
+
+### Tape routing
+
+`tape` nets carry an **asset id**, routed like MIDI (event push), not audio.
+`src/ui/tape.ts` `resolveAssetFor(block)` finds which cassette feeds a block on
+the document side (a wired tape input wins over the block's own `asset` param) —
+used for waveform display and the writer. The engines resolve the id to a buffer
+themselves.
+
+### Engine asset access
+
+- **Web engine:** `getCassetteBuffer(id)` (decode cache).
+- **Native engine** (`engine/src/assets.ts`): reads bytes straight from the
+  cassette dir (no IPC round-trip). It decodes **WAV natively** (`wav.ts`); for
+  compressed formats it emits `need-asset`, the renderer decodes with Web Audio
+  and writes a `.pcm` cache (`LPCM` header + interleaved float32), then replies
+  `asset-ready` and the engine loads the cache.
+
+## The `.pcm` cache format (`engine/src/wav.ts`)
+
+`'LPCM'` | u32 sampleRate | u32 channels | u32 frames | f32 interleaved. This is
+the renderer↔engine handoff for any format the engine can't decode itself.
+
+## Encoders (`src/core/encode/`)
+
+`encodeAudio(buffer, 'wav'|'mp3'|'ogg'|'flac')`. WAV is a hand-rolled 16-bit PCM
+writer (also used by the recorder). mp3/ogg from `wasm-media-encoders` (WASM
+inlined — no Vite asset config). flac from `libflacjs` (the asm.js build,
+deliberately, to avoid `.wasm` asset loading issues under `file://`). All
+verified to round-trip (encode → decode back correctly).
+
+## MIDI rolls (`src/core/rolls.ts`)
+
+A **roll** is the note-data counterpart of a cassette: a note list plus a
+tempo, stored in the same byte store with `kind: 'midi'` and extension
+`lproll`, bytes = UTF-8 JSON. Electron main needed **no changes** — the same
+trick image assets used.
+
+```ts
+RollNote { n, t, d, v }        // pitch, start beat, length beats, velocity
+RollData { bpm, beats, notes }
+```
+
+- **A roll is its own timeline.** There is no clip layer between the notes and
+  the player, so what the piano roll draws *is* the list the Pianola is handed
+  and the two cannot disagree. `rollPlayEnd` is the span a player loops over
+  (the last sounding beat, floored at the declared length), and a reported
+  playhead is a fraction of exactly that.
+- **Time is in beats, not seconds**, so a roll can be re-tempoed without
+  touching the notes and a take can be quantized after the fact.
+- `parseRoll` **ignores** a `clips` key rather than rejecting the file: rolls
+  saved while the clip system existed still open, and their notes are the roll.
+- `getRollData` mirrors the waveform caches: synchronous, null while loading,
+  event on arrival. That event goes through `notifyAssets()` — the *shared*
+  asset event — because derived state (a player's `notes` param) is re-synced
+  from there and would otherwise never catch up after an async load.
+- `cassetteList()` is an **allow-list** (`(kind ?? 'audio') === 'audio'`), not a
+  deny-list. A new asset kind must not be able to leak into the audio lists,
+  the decode cache and the tape ports simply because nobody remembered to
+  exclude it. It also drops `scratch` records — see the take model above.
+- Blocks: `midi-roll` (holder), `midi-recorder` (records + thru), `midi-player`
+  (plays out as MIDI). All three have native kernels — the parity rule.
+- The `roll` **SignalKind** transports exactly like `tape` (an asset id pushed
+  to sinks, reusing the same `tapeIn`/`tapeOut` hooks); they are separate kinds
+  only so a cassette cannot be patched into a note player, or a roll into an
+  audio deck, where it would silently do nothing.
+- Note data reaches the engines as the `notes` string param via `syncRolls()` —
+  the same derived-state pattern the retired arrangement `arr` used.
+- MIDI **file** import/export is real SMF (`src/core/midifile.ts`, hand-rolled,
+  no dep). It parses format 0 and 1 (all tracks merged onto one note list) and
+  writes format 0 at 480 ppq. Round-trips exactly. The parser measures every
+  event — including sysex and meta it skips — because a length off by one byte
+  desyncs the rest of the track.
+
+### `syncRolls` — the derived `notes` param
+
+The asset owns the truth; `syncRolls()` re-derives the engine-facing copy and
+writes **only where it differs**, so the common case costs one string compare
+per player. It runs from three places, and all three are needed:
+
+1. **On every asset change** (`onCassettesChange` in `main.ts`) — edits,
+   imports, undo, and an async roll load landing.
+2. **On every structure change.** *Wiring is what decides which roll a player is
+   holding.* Without this, dropping a roll from the Library into a wired Pianola
+   — or pulling the wire out again — left the player on whatever note list it
+   already had: it went on playing the old roll, or played nothing, until some
+   unrelated asset event happened to fire.
+3. **Once after a scene load** (`afterSceneLoad` / boot), because a scene edited
+   elsewhere can hold a stale copy.
+
+### Rolls in the Library
+
+Rolls appear under a **Rolls** category, built to the same shape as Cassettes
+because they are assets in the same sense: **＋ Add files… / ＋ Add folder…**
+(MIDI, folder only under Electron) plus **＋ New roll**. Drag or double-click to
+drop a **Piano Roll** block bound to the roll (`addBlockAt('roll:<id>')`),
+right-click for Export .mid… / Rename / Delete.
+
+- MIDI import returns **bytes**, not paths — the opposite of the audio side, and
+  deliberately: an audio library can be gigabytes so it is copied main-side,
+  while a MIDI file is a few kilobytes and has to be *parsed* by the renderer
+  (which owns the SMF reader) before it can become a roll.
+- **A roll tile draws the Piano Roll block with that roll's notes punched into
+  the paper** (`renderRollThumbnail`), not a generic box: a roll and a cassette
+  sit next to each other in the same grid and the drawing is the only thing
+  telling them apart at a glance.
+
+> **The data-loss bug.** `getRollData` starts an async load when the cache is
+> empty and, when the bytes arrive, writes them into the cache. But an edit
+> (draw/import/undo) can populate the cache *while the load is in flight* — and
+> the stale on-disk version then clobbers the live edit. That is the
+> intermittent "MIDI data gets deleted when I come back to a roll." The load's
+> `.then` bails if the cache was filled during the load (`dataCache.has`); the
+> live edit persisted itself, so nothing is lost.
+
+> **The delete bugs (found 2026-07-23).** Three of them, all from the same
+> place — an asset's *bytes* are gone but state derived from them is not:
+>
+> 1. **`deleteCassette` did not evict the roll data cache.** A deleted roll went
+>    on drawing in the Clip tab *and* went on being pushed to its player's
+>    `notes` param — i.e. it kept **playing**. Fixed with `onAssetDeleted`, a
+>    hook fired *before* the change event so no listener can repaint a world
+>    where the record is gone but its data is still cached.
+> 2. **A load in flight could resurrect a deleted roll**, re-caching bytes with
+>    no meta behind them — an entry nothing could ever delete again. The same
+>    `.then` guard now also checks `getCassette(id)`.
+> 3. **Undo could resurrect one too**, because a history snapshot predating the
+>    delete still held its notes. `installRollHistory`'s `restore` skips ids
+>    with no meta: deleting an asset is a Library action, not an undoable
+>    document edit.
+
+### The piano roll (`src/ui/pianoroll.ts`)
+
+The Clip tab's second mode, chosen when the selection holds a roll. Its toolbar
+is transport + draw/select + snap grid + delete + quantize + fit + import/export
+— it shares nothing with the waveform view, because a roll has no play window.
+
+- **Selecting an empty Piano Roll mints its roll and opens the editor.** The
+  block exists to hold notes; a "press New Roll to begin" wall was a step in the
+  way of the only thing you can do next. `ensureRoll` is idempotent and
+  re-entrant-safe (a `minting` set), and re-checks the block still exists when
+  the async save lands. Only `midi-roll` — a Pianola plays whatever is wired to
+  it, and minting a roll there would silently detach the wire.
+- **`yn` floors, it does not round.** A row's whole visual band must map to
+  that row; rounding splits at the half-row, so clicks in a row's lower half
+  land a semitone below the cursor — the "note doesn't match the cursor" bug.
+  Drawing floor-snaps the start (`snapFloor`) so the note fills the cell you
+  clicked instead of jumping to the next line.
+- **Double-tap / double-click a note deletes it** — no right-click, no mode
+  switch, same under a finger. Matched on the note's *identity* (pitch+start),
+  not its array index, which shifts after a re-sort.
+- **Scroll wheel zooms** (time on plain, pitch on Ctrl, scroll on Shift/Alt),
+  anchored at the cursor.
+- **Touch**: single finger draws/drags through pointer events; a second finger
+  promotes to pinch-zoom + two-finger pan (`beginGesture`/`applyGesture` in
+  `clipview.ts`, shared by the waveform and piano-roll surfaces). A second
+  finger aborts any single-finger edit in progress, exactly like the workspace
+  canvas.
+- Editing is audible: gestures preview through the player the roll feeds
+  (`previewOn`/`previewOff`), and preview notes are tracked **separately** from
+  scheduled ones so an audition can never cut short a note that playback is
+  holding at the same pitch.
+- **Undo/redo works** via `beforeEdit`, a hook the roll fires *before* its first
+  mutation so history snapshots the pre-edit note list (pushing after would
+  capture the result and make undo a no-op).
+
+> **The other trap here.** The Clip tab's `nodeIdOf` addressed the *selected*
+> block by its path but every other block the same way, so the roll bar's ▶ sent
+> transport to the roll holder instead of the Pianola downstream — nothing
+> sounded. Only the target uses the tab's path; anything else resolves through
+> `runtime.nodeId`.
+
+## Undoing non-Scene state (`registerHistorySide`)
+
+Undo snapshots the Scene — but not everything the user edits is in it. Roll
+notes belong to the *asset*, shared by every block and scene that uses that
+roll, yet drawing a note is still an edit and Ctrl+Z has to reverse it.
+
+`GraphDoc` therefore keeps a **list** of `HistorySide` providers (it was one
+slot until a second registrant silently displaced the first). `capture()` runs
+for every snapshot, `restore()` when one is applied; `installRollHistory()`
+registers from `main.ts`.
+
+- Captures must stay small — this runs on **every** `pushHistory()`. Never put
+  audio, images or decoded buffers here.
+- `restore()` only re-persists rolls that actually differ, so an ordinary
+  block-move undo does no IO at all — and it **skips ids with no meta**, so an
+  undo cannot resurrect a deleted asset (see the delete bugs above).
+- **`restore()` swaps in a fresh `scene` object.** Anything holding a `Block`
+  reference across an undo is holding a detached one; re-resolve by id/path.
+  The Clip tab does exactly that (`doc.blockByPath(targetPath)` per access).
+- **Push history before the mutation.** A `pushHistory()` after the edit
+  captures the new state and undo becomes a no-op. Equally, don't push for an
+  edit that turns out to be a no-op, or the stack fills with entries that
+  appear to do nothing.
+- `reset()` is the optional third hook: the document was *replaced*, so every
+  snapshot naming this side's state is gone and whatever it held for them can
+  be dropped. `loadScene` calls it. For rolls that saves nothing; for takes it
+  frees audio.
+
+### The take store (`core/takehistory.ts`) — undo for bytes
+
+Cutting a range out of a take rewrites the asset's bytes, and that has to be
+undoable: a confirmation asks the user to be certain *before* they can hear the
+result, which is the wrong instrument for an edit you judge by ear.
+
+It is **not** shaped like the roll side, and the reason is the constraint that
+should govern any future side provider:
+
+- `capture()` runs on **every** `pushHistory()` — every block drag. The roll
+  side copies its whole cache each time, which is fine for note lists and
+  unaffordable for audio (a few minutes of stereo 48 kHz is ~90 MB).
+- So the capture is a **version token per asset** (an integer) and the bytes sit
+  in a bounded side store: `MAX_BYTES` / `MAX_VERSIONS`, oldest evicted first,
+  never the version an asset currently sits at. Snapshots stay cheap; only real
+  edits cost memory.
+- `noteTakeBaseline(id, bytes, meta)` → `doc.pushHistory()` → write →
+  `noteTakeVersion(id, bytes, meta)`. The baseline call is a no-op when the
+  store already holds the asset's present bytes, so consecutive edits don't
+  keep two copies of the same audio. `clipview.ts`'s `rewriteTake` is the only
+  caller, deliberately: one funnel for every destructive take write.
+- **Meta rides with the bytes.** A cut changes the duration; restoring samples
+  without it leaves every waveform scaled to a length the file no longer has.
+- **Anything that rewrites take bytes outside the undo stack must call
+  `forgetTakeHistory(id)`** — the web recorder's `commit` and the native
+  engine's `tape-created { rewrote }`. Recording is not an undoable edit, so no
+  snapshot names the punched bytes; without this the store still claims the
+  take sits at its pre-punch token, and undoing the *previous* edit would write
+  older audio straight over the pass just recorded.
+- Running out of history **says so** (a banner via the `onEvicted` hook). A
+  Ctrl+Z that quietly does nothing reads as a broken app; the cap is a real
+  bargain with memory, not something to hide.
+
+## The Dock's contents live in the Scene
+
+`Scene.dock = { widgets: DockWidget[] }` holds the mirrored widgets in the
+Dock's Widgets tab. It is in the **scene**, not localStorage, for two reasons:
+the entries name block ids (which are scene-scoped and meaningless anywhere
+else), and being inside the scene puts them inside the undo snapshot — so
+undoing a block delete brings its docked widgets back with it.
+
+- `DockWidget.path` is the block's **absolute path from the scene root**
+  (`['b7','b3']`) — the same segment list that forms a compiled node id — so a
+  clone resolves identically no matter which subgraph is open.
+- `doc.pruneDock()` drops entries whose source block (or the child a
+  `link:`/`expose:` ref names) is gone. It runs after every block delete and on
+  scene load, so a hand-edited or partially-migrated `.lps` can't leave orphans.
+- `parseScene` backfills a missing/malformed `dock` (`normalizeDock`): scenes
+  saved before the Dock existed simply have no key and load with an empty one.
+- The Dock's *panel layout* (height, which tab was open) stays in localStorage
+  with the other panel state — that is per-machine preference, not document.
+
+## Image assets and the image library (`src/ui/imagepicker.ts`)
+
+Images share the cassette store (`kind: 'image'`) and are referenced by id from
+two places: a face `image:<assetId>` layout item and a block's `style.bgImage`
+skin. `imageList()` is the audio-free view of the store, so no engine ever sees
+them.
+
+`pickImage()` is the **only** UI for them — the block Skin row and the block
+menu's `Add image…` both call it, and the top bar's Options ▸ Image library…
+opens it with nothing to pick. It imports, renames, deletes, and reports a
+**usage count** taken over the whole scene (every subgraph, both reference
+kinds) before a delete, because an image can be on a block three subpatches
+down. Before it existed, images accumulated forever: a flat context-menu list
+with an Import item on the end and no way to remove anything.
+
+> **Delete and rename are inline inside the picker, and must stay that way.**
+> `buildModal` **empties `#modal-layer`** — modals do not stack. A
+> `confirmModal`/`promptModal` opened from inside the picker tears the picker
+> down: you get exactly one delete per visit and then land back on the canvas
+> with the dialog gone. So ✕ arms itself (a second click commits) and rename
+> swaps the caption for an input. Any new in-dialog action has the same
+> constraint.
+
+## Saved speaker rigs (`savedRigs` in `src/core/rig.ts`)
+
+`rigPresets` is the built-in standards (Stereo → 9.1.6). The layout you actually
+own is the one you dragged to match your room, so it can be saved by name —
+`saveRigPreset` / `deleteRigPreset`, listed in the Rig tab's picker under
+"Saved". These live in **localStorage**, not the Scene: a rig preset is a
+property of the room, not of a patch. Both save and load deep-copy, so a scene's
+subsequent speaker drags never write back into the preset. Every stored entry is
+re-validated through `parseRig` on read.
+
+## Application preferences (`src/core/prefs.ts`)
+
+The settings that belong to the *installation*, not to a scene: default device
+per hardware block type (`audio-in` / `audio-out` / `asio-in` / `asio-out`), the
+engine to start with, and whether audio comes up running. Top bar → **Options**.
+
+- `GraphDoc.makeBlock` applies `defaultDeviceFor(type)` to a new block's
+  `device` param — so a hardware block arrives on the right interface instead of
+  "(default)". No preference set leaves the def's default alone.
+- `applyStartupPrefs()` (shell) runs **after the session scene is restored**;
+  starting audio before that would spin the engine up on an empty graph and
+  immediately rebuild it.
+- Preferences never enter the undo stack — changing one is not an edit to the
+  document.
+
+## Invariants
+
+- **Scene blocks reference assets by id, never by path or bytes.** Keeps scenes
+  small and portable.
+- **An app preference never goes in the Scene, and scene state never goes in
+  localStorage.** Devices, engine choice, UI scale, Library pins and saved rigs
+  describe the machine; a patch handed to someone else must not carry them.
+- **Assets are never edited destructively.** Nothing in the app rewrites a
+  cassette's samples. The one exception is a recorder acting on *its own take*,
+  under an id it already owns: punching in, and (2026-07-25) the Clip tab's
+  `Delete` on a window selection. Both keep the id so every deck holding the
+  take follows the edit, and both must evict the engine's decoded copy
+  (`runtime.assetChanged`). The `Delete` is **undoable** (see the take store
+  below) and therefore asks nothing first; the punch is not, because recording
+  is not a document edit. A player's cassette is never a candidate; that is why
+  those buttons exist only for `recorder` roles.
+- **There is one playback mode and one position domain.** A deck plays its file
+  between the bars, and a position is 0..1 of that file. Anything that adds a
+  second mode brings back two position domains, and with them a playhead that
+  lies about where the audio is. **The Clip tab is a viewer, not a timeline** —
+  see [`README.md`](README.md) before adding an edit to it.
+- **A recorder's take commits to one scratch id, and only Save As… makes a
+  Library asset.** Minting a listed cassette per pass turns an edit into litter;
+  minting a *new* id per pass strands whatever was already holding the take.
+- **Derived engine params re-derive on structure changes too**, not just asset
+  changes — wiring is what decides which asset a block is holding.
+- **Deleting an asset must evict everything derived from its bytes**
+  (`onAssetDeleted`), or the deleted thing goes on drawing and on sounding.
+- **State the user can edit must be undoable.** If it isn't in the Scene, it
+  goes through `registerHistorySide` — it does not get to skip Ctrl+Z. Deleting
+  an *asset* is not one of those: it is a Library action, and undo must not
+  bring it back.
+- **Retiring a port means listing it in `RETIRED_PORTS`.** `backfillDefPorts`
+  only ever adds, so a port dropped from a definition survives in every scene
+  that already had one — wired and apparently working, ignored by the engine.
+- **`Scene.dock` entries are cleaned, never trusted.** Prune on load and on
+  delete; a dangling entry must degrade to "not drawn", not to a crash.
+- **Never round-trip large audio through the renderer** when main can copy it
+  (folder import). Bytes cross IPC one cassette at a time, on demand.
+- **`parseScene` must keep tolerating old/partial scenes** — add migrations, not
+  hard requirements.

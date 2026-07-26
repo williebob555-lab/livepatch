@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Read(//c/Users/willi/Downloads/**)",
+      "Bash(mkdir -p __TRACKED_VAR__/session-export)",
+      "Bash(unzip -o \"/c/Users/willi/Downloads/session-export-1784425894748.zip\" -d \"/c/Users/willi/AppData/Local/Temp/claude/C--SurroundApp-2/00f51d4e-0805-4cb6-93e3-b1102dbe5bb1/scratchpad/session-export\")",
+      "Bash(grep -n \"  private \\\\|  [a-zA-Z]*\\(.*\\)[:{ ]*$\\\\|drawVisual\\\\|paintWidget\\\\|modOf\\\\|class Renderer\" src/ui/render.ts)",
+      "Bash(npm run *)",
+      "Bash(python -c ' *)",
+      "Bash(node -e ' *)"
+    ]
+  }
+}
