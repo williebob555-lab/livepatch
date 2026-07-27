@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LivePatch">
+  <title>LivePatch mark — square</title>
+  <!-- A CV cable draws the L and the P's stem, then plugs into an audio
+       socket that forms the bowl. Colours are the app's own signal palette
+       (src/core/types.ts) — purple means CV here exactly as it does on a wire
+       in the editor. -->
+  <rect width="256" height="256" rx="56" fill="#14161a"/>
+  <path d="M62 70 V188 H142 V94" fill="none" stroke="#c9a2ff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="168" cy="94" r="30" fill="#14161a" stroke="#5fb2ff" stroke-width="17"/>
+</svg>

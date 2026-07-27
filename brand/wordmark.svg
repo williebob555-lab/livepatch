@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 200" width="660" height="200" role="img" aria-label="LivePatch">
+  <title>LivePatch wordmark — for dark backgrounds</title>
+  <!-- One substitution: the i is a fader. A fader cap is unmistakably an
+       object; every other letter we tried (v as a slack cable, c as an arc)
+       just read as a mismatched font. Cap in CV purple puts it on the same
+       circuit as the mark.
+       Text is live, so it re-renders with whatever sans the viewer has and
+       the fader is positioned to Segoe metrics. Use png/ where the exact
+       shape matters. -->
+  <text x="16" y="132" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#e8ecf2">L</text>
+  <rect x="106" y="44" width="10" height="90" rx="5" fill="#333c49"/>
+  <rect x="89" y="62" width="44" height="25" rx="8" fill="#c9a2ff"/>
+  <rect x="96" y="73" width="30" height="3" rx="1.5" fill="#14161a" opacity="0.55"/>
+  <text x="140" y="132" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3"><tspan fill="#e8ecf2">ve</tspan><tspan fill="#5fb2ff">Patch</tspan></text>
+</svg>

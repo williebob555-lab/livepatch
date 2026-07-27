@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 280" width="1280" height="280" role="img" aria-label="LivePatch — block-and-wire audio patching for Windows">
+  <title>LivePatch README header (1280×280)</title>
+  <defs>
+    <pattern id="grid2" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0 H0 V32" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.035"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="280" rx="16" fill="#14161a"/>
+  <rect width="1280" height="280" rx="16" fill="url(#grid2)"/>
+
+  <!-- A patchbay on the right, in the app's signal colours -->
+  <g opacity="0.8">
+    <g fill="none" stroke="#333c49" stroke-width="7">
+      <circle cx="1042" cy="76" r="12"/><circle cx="1114" cy="76" r="12"/><circle cx="1186" cy="76" r="12"/>
+      <circle cx="1042" cy="140" r="12"/><circle cx="1114" cy="140" r="12"/><circle cx="1186" cy="140" r="12"/>
+      <circle cx="1042" cy="204" r="12"/><circle cx="1114" cy="204" r="12"/><circle cx="1186" cy="204" r="12"/>
+    </g>
+    <path d="M1042 76 C 1064 40, 1164 40, 1186 76" fill="none" stroke="#5fb2ff" stroke-width="10" stroke-linecap="round"/>
+    <path d="M1042 140 C 1064 108, 1092 108, 1114 140" fill="none" stroke="#c9a2ff" stroke-width="10" stroke-linecap="round"/>
+    <path d="M1114 204 C 1136 172, 1164 172, 1186 204" fill="none" stroke="#7ee08a" stroke-width="10" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(56 46) scale(0.6)">
+    <g transform="translate(0 0) scale(0.625)">
+      <rect width="256" height="256" rx="56" fill="#1b1f26"/>
+      <path d="M62 70 V188 H142 V94" fill="none" stroke="#c9a2ff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="168" cy="94" r="30" fill="#1b1f26" stroke="#5fb2ff" stroke-width="17"/>
+    </g>
+    <text x="198" y="118" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#e8ecf2">L</text>
+    <rect x="288" y="30" width="10" height="90" rx="5" fill="#333c49"/>
+    <rect x="271" y="48" width="44" height="25" rx="8" fill="#c9a2ff"/>
+    <rect x="278" y="59" width="30" height="3" rx="1.5" fill="#14161a" opacity="0.55"/>
+    <text x="322" y="118" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3"><tspan fill="#e8ecf2">ve</tspan><tspan fill="#5fb2ff">Patch</tspan></text>
+  </g>
+
+  <text x="60" y="212" font-family="Segoe UI Variable Text, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="25" font-weight="500" letter-spacing="0.2" fill="#94a3b8">
+    Block-and-wire audio patching for Windows · ASIO · VST3 · Surround
+  </text>
+</svg>

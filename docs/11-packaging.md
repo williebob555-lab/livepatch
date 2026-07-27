@@ -12,12 +12,14 @@ _Last verified: 2026-07-26. Files: `package.json`, `electron-builder.yml`,
 | `npm run build:engine` | `tsc -p engine/tsconfig.json` → `dist-engine/` (CJS) + `postbuild.mjs` |
 | `npm run build` | `vite build` (→ `dist/`) then `build:engine` |
 | `npm run bundle:node` | copy the current `node.exe` → `build/node.exe` |
+| `npm run brand` | rasterize `brand/*.svg` → `brand/png/` + `build/icon.ico` ([brand/README.md](../brand/README.md)) |
 | `npm run typecheck` | `tsc --noEmit` for **both** renderer and engine |
 | `npm run electron` | run Electron against the built app |
 | `npm run start` | `build` then Electron |
 | `npm run package` | `build` + `bundle:node` + `electron-builder --win` (NSIS, local only) |
 | `npm run package:dir` | same but an unpacked folder (faster to test) |
 | `npm run release` | same as `package`, plus uploads to GitHub Releases |
+| `npm run ship` | version bump + tag + push + `release`, in one command |
 
 Output: `release/LivePatch-<version>-setup.exe` (~95 MB) plus `latest.yml` and
 a `.blockmap` — the last two are the update feed and must be published
@@ -76,13 +78,20 @@ changed" failure.
    both the upload target and the `app-update.yml` baked into the app from it.
    The repo, or at least its releases, must be **public**; private release
    assets need a token compiled into the shipped app.
-2. `npm version patch|minor|major`
-3. `$env:GH_TOKEN = "<token>"` (PowerShell; a PAT with `repo` scope)
-4. `npm run release`
+2. `setx GH_TOKEN "<token>"` **once** (a PAT with `repo` scope; takes effect in
+   new terminals). Per-session instead: `$env:GH_TOKEN = "<token>"`.
+3. `npm run ship` — bumps the patch version, commits and tags it, pushes with
+   `--follow-tags`, builds, uploads, and goes live. `npm run ship:minor` for a
+   minor bump.
 
-That creates a draft release and uploads `LivePatch-<v>-setup.exe`,
-`latest.yml` and the `.blockmap`. **Publish the draft** — electron-updater
-ignores drafts, so installs will not see it until you do.
+`npm version` refuses to run on a dirty tree, so commit first — that is the
+only manual gate left.
+
+`publish.releaseType: release` means uploads go **live immediately** rather
+than sitting as a draft. That removes the last click, at the cost of the
+safety net: a broken build reaches users the moment the upload finishes. Set
+it back to `draft` in `electron-builder.yml` if you'd rather inspect first
+(electron-updater ignores drafts, so a draft is invisible until published).
 
 The `.blockmap` is what keeps updates small: electron-updater diffs it against
 the installed version and downloads only changed blocks. With `asar: false` and
@@ -127,7 +136,6 @@ Last verified package: reported the bundled `resources\node.exe`, enumerated
 
 ## Known follow-ups (not done)
 
-- **No icon** — drop a 256×256 `build/icon.ico` and electron-builder uses it.
 - **Unsigned** — SmartScreen warns on first install on other machines; needs a
   code-signing cert for distribution. Auto-updates themselves are unaffected
   (electron-updater only verifies a signature when there is a `publisherName`

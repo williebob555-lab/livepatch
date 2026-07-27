@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LivePatch">
+  <title>LivePatch mark — square, tiny-size variant</title>
+  <!-- 16–24 px. Everything grows and the socket becomes as large as the
+       letterform allows, because at 16 px its hole is barely one pixel and
+       that pixel is the only thing saying "P". Never use above 24 px. -->
+  <rect width="256" height="256" rx="64" fill="#14161a"/>
+  <path d="M58 64 V190 H140 V88" fill="none" stroke="#c9a2ff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="176" cy="88" r="34" fill="#14161a" stroke="#5fb2ff" stroke-width="22"/>
+</svg>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" width="900" height="220" role="img" aria-label="LivePatch">
+  <title>LivePatch lockup — horizontal, for light backgrounds</title>
+  <!-- The mark keeps its dark tile; it's a contained shape and reads either
+       way. Only the free-standing type and the fader retune. -->
+  <g transform="translate(30 30) scale(0.625)">
+    <rect width="256" height="256" rx="56" fill="#14161a"/>
+    <path d="M62 70 V188 H142 V94" fill="none" stroke="#c9a2ff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="168" cy="94" r="30" fill="#14161a" stroke="#5fb2ff" stroke-width="17"/>
+  </g>
+  <text x="228" y="148" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#14161a">L</text>
+  <rect x="318" y="60" width="10" height="90" rx="5" fill="#b6bec9"/>
+  <rect x="301" y="78" width="44" height="25" rx="8" fill="#6f4fd0"/>
+  <rect x="308" y="89" width="30" height="3" rx="1.5" fill="#ffffff" opacity="0.5"/>
+  <text x="352" y="148" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3"><tspan fill="#14161a">ve</tspan><tspan fill="#1f6fd0">Patch</tspan></text>
+</svg>

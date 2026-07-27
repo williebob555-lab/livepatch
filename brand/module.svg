@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LivePatch module">
+  <title>LivePatch module — secondary illustration</title>
+  <!-- Secondary asset: splash screens, store art, About boxes. NOT the icon —
+       below ~48 px it collapses into a blue smear. Jacks are colour-coded
+       audio / CV / MIDI to match the editor. -->
+  <rect width="256" height="256" rx="56" fill="#14161a"/>
+  <rect x="54" y="32" width="148" height="192" rx="18" fill="#1b1f26" stroke="#2a2f38" stroke-width="4"/>
+  <path d="M54 50 a18 18 0 0 1 18 -18 h112 a18 18 0 0 1 18 18 v24 h-148 z" fill="#5fb2ff"/>
+  <rect x="72" y="90" width="62" height="8" rx="4" fill="#39414d"/>
+  <rect x="72" y="106" width="38" height="8" rx="4" fill="#2a2f38"/>
+  <circle cx="98" cy="150" r="25" fill="#14161a" stroke="#5fb2ff" stroke-width="7"/>
+  <path d="M98 150 L114 134" stroke="#c9a2ff" stroke-width="8" stroke-linecap="round"/>
+  <rect x="153" y="122" width="10" height="60" rx="5" fill="#2a2f38"/>
+  <rect x="141" y="140" width="34" height="15" rx="6" fill="#7ee08a"/>
+  <circle cx="82" cy="198" r="12" fill="#14161a" stroke="#5fb2ff" stroke-width="5"/>
+  <circle cx="128" cy="198" r="12" fill="#14161a" stroke="#c9a2ff" stroke-width="5"/>
+  <circle cx="174" cy="198" r="12" fill="#14161a" stroke="#7ee08a" stroke-width="5"/>
+</svg>

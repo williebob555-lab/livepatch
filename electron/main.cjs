@@ -360,6 +360,10 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: '#14161a',
     title: 'LivePatch',
+    // Packaged builds take the icon from the .exe resources; only the dev run
+    // needs it set explicitly, and build/ isn't shipped, so don't look for it
+    // there when packaged.
+    ...(app.isPackaged ? {} : { icon: path.join(__dirname, '..', 'build', 'icon.ico') }),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),

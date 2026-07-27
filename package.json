@@ -14,12 +14,15 @@
     "build:engine": "tsc -p engine/tsconfig.json && node engine/postbuild.mjs",
     "build:vsthost": "node scripts/build-vsthost.mjs",
     "bundle:node": "node scripts/bundle-node.mjs",
+    "brand": "electron scripts/make-brand.cjs",
     "typecheck": "tsc --noEmit && tsc -p engine/tsconfig.json --noEmit",
     "start": "npm run build && electron .",
     "electron": "electron .",
     "package": "npm run build && npm run bundle:node && electron-builder --win",
     "package:dir": "npm run build && npm run bundle:node && electron-builder --win --dir",
-    "release": "npm run build && npm run bundle:node && electron-builder --win --publish always"
+    "release": "npm run build && npm run bundle:node && electron-builder --win --publish always",
+    "ship": "npm version patch && git push --follow-tags && npm run release",
+    "ship:minor": "npm version minor && git push --follow-tags && npm run release"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

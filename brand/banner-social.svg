@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="LivePatch — block-and-wire audio patching for Windows">
+  <title>LivePatch social banner (1280×640)</title>
+  <!-- GitHub social preview / OG image. GitHub crops to 1280×640, so keep
+       anything meaningful inside the middle 1200×600. -->
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0 H0 V40" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.035"/>
+    </pattern>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#c9a2ff" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#c9a2ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#14161a"/>
+  <rect width="1280" height="640" fill="url(#grid)"/>
+  <ellipse cx="1010" cy="320" rx="380" ry="340" fill="url(#glow)"/>
+
+  <!-- A patchbay, quietly, in the app's signal colours -->
+  <g opacity="0.62">
+    <g fill="none" stroke="#333c49" stroke-width="9">
+      <circle cx="912" cy="180" r="15"/><circle cx="1010" cy="180" r="15"/><circle cx="1108" cy="180" r="15"/>
+      <circle cx="912" cy="320" r="15"/><circle cx="1010" cy="320" r="15"/><circle cx="1108" cy="320" r="15"/>
+      <circle cx="912" cy="460" r="15"/><circle cx="1010" cy="460" r="15"/><circle cx="1108" cy="460" r="15"/>
+    </g>
+    <path d="M912 180 C 940 100, 1080 100, 1108 180" fill="none" stroke="#5fb2ff" stroke-width="13" stroke-linecap="round"/>
+    <path d="M912 320 C 944 250, 978 250, 1010 320" fill="none" stroke="#c9a2ff" stroke-width="13" stroke-linecap="round"/>
+    <path d="M1010 460 C 1042 392, 1076 392, 1108 460" fill="none" stroke="#7ee08a" stroke-width="13" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(96 214)">
+    <g transform="scale(0.6875)">
+      <rect width="256" height="256" rx="56" fill="#1b1f26"/>
+      <path d="M62 70 V188 H142 V94" fill="none" stroke="#c9a2ff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="168" cy="94" r="30" fill="#1b1f26" stroke="#5fb2ff" stroke-width="17"/>
+    </g>
+  </g>
+
+  <text x="316" y="300" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="112" font-weight="700" letter-spacing="-2.5" fill="#e8ecf2">L</text>
+  <rect x="392" y="222" width="9" height="77" rx="4.5" fill="#333c49"/>
+  <rect x="378" y="238" width="38" height="21" rx="7" fill="#c9a2ff"/>
+  <rect x="384" y="247" width="26" height="3" rx="1.5" fill="#14161a" opacity="0.55"/>
+  <text x="421" y="300" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="112" font-weight="700" letter-spacing="-2.5"><tspan fill="#e8ecf2">ve</tspan><tspan fill="#5fb2ff">Patch</tspan></text>
+
+  <text x="320" y="358" font-family="Segoe UI Variable Text, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="31" font-weight="500" letter-spacing="0.2" fill="#94a3b8">
+    Block-and-wire audio patching for Windows
+  </text>
+  <text x="320" y="408" font-family="Segoe UI Variable Text, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="24" font-weight="500" letter-spacing="1.4" fill="#5b6572">
+    ASIO · WASAPI · VST3 · SURROUND
+  </text>
+</svg>

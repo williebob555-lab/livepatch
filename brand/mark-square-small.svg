@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LivePatch">
+  <title>LivePatch mark — square, small-size variant</title>
+  <!-- 32–48 px. Cable thickens and the socket's hole opens up, or the ring
+       fills in and the P is lost. Never use above 48 px. -->
+  <rect width="256" height="256" rx="60" fill="#14161a"/>
+  <path d="M60 68 V190 H144 V92" fill="none" stroke="#c9a2ff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="172" cy="92" r="30" fill="#14161a" stroke="#5fb2ff" stroke-width="20"/>
+</svg>

@@ -1,4 +1,4 @@
-# LivePatch
+<img src="brand/png/banner-readme-1280x280.png" alt="LivePatch — block-and-wire audio patching for Windows" width="100%">
 
 Block-and-wire audio patching environment for Windows: build signal chains between
 Windows audio, ASIO hardware, and VST plugins with an Unreal-style node editor.

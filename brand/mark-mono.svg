@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LivePatch">
+  <title>LivePatch mark — single colour</title>
+  <!-- Engraving, watermarks, single-ink. Inherits `currentColor` in HTML; set
+       a fill/stroke on the <svg> otherwise. The socket keeps its hole by
+       punching the field colour through, so set --punch to match whatever it
+       sits on if that isn't the app background. -->
+  <g color="#c9a2ff">
+    <path d="M62 70 V188 H142 V94" fill="none" stroke="currentColor" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="168" cy="94" r="30" fill="none" stroke="currentColor" stroke-width="17"/>
+  </g>
+</svg>

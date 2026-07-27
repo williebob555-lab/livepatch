@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 200" width="660" height="200" role="img" aria-label="LivePatch">
+  <title>LivePatch wordmark — for light backgrounds</title>
+  <!-- Same geometry, retuned for white: the signal colours are tuned for a
+       #14161a canvas and neither holds contrast on paper. -->
+  <text x="16" y="132" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#14161a">L</text>
+  <rect x="106" y="44" width="10" height="90" rx="5" fill="#b6bec9"/>
+  <rect x="89" y="62" width="44" height="25" rx="8" fill="#6f4fd0"/>
+  <rect x="96" y="73" width="30" height="3" rx="1.5" fill="#ffffff" opacity="0.5"/>
+  <text x="140" y="132" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3"><tspan fill="#14161a">ve</tspan><tspan fill="#1f6fd0">Patch</tspan></text>
+</svg>

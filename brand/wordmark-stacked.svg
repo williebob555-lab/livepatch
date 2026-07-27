@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 400" width="620" height="400" role="img" aria-label="LivePatch">
+  <title>LivePatch wordmark — stacked, with patch cable</title>
+  <!-- Stacking is what gives the cable somewhere real to go: out of a jack on
+       Live, round the side, into Patch. Two words, one patch. Use where the
+       horizontal wordmark is too wide — splash, About box, square crops. -->
+  <text x="40" y="150" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#e8ecf2">L</text>
+  <rect x="130" y="62" width="10" height="90" rx="5" fill="#333c49"/>
+  <rect x="113" y="80" width="44" height="25" rx="8" fill="#7ee08a"/>
+  <rect x="120" y="91" width="30" height="3" rx="1.5" fill="#14161a" opacity="0.55"/>
+  <text x="164" y="150" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#e8ecf2">ve</text>
+  <text x="40" y="330" font-family="Segoe UI Variable Display, Segoe UI, Inter, -apple-system, system-ui, Helvetica Neue, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-3" fill="#5fb2ff">Patch</text>
+  <path d="M392 122 C 486 122, 500 300, 424 300" fill="none" stroke="#c9a2ff" stroke-width="15" stroke-linecap="round"/>
+  <circle cx="380" cy="122" r="14" fill="#14161a" stroke="#5fb2ff" stroke-width="9"/>
+  <circle cx="412" cy="300" r="14" fill="#14161a" stroke="#5fb2ff" stroke-width="9"/>
+</svg>
