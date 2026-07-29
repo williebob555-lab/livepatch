@@ -3,7 +3,7 @@
 // branch roots → blocks (theme + per-block style, ports on any edge, face
 // widgets, live visuals) → overlays (marquee, snap ring, edit-mode handles).
 // ============================================================================
-import { doc } from '../core/graph';
+import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
 import { getDef, paramSpec } from '../core/registry';
 import { Block, Theme, Vec2, Wire } from '../core/types';
@@ -25,6 +25,7 @@ import {
 } from './geometry';
 import { TITLE_H, contentOrigin, faceItems, linkTarget, padOf, syncBlockSize } from './layout';
 import {
+  SPEAKER_METER_PAD,
   SampleHandle,
   eqBandHandles,
   eqBusesDiffer,
@@ -33,9 +34,11 @@ import {
   eqGainToY,
   eqPlotRect,
   eqResponseDbBus,
+  speakerBarSlots,
 } from './widgets';
 import { ResolvedRef, paintFaceWidget } from './facepaint';
 import { uiScale } from './uiscale';
+import { isSpeakerSilenced } from '../core/rig';
 import { fmtDuration, getCassette } from '../core/cassettes';
 import { getRollData, getRollMeta } from '../core/rolls';
 import { drawFitted, imageBitmap } from './images';
@@ -44,6 +47,35 @@ export interface View {
   x: number;
   y: number;
   scale: number;
+}
+
+/**
+ * Which speakers a block is currently silencing, for the bar meters' dimming.
+ * Only Speaker Monitor has mute/solo; everything else reports "none off", so
+ * the same visual serves both it and Speaker Rig.
+ */
+function speakerOffTest(b: Block): ((i: number) => boolean) | undefined {
+  if (b.type !== 'speaker-monitor') return undefined;
+  const mute = b.params.mute;
+  const solo = b.params.solo;
+  return (i) => isSpeakerSilenced(mute, solo, i);
+}
+
+/**
+ * "8 spk → 2 ch" when the engine reports the rig is wider than the hardware.
+ *
+ * The engine's `speaker-rig` kernel publishes `__folded` (speakers with no
+ * channel of their own) and `__chans` (what the device actually offers) on the
+ * mods stream. Surfacing it here is the whole point: the old behaviour wrapped
+ * surplus channels onto the stereo pair, clipped, and said nothing — you heard
+ * distortion and had no way to find out why.
+ */
+function foldBanner(nodeId: string): string | null {
+  const folded = runtime.modValueFor(nodeId, '__folded');
+  if (!folded) return null;
+  const chans = runtime.modValueFor(nodeId, '__chans') ?? 0;
+  const total = doc.scene.rig?.speakers.length ?? 0;
+  return `${total} spk → ${Math.round(chans)} ch · ${Math.round(folded)} folded`;
 }
 
 /** What the renderer needs to know about the net a wire belongs to. */
@@ -56,6 +88,14 @@ interface NetInfo {
   /** Some port on this net is narrower than the bus — worth showing, because
    *  the extra channels are silently truncated there (docs/02 rules). */
   narrow: boolean;
+  /** Narrowest port width on the net; channels at or above this index reach
+   *  that port as silence. Equals `width` when nothing narrows. */
+  narrowTo: number;
+  /** Block names doing the narrowing, so the legend can say where the channels
+   *  are being lost rather than only that they are. */
+  narrowAt: string[];
+  /** This net lies on a signal cycle (see `Renderer.loopNets`). */
+  loop: boolean;
 }
 
 export interface Overlay {
@@ -318,7 +358,9 @@ export class Renderer {
     const rev = doc.netRevision;
     if (this.netStyleCache?.rev === rev) return this.netStyleCache.byWire;
     const byWire = new Map<string, NetInfo>();
-    for (const net of doc.nets()) {
+    const nets = doc.nets();
+    const loops = this.loopNets(nets);
+    for (const net of nets) {
       // A net reads as CV if any connected port is tagged role 'cv'.
       let cv = false;
       // Channel width mirrors the compiler's rule: the widest port wins, and
@@ -326,6 +368,8 @@ export class Renderer {
       // so the wire can say "2→12" instead of silently truncating.
       let width = 2;
       let narrow = false;
+      let narrowTo = Infinity;
+      const narrowAt: string[] = [];
       // Two passes over the taps, because `narrow` is relative to the final
       // width — but without the `[...sources, ...sinks]` spreads this used to
       // do, which copied every tap on every net, twice, every frame.
@@ -338,15 +382,145 @@ export class Renderer {
             if (pass === 0) {
               if (found.port.role === 'cv') cv = true;
               if (c > width) width = c;
-            } else if (c < width) narrow = true;
+            } else if (c < width) {
+              narrow = true;
+              if (c < narrowTo) narrowTo = c;
+              // Sinks are where channels are actually *lost*: a narrow source
+              // just leaves the upper channels silent, which is not a surprise.
+              const name = found.block.name || getDef(found.block.type).title;
+              if (found.port.dir === 'in' && !narrowAt.includes(name)) narrowAt.push(name);
+            }
           }
         }
       }
-      const info: NetInfo = { kind: net.kind, cv, hasSource: net.sources.length > 0, width, narrow };
+      const info: NetInfo = {
+        kind: net.kind,
+        cv,
+        hasSource: net.sources.length > 0,
+        width,
+        narrow,
+        narrowTo: Number.isFinite(narrowTo) ? narrowTo : width,
+        narrowAt,
+        loop: net.wires.some((w) => loops.has(w.id)),
+      };
       for (const w of net.wires) byWire.set(w.id, info);
     }
     this.netStyleCache = { rev, byWire };
     return byWire;
+  }
+
+  /**
+   * Wires that lie on a signal cycle.
+   *
+   * A patched loop is legal and useful — the executor breaks it with a
+   * one-quantum delay (`engine/src/graph.ts`), which is the whole premise of
+   * the Feedback block. But a ring is close to invisible on a canvas: the
+   * wires look like any others, so an accidental loop reads as a *fault*
+   * ("why is this block screaming?") instead of as the topology you built.
+   * Wires on a cycle get the loop tint in `drawWire`.
+   *
+   * Tarjan SCC over blocks, iteratively — a recursive DFS would be shorter but
+   * a deep patch is user data, and blowing the JS stack while *drawing* is not
+   * a failure mode worth accepting. A net is on a cycle exactly when one of
+   * its sources and one of its sinks share a non-trivial component (or a block
+   * feeds itself). Runs with the rest of `netStyles`, i.e. once per
+   * `netRevision`, never per frame.
+   */
+  private loopNets(nets: DocNet[]): Set<string> {
+    const out = new Set<string>();
+    const adj = new Map<string, string[]>();
+    const touch = (id: string): string[] => {
+      let a = adj.get(id);
+      if (!a) adj.set(id, (a = []));
+      return a;
+    };
+    for (const net of nets) {
+      for (const s of net.sources) {
+        const a = touch(s.blockId);
+        for (const k of net.sinks) {
+          touch(k.blockId);
+          if (!a.includes(k.blockId)) a.push(k.blockId);
+        }
+      }
+    }
+    const ids = [...adj.keys()];
+    const n = ids.length;
+    if (!n) return out;
+    const index = new Map<string, number>();
+    for (let i = 0; i < n; i++) index.set(ids[i], i);
+    const disc = new Int32Array(n).fill(-1);
+    const low = new Int32Array(n);
+    const onStk = new Uint8Array(n);
+    const comp = new Int32Array(n).fill(-1);
+    const compSize: number[] = [];
+    const stk: number[] = [];
+    const callV: number[] = [];
+    const callI: number[] = [];
+    let counter = 0;
+    let ncomp = 0;
+    for (let s0 = 0; s0 < n; s0++) {
+      if (disc[s0] !== -1) continue;
+      disc[s0] = low[s0] = counter++;
+      stk.push(s0);
+      onStk[s0] = 1;
+      callV.push(s0);
+      callI.push(0);
+      while (callV.length) {
+        const v = callV[callV.length - 1];
+        const nbrs = adj.get(ids[v]) as string[];
+        const i = callI[callI.length - 1];
+        if (i < nbrs.length) {
+          callI[callI.length - 1] = i + 1;
+          const w = index.get(nbrs[i]);
+          if (w === undefined) continue;
+          if (disc[w] === -1) {
+            disc[w] = low[w] = counter++;
+            stk.push(w);
+            onStk[w] = 1;
+            callV.push(w);
+            callI.push(0);
+          } else if (onStk[w] && disc[w] < low[v]) low[v] = disc[w];
+        } else {
+          callV.pop();
+          callI.pop();
+          if (callV.length) {
+            const p = callV[callV.length - 1];
+            if (low[v] < low[p]) low[p] = low[v];
+          }
+          if (low[v] === disc[v]) {
+            let size = 0;
+            let w = -1;
+            do {
+              w = stk.pop() as number;
+              onStk[w] = 0;
+              comp[w] = ncomp;
+              size++;
+            } while (w !== v);
+            compSize.push(size);
+            ncomp++;
+          }
+        }
+      }
+    }
+    const cyclic = (i: number): boolean =>
+      compSize[comp[i]] > 1 || (adj.get(ids[i]) as string[]).includes(ids[i]);
+    for (const net of nets) {
+      let hit = false;
+      for (const s of net.sources) {
+        const si = index.get(s.blockId);
+        if (si === undefined) continue;
+        for (const k of net.sinks) {
+          const ki = index.get(k.blockId);
+          if (ki !== undefined && comp[si] === comp[ki] && cyclic(si)) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit) break;
+      }
+      if (hit) for (const w of net.wires) out.add(w.id);
+    }
+    return out;
   }
 
   private drawGrid(vw: number, vh: number, theme: Theme): void {
@@ -473,8 +647,11 @@ export class Renderer {
     const width = theme.wireWidth + extra + (wide ? theme.wireWideExtra : 0);
     if (w.selected) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 4, theme.selectionColor + '88');
     if (overlay.snapWire === w.id) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 6, theme.selectionColor + '55');
-    // Solid border first, signal color on top.
-    this.strokePath(path.pts, width + theme.wireBorderWidth * 2, theme.wireBorderColor);
+    // Solid border first, signal color on top. A wire on a cycle swaps the
+    // border for the loop tint — the signal color still carries the level, so
+    // a looped wire stays as readable as any other (see `loopNets`).
+    const border = info?.loop ? theme.wireLoopColor : theme.wireBorderColor;
+    this.strokePath(path.pts, width + theme.wireBorderWidth * 2, border);
     this.strokePath(path.pts, width, color);
     if (wide) this.strokePath(path.pts, Math.max(0.6, width * 0.3), theme.wireCoreColor + 'cc');
     // Branch root dot, exactly on the trunk.
@@ -560,7 +737,12 @@ export class Renderer {
     const g = this.g;
     const speakers = doc.scene.rig?.speakers ?? [];
     const rows: string[] = [];
-    for (let c = 0; c < info.width; c++) rows.push(`${c + 1}  ${speakers[c]?.name ?? '—'}`);
+    // Channels at or past `narrowTo` never arrive at the narrow sink. Naming
+    // them beats "a narrower port on this net": the question a surround patch
+    // actually raises is *which speakers am I losing*, and the answer used to
+    // require counting ports by hand.
+    for (let c = 0; c < info.width; c++)
+      rows.push(`${c + 1}  ${speakers[c]?.name ?? '—'}${info.narrow && c >= info.narrowTo ? '  ✕' : ''}`);
     // Two columns past six channels, so a 12-channel bus stays a compact card
     // instead of a strip taller than the viewport.
     const cols = rows.length > 6 ? 2 : 1;
@@ -594,11 +776,20 @@ export class Renderer {
     g.fillStyle = theme.portLabelColor;
     g.textAlign = 'left';
     g.textBaseline = 'top';
-    g.fillText(`${info.width} channels${info.narrow ? ' · narrower port on this net' : ''}`, ox + pad, oy + 5);
-    g.fillStyle = theme.blockText;
+    const dropped = info.narrow ? info.width - info.narrowTo : 0;
+    g.fillText(
+      dropped
+        ? `${info.width} channels · ${dropped} dropped at ${info.narrowAt.join(', ') || 'a narrower port'}`
+        : `${info.width} channels`,
+      ox + pad,
+      oy + 5,
+    );
     for (let i = 0; i < rows.length; i++) {
       const col = Math.floor(i / perCol);
       const row = i % perCol;
+      // Dropped channels are struck through in the clip colour, so the card is
+      // readable at a glance instead of needing the ✕ hunted for.
+      g.fillStyle = info.narrow && i >= info.narrowTo ? theme.wireClipColor : theme.blockText;
       g.fillText(rows[i], ox + pad + col * colW, oy + 22 + row * rowH);
     }
     g.restore();
@@ -608,11 +799,11 @@ export class Renderer {
    * Channel-count chip on a multichannel wire.
    *
    * Placed at the wire's midpoint on the trunk only (a branch would stamp the
-   * same number again a few pixels away). Reads `12` normally, and `2→12` when
+   * same number again a few pixels away). Reads `12` normally, and `12→2` when
    * something on the net is narrower than the bus — that mismatch is legal and
    * deliberate (docs/02 truncation rules), but it should never be *invisible*:
    * "why is my surround patch only using two channels" is otherwise a silent
-   * mystery.
+   * mystery. Hover the wire for the legend, which names the lost speakers.
    */
   private drawWireChip(w: Wire, theme: Theme, netByWire: Map<string, NetInfo>): void {
     const info = netByWire.get(w.id);
@@ -625,7 +816,8 @@ export class Renderer {
     const mid = pointAtRatio(path, 0.5);
     if (!mid) return;
     const g = this.g;
-    const label = info.narrow ? `2→${info.width}` : String(info.width);
+    // Source→destination order, because that is the direction of the loss.
+    const label = info.narrow ? `${info.width}→${info.narrowTo}` : String(info.width);
     setFont(g, uiFont(9, 'bold'));
     const tw = g.measureText(label).width;
     const w2 = tw / 2 + 4;
@@ -728,6 +920,7 @@ export class Renderer {
     const textColor = st.textColor ?? theme.blockText;
     if (def.customFace === 'cassette') this.drawCassetteFace(b, theme);
     else if (def.customFace === 'roll') this.drawRollFace(b, theme);
+    else if (def.customFace === 'comment') this.drawCommentFace(b, theme);
     const editingThis = overlay.mode === 'edit' && overlay.editingBlockId === b.id;
     // Proximity focus dims everything except the title, which is the whole
     // point: a collapsed block still says what it is.
@@ -814,7 +1007,11 @@ export class Renderer {
         g.fillText('⧉', x + w - 5, y + 4);
       }
       if (def.stubbed) {
-        g.fillStyle = '#b9873d';
+        // On the web engine this block's DSP is a pass-through — it is doing
+        // nothing, silently. That is worth shouting about rather than noting:
+        // the web engine is the DEFAULT, so a first surround patch is silent
+        // and the only clue was a dim amber word in the corner.
+        g.fillStyle = runtime.engine.name === 'webaudio' ? theme.wireClipColor : '#b9873d';
         g.fillText('NATIVE', x + w - (def.isSubgraph ? 16 : 5), y + 4);
       }
     }
@@ -1010,6 +1207,73 @@ export class Renderer {
    * pianola scroll, so this reads instantly as "MIDI here" and is unmistakable
    * against the cassette next to it.
    */
+  /**
+   * Comment face — word-wrapped prose filling the block, no title bar.
+   *
+   * Wrapping is measured with `measureText` per word rather than laid out
+   * once and cached: comments are few and short, and a cache would have to be
+   * invalidated on text, size, width *and* font changes. If a patch ever holds
+   * enough comments for this to show up in a frame profile, cache on
+   * `(text, size, w)` — but measure first (docs/10).
+   *
+   * Overflow clips rather than shrinking the font: silently rescaling type is
+   * how you end up with two comments at different sizes that you never chose.
+   */
+  private drawCommentFace(b: Block, theme: Theme): void {
+    const g = this.g;
+    const { x, y } = b.pos;
+    const { w, h } = b.size;
+    const text = typeof b.params.text === 'string' ? b.params.text : '';
+    const size = Math.max(8, Math.round(Number(b.params.size) || 13));
+    const centred = b.params.align === 'Centre';
+    const pad = 10;
+    const maxW = w - pad * 2;
+    if (maxW <= 4) return;
+
+    g.save();
+    g.beginPath();
+    g.rect(x + pad, y + pad, maxW, h - pad * 2);
+    g.clip();
+    setFont(g, uiFont(size));
+    g.fillStyle = b.style.textColor ?? theme.blockText;
+    g.textBaseline = 'top';
+    g.textAlign = centred ? 'center' : 'left';
+    const tx = centred ? x + w / 2 : x + pad;
+
+    // Empty comments say so, faintly — an invisible block you can't find again
+    // is worse than a placeholder.
+    if (!text.trim()) {
+      g.globalAlpha = 0.4;
+      g.fillText('Double-click to edit…', tx, y + pad);
+      g.restore();
+      return;
+    }
+
+    const lh = size * 1.35;
+    let ly = y + pad;
+    for (const para of text.split('\n')) {
+      if (!para) {
+        ly += lh;
+        continue;
+      }
+      let line = '';
+      for (const word of para.split(/\s+/)) {
+        const probe = line ? line + ' ' + word : word;
+        if (line && g.measureText(probe).width > maxW) {
+          g.fillText(line, tx, ly);
+          ly += lh;
+          line = word;
+        } else line = probe;
+      }
+      if (line) {
+        g.fillText(line, tx, ly);
+        ly += lh;
+      }
+      if (ly > y + h) break;
+    }
+    g.restore();
+  }
+
   private drawRollFace(b: Block, theme: Theme): void {
     const g = this.g;
     const { x, y } = b.pos;
@@ -1175,6 +1439,97 @@ export class Renderer {
       g.globalAlpha = 1;
       g.fillStyle = theme.portLabelColor;
       g.fillText(s.name, px, py - dotR - 5);
+    }
+  }
+
+  /**
+   * Per-speaker bar meters: one labelled column per channel of a wide bus.
+   *
+   * The Spatial Scope answers "where is it"; this answers "how much", which a
+   * dot's radius cannot. Channel `i` is speaker `i`, the same order the rig and
+   * every wide bus use, so the two views index identically.
+   *
+   * Muted / soloed-out speakers are drawn dimmed with a strike, and the
+   * `banner` line (set by the caller from the engine's fold telemetry) says
+   * when the hardware is narrower than the rig — a truncation you cannot see is
+   * the bug this whole visual exists to stop.
+   */
+  private drawSpeakerMeters(
+    g: CanvasRenderingContext2D,
+    r: { x: number; y: number; w: number; h: number },
+    theme: Theme,
+    chans: number[] | null,
+    opts: { muted?: (i: number) => boolean; banner?: string | null } = {},
+  ): void {
+    const speakers = doc.scene.rig?.speakers ?? [];
+    const n = Math.max(speakers.length, chans?.length ?? 0);
+    if (!n) return;
+    const pad = SPEAKER_METER_PAD;
+    const bannerH = opts.banner ? 12 : 0;
+    const labelH = 10;
+    const top = r.y + pad + bannerH;
+    const bottom = r.y + r.h - pad - labelH;
+    const barH = bottom - top;
+    if (barH < 8) return;
+    const { slot, barW: bw } = speakerBarSlots(r, n);
+
+    if (opts.banner) {
+      g.fillStyle = theme.wireClipColor;
+      setFont(g, uiFont(9, 600));
+      g.textAlign = 'left';
+      g.textBaseline = 'top';
+      g.fillText(opts.banner, r.x + pad, r.y + 2);
+    }
+    // −60 dB floor: a scale, not a raw amplitude — a linear bar spends most of
+    // its travel in the top 6 dB and reads as "on or off".
+    const FLOOR = -60;
+    const norm = (v: number): number =>
+      v <= 1e-7 ? 0 : Math.max(0, Math.min(1, (20 * Math.log10(v) - FLOOR) / -FLOOR));
+    // −6 dB and −20 dB guides, so a level can be read off rather than guessed.
+    g.strokeStyle = theme.gridColor;
+    g.lineWidth = 1;
+    for (const db of [-6, -20]) {
+      const yy = Math.round(bottom - ((db - FLOOR) / -FLOOR) * barH) + 0.5;
+      g.beginPath();
+      g.moveTo(r.x + pad, yy);
+      g.lineTo(r.x + r.w - pad, yy);
+      g.stroke();
+    }
+    setFont(g, uiFont(8));
+    g.textAlign = 'center';
+    g.textBaseline = 'top';
+    for (let i = 0; i < n; i++) {
+      const s = speakers[i];
+      const lv = chans && i < chans.length ? chans[i] : 0;
+      const off = opts.muted?.(i) ?? false;
+      const cx = r.x + pad + slot * (i + 0.5);
+      const bx = cx - bw / 2;
+      g.fillStyle = 'rgba(255,255,255,0.06)';
+      g.fillRect(bx, top, bw, barH);
+      const hh = norm(lv) * barH;
+      if (hh > 0.5) {
+        g.fillStyle = off ? theme.wireQuietColor : levelStyle(theme, lv, lv).color;
+        g.globalAlpha = off ? 0.35 : 1;
+        g.fillRect(bx, bottom - hh, bw, hh);
+        g.globalAlpha = 1;
+      }
+      // Clip tell-tale: the whole point of a per-speaker meter is spotting the
+      // ONE channel that is overloading.
+      if (lv >= 0.999) {
+        g.fillStyle = theme.wireClipColor;
+        g.fillRect(bx, top, bw, 2);
+      }
+      if (off) {
+        g.strokeStyle = theme.wireClipColor;
+        g.lineWidth = 1.25;
+        g.beginPath();
+        g.moveTo(bx, bottom - barH * 0.5);
+        g.lineTo(bx + bw, bottom - barH * 0.5);
+        g.stroke();
+      }
+      g.fillStyle = s?.lfe ? theme.wireTapeColor : theme.portLabelColor;
+      const label = s?.name ?? String(i + 1);
+      g.fillText(label.length > 4 ? label.slice(0, 4) : label, cx, bottom + 1);
     }
   }
 
@@ -1361,6 +1716,15 @@ export class Renderer {
     // up when levels arrive.
     if (kind === 'spatial') {
       this.drawSpatialScope(g, { x, y, w, h }, theme, feed?.chans?.() ?? null);
+      return;
+    }
+    // Same rule as the scope: the layout is meaningful with audio off, so the
+    // bars draw (empty) rather than showing "audio off".
+    if (kind === 'speakers') {
+      this.drawSpeakerMeters(g, { x, y, w, h }, theme, feed?.chans?.() ?? null, {
+        muted: speakerOffTest(_b),
+        banner: foldBanner(nodeId),
+      });
       return;
     }
     if (!feed) {

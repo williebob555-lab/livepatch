@@ -28,6 +28,7 @@ const services: Services = {
   pullInputCh: (d, c, o, n) => io.pullInputCh(d, c, o, n),
   pushOutput: (d, L, R, n) => io.pushOutput(d, L, R, n),
   pushOutputCh: (d, c, b, n) => io.pushOutputCh(d, c, b, n),
+  outChannels: (d, asio) => io.outChannels(d, asio),
   pullAsioIn: (c, o, n) => io.pullAsioIn(c, o, n),
   pushAsioOut: (c, b, n) => io.pushAsioOut(c, b, n),
   hardwareChanged: () => scheduleReconfigure(),

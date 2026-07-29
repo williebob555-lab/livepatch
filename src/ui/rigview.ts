@@ -335,16 +335,27 @@ function build(body: HTMLElement): DockTabHandle {
     return null;
   };
 
-  const hit = (pt: Vec, W: number, H: number): { s: Speaker; pane: Pane } | null => {
+  const hit = (pt: Vec, W: number, H: number, touch = false): { s: Speaker; pane: Pane } | null => {
     const p = paneAt(pt, W, H);
     if (!p) return null;
+    // A fingertip is ~10 mm across and hides the dot it is aiming at, so the
+    // grab radius roughly triples for touch. Speakers in a dense rig can sit
+    // closer than that, which is why the topmost still wins outright below —
+    // the wider radius only decides whether ANY speaker was grabbed.
+    const tol = touch ? DOT * 3 : DOT + 4;
     // Reverse order so the last-drawn (topmost) speaker wins a tie.
     const list = rig().speakers;
+    let best: { s: Speaker; pane: Pane } | null = null;
+    let bestD = Infinity;
     for (let i = list.length - 1; i >= 0; i--) {
       const q = project(list[i], p);
-      if (Math.hypot(q.x - pt.x, q.y - pt.y) <= DOT + 4) return { s: list[i], pane: p };
+      const d = Math.hypot(q.x - pt.x, q.y - pt.y);
+      if (d <= tol && d < bestD) {
+        bestD = d;
+        best = { s: list[i], pane: p };
+      }
     }
-    return null;
+    return best;
   };
 
   /** Pointer → canvas surface px. The Dock is inside `#app` (CSS-zoomed) and
@@ -641,7 +652,7 @@ function build(body: HTMLElement): DockTabHandle {
     const W = canvas.width / ratio;
     const H = canvas.height / ratio;
     const pt = toSurface(e);
-    const h = hit(pt, W, H);
+    const h = hit(pt, W, H, e.pointerType !== 'mouse');
     if (!h) {
       selId = '';
       syncBar();

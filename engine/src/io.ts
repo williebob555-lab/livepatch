@@ -474,6 +474,24 @@ interface OutputRec {
   frames: number;
   chans: number;
   scratch: Float32Array; // interleaved
+  /**
+   * A Buffer **view** over `scratch`, built once at stream-open and handed
+   * straight to `rt.write` every quantum.
+   *
+   * This exists because `Buffer.from(rec.scratch.buffer, 0, bytes)` inside the
+   * pump allocated a fresh Buffer object on **every single callback**. It looks
+   * free — it wraps the existing ArrayBuffer rather than copying it — but the
+   * wrapper itself is a heap allocation, ~375 of them a second per secondary
+   * device, in the audio pump. That is steady GC pressure on the thread the
+   * pump runs on, and a GC pause there makes the pump miss its deadline: an
+   * xrun, heard as a pop (docs/10 rule 1). The master output path already
+   * preallocates (`outScratchA`/`outScratchB`) for exactly this reason; the
+   * secondary path was the one that didn't.
+   *
+   * Safe to reuse: it is a fixed-size window onto a buffer we own, and
+   * `rt.write` consumes it synchronously.
+   */
+  writeView: Buffer;
   primed: boolean;
 }
 
@@ -567,6 +585,36 @@ export class IoManager {
   private asioTrimmed = false;
   private outScratchA: Buffer = Buffer.alloc(0);
   private outScratchB: Buffer = Buffer.alloc(0);
+  /**
+   * Per-callback views onto the two output scratch buffers, built once by
+   * `ensureOutViews` instead of per pump call.
+   *
+   * The master pump used to do **both** of these on every single callback:
+   *
+   * ```
+   * const f = new Float32Array(scratch.buffer, 0, n * mc);   // interleave target
+   * this.master?.write(scratch.subarray(0, n * mc * 4));     // the write
+   * ```
+   *
+   * Neither copies any audio — they are windows onto memory we already own —
+   * but each one allocates a *wrapper object*, so at 128 frames / 48 kHz that
+   * is ~750 short-lived objects a second in the hottest path in the engine,
+   * every one of them garbage. GC then pauses the thread the pump runs on, the
+   * pump misses its deadline, and that is an xrun heard as a pop. Golden rule 1
+   * says the audio callback allocates nothing, and this was the largest
+   * remaining violation of it.
+   *
+   * Views (not just the byte buffers) are cached because the *sizes* are what
+   * the pump needs: `write` must hand over exactly `n * chans * 4` bytes.
+   */
+  private outFloatA: Float32Array = new Float32Array(0);
+  private outFloatB: Float32Array = new Float32Array(0);
+  private outWriteA: Buffer = Buffer.alloc(0);
+  private outWriteB: Buffer = Buffer.alloc(0);
+  /** Geometry the cached views were built for. Two integer compares per
+   *  callback; a rebuild only on an actual reconfigure. */
+  private outViewFrames = 0;
+  private outViewChans = 0;
   private flip = false;
   /** Monotonic quantum id — input caches key their freshness on it. */
   private quantumId = 0;
@@ -921,6 +969,31 @@ export class IoManager {
     const bytes = MAXQ * chans * 4;
     this.outScratchA = Buffer.alloc(bytes);
     this.outScratchB = Buffer.alloc(bytes);
+    // Force `ensureOutViews` to rebuild: the cached views point at the buffers
+    // we just replaced, and a view onto a freed ArrayBuffer is not a bug that
+    // announces itself.
+    this.outViewFrames = 0;
+    this.outViewChans = 0;
+  }
+
+  /**
+   * Make sure the cached output views match `n × chans`, rebuilding only when
+   * that geometry actually changes (stream open / reconfigure). Called at the
+   * top of each master pump; in steady state it is two integer comparisons.
+   *
+   * The scratch buffers are allocated at MAXQ frames, so a smaller `n` is
+   * always a valid window onto them — this never reallocates the buffers
+   * themselves, only the wrappers.
+   */
+  private ensureOutViews(n: number, chans: number): void {
+    if (this.outViewFrames === n && this.outViewChans === chans) return;
+    const floats = n * chans;
+    this.outFloatA = new Float32Array(this.outScratchA.buffer, 0, floats);
+    this.outFloatB = new Float32Array(this.outScratchB.buffer, 0, floats);
+    this.outWriteA = this.outScratchA.subarray(0, floats * 4);
+    this.outWriteB = this.outScratchB.subarray(0, floats * 4);
+    this.outViewFrames = n;
+    this.outViewChans = chans;
   }
 
   private openInput(name: string, errCb: (t: number, m: string) => void): void {
@@ -1067,13 +1140,16 @@ export class IoManager {
         RT_FLAGS,
         errCb,
       );
+      const scratch = new Float32Array((frames || this.frames) * chans);
       const rec: OutputRec = {
         rt,
         ring: new Ring(this.frames * 32, chans),
         name: dev.name,
         frames: frames || this.frames,
         chans,
-        scratch: new Float32Array((frames || this.frames) * chans),
+        scratch,
+        // Built once here, never in the pump — see `OutputRec.writeView`.
+        writeView: Buffer.from(scratch.buffer, 0, (frames || this.frames) * chans * 4),
         primed: false,
       };
       this.secOuts.set(key, rec);
@@ -1095,13 +1171,13 @@ export class IoManager {
     const rec = this.secOuts.get(key);
     if (!rec) return;
     const n = rec.frames;
-    const ch = rec.chans;
     // Same story as capture, mirrored: this device's clock differs from the
     // master's, so read at a drift-tracked, self-tuning rate. Standing latency
     // is bounded inside readResampled* (capLatency) — no coarse trim here.
     if (!rec.ring.readResampledInterleaved(rec.scratch, n) && this.running) this.xruns++;
     try {
-      rec.rt.write(Buffer.from(rec.scratch.buffer, 0, n * ch * 4));
+      // Preallocated view — a `Buffer.from` here allocated once per callback.
+      rec.rt.write(rec.writeView);
     } catch {
       /* stream torn down mid-pump */
     }
@@ -1150,13 +1226,16 @@ export class IoManager {
       send({ op: 'status', error: 'dsp error: ' + String(err) });
     }
     this.runProbe(n); // adds a click / reads input if a measurement is active
-    const scratch = this.flip ? this.outScratchA : this.outScratchB;
+    // Preallocated interleave target + write window (see `outFloatA`). Building
+    // either of these here allocated twice per callback.
+    this.ensureOutViews(n, mc);
+    const useA = this.flip;
     this.flip = !this.flip;
-    const f = new Float32Array(scratch.buffer, 0, n * mc);
+    const f = useA ? this.outFloatA : this.outFloatB;
     for (let i = 0; i < n; i++)
       for (let c = 0; c < mc; c++) f[i * mc + c] = clip(this.mix[c][i]);
     try {
-      this.master?.write(scratch.subarray(0, n * mc * 4));
+      this.master?.write(useA ? this.outWriteA : this.outWriteB);
     } catch {
       /* torn down */
     }
@@ -1233,13 +1312,16 @@ export class IoManager {
       this.feedSecondaries(n);
       return;
     }
-    const scratch = this.flip ? this.outScratchA : this.outScratchB;
+    // Preallocated interleave target + write window (see `outFloatA`). Building
+    // either of these here allocated twice per callback.
+    this.ensureOutViews(n, outSpan);
+    const useA = this.flip;
     this.flip = !this.flip;
-    const f = new Float32Array(scratch.buffer, 0, n * outSpan);
+    const f = useA ? this.outFloatA : this.outFloatB;
     for (let i = 0; i < n; i++)
       for (let c = 0; c < outSpan; c++) f[i * outSpan + c] = clip(this.asioOut[c][i]);
     try {
-      this.master?.write(scratch.subarray(0, n * outSpan * 4));
+      this.master?.write(useA ? this.outWriteA : this.outWriteB);
       this.asioQueue += 1;
     } catch {
       /* torn down */
@@ -1370,19 +1452,45 @@ export class IoManager {
     }
   }
 
-  /** Surround playback: add one channel into a device's multichannel mix.
-   *  Channels beyond what the device offers fold down onto the stereo pair. */
+  /**
+   * How many output channels a route actually has right now; 0 while nothing
+   * is open. `speaker-rig` asks so it can fold a rig that is wider than the
+   * hardware instead of overflowing it (see the kernel's `buildPlan`).
+   *
+   * Cheap and allocation-free: it is read once per quantum from `process`.
+   */
+  outChannels(device: string, asio: boolean): number {
+    if (asio) return this.asioOut.length;
+    const sec = this.secOuts.get(device);
+    if (sec) return sec.chans;
+    if (!this.masterIsAsio && this.master && device === this.masterKey) return this.masterOutChans;
+    // No route of its own: it will land on the master (or the ASIO fallback).
+    return this.master ? (this.masterIsAsio ? this.asioOut.length : this.masterOutChans) : 0;
+  }
+
+  /**
+   * Surround playback: add one channel into a device's multichannel mix.
+   *
+   * A channel the device does not have is **dropped**. It used to wrap onto
+   * `ch % 2`, which silently summed a whole 7.1 rig onto a stereo endpoint at
+   * unity per speaker — +12 dB into `clip()`, i.e. the frequent popping on
+   * multichannel material, with nothing anywhere saying so. Deciding what to do
+   * about a too-narrow device needs the speaker layout, so it belongs in
+   * `speaker-rig`, which has it; by the time a feed reaches here it has already
+   * been folded onto a channel that exists. Dropping is the safe floor for
+   * anything that slips through, and it is silent rather than distorted.
+   */
   pushOutputCh(device: string, ch: number, buf: Float32Array, n: number): void {
     let mix = this.secMix.get(device);
     if (!mix && !this.masterIsAsio && this.master && device === this.masterKey) mix = this.mix;
     if (mix) {
-      const dst = mix[ch] ?? mix[ch % 2];
+      const dst = mix[ch];
       if (!dst) return;
       for (let i = 0; i < n; i++) dst[i] += buf[i];
       return;
     }
     // ASIO master fallback: surround channels map 1:1 onto ASIO channels.
-    const dst = this.asioOut[ch] ?? this.asioOut[ch % 2];
+    const dst = this.asioOut[ch];
     if (!dst) return;
     for (let i = 0; i < n; i++) dst[i] += buf[i];
   }

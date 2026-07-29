@@ -127,16 +127,24 @@ async function offerRestart(version: string): Promise<void> {
   // The version can be blank when the download resolved before the
   // 'update-downloaded' event named it — don't render "LivePatch  ".
   const what = version ? `LivePatch ${version}` : 'The update';
+  // Be specific about the gap. The installer replaces ~2,500 files one at a
+  // time (asar is off), so LivePatch is gone for around a minute with nothing
+  // on screen — and a user who assumes it crashed will relaunch the old copy
+  // from the Start Menu mid-install, which can wedge the update.
   const ok = await confirmModal(
     'Update ready',
-    `${what} has been downloaded. Restart now to install it? ` +
-      `Audio will stop and any unsaved scene should be saved first.`,
-    'Restart now',
+    `${what} has been downloaded. Save any unsaved scene first — audio will stop. ` +
+      `LivePatch will close, install for about a minute with nothing on screen, ` +
+      `then reopen by itself. Don't launch it while it's closed.`,
+    'Install and restart',
   );
   if (!ok) {
     showBanner('The update will install the next time you quit LivePatch.', { ttl: 8000 });
     return;
   }
+  showBanner('Installing update — LivePatch will reopen in about a minute. Don\'t launch it meanwhile.', {
+    accent: '#c9a2ff',
+  });
   const res = await bridge()!.updatesInstall!();
   if (!res.ok) await confirmModal('Update failed', res.error ?? 'Could not start the installer.', 'OK');
 }

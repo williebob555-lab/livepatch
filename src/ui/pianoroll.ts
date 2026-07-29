@@ -40,6 +40,17 @@ const BAR_W = 4;
 const BAR_HEAD = 9;
 const BAR_TOL = 8;
 /**
+ * How much every grab tolerance grows under a finger.
+ *
+ * A mouse cursor is a pixel; a fingertip covers roughly 8–10 mm, and it hides
+ * what it is pointing at. A 5 px stretch handle and a zero-slop note hit test
+ * are usable with a mouse and close to random with a finger — which is what
+ * made the roll "barely controllable" on a touchscreen. Every tolerance below
+ * is multiplied by this when the gesture came from touch or pen, and nothing
+ * changes for mouse input.
+ */
+const TOUCH_SLOP = 2.6;
+/**
  * Shortest note the editor will make, when the grid is off. With a grid on,
  * one grid division is the floor. Nothing may produce a note below this: a
  * sub-pixel note is invisible, un-clickable, and can only be found by
@@ -142,6 +153,16 @@ export class PianoRoll {
   private previewing = -1;
   /** Last note tapped + when — for double-tap-to-delete (touch and mouse). */
   private lastTap = { key: '', at: 0 };
+  /**
+   * Is the current gesture coming from a finger/pen? Set by the host on every
+   * pointer event before it calls in. Drives `slop()` — see `TOUCH_SLOP`.
+   */
+  touch = false;
+
+  /** Grab tolerance in px, widened for touch. */
+  private slop(base: number): number {
+    return this.touch ? base * TOUCH_SLOP : base;
+  }
 
   private markEdit(): void {
     if (!this.edited) {
@@ -222,7 +243,7 @@ export class PianoRoll {
     if (!t || p.x < KEYS_W) return null;
     const ds = Math.abs(this.regX(t.regStart, w, h) - p.x);
     const de = Math.abs(this.regX(t.regEnd, w, h) - p.x);
-    if (Math.min(ds, de) > BAR_TOL) return null;
+    if (Math.min(ds, de) > this.slop(BAR_TOL)) return null;
     return ds <= de ? 'start' : 'end';
   }
 
@@ -233,7 +254,7 @@ export class PianoRoll {
     if (!t || p.x < KEYS_W) return false;
     if (p.y < RULER_H) return true;
     if (t.pos < 0) return false;
-    return Math.abs(this.regX(t.pos, w, h) - p.x) <= BAR_TOL;
+    return Math.abs(this.regX(t.pos, w, h) - p.x) <= this.slop(BAR_TOL);
   }
 
   /** The note under a point, as an index into `d.notes`, or −1. Later notes
@@ -241,9 +262,26 @@ export class PianoRoll {
   noteAt(d: RollData, p: Vec, w: number, h: number): number {
     const n = this.yn(p.y, w, h);
     const beat = this.xb(p.x, w, h);
+    // Horizontal slop, in beats. A 1/16 note at a wide zoom is only a few
+    // pixels across, so an exact containment test made short notes effectively
+    // unselectable — with a mouse it was fiddly, with a finger impossible.
+    const r = this.gridRect(w, h);
+    const tol = (this.slop(3) / Math.max(1, r.w)) * this.view.beats;
     for (let i = d.notes.length - 1; i >= 0; i--) {
       const q = d.notes[i];
-      if (q.n === n && beat >= q.t && beat <= q.t + q.d) return i;
+      if (q.n === n && beat >= q.t - tol && beat <= q.t + q.d + tol) return i;
+    }
+    // Under a finger, allow the neighbouring rows too: a row can be as short as
+    // MIN_ROW (5 px) and the fingertip covers several of them. Exact row first
+    // (above) so a precise hit always wins over a near one.
+    if (!this.touch) return -1;
+    for (let dn = 1; dn <= 1; dn++) {
+      for (const cand of [n + dn, n - dn]) {
+        for (let i = d.notes.length - 1; i >= 0; i--) {
+          const q = d.notes[i];
+          if (q.n === cand && beat >= q.t - tol && beat <= q.t + q.d + tol) return i;
+        }
+      }
     }
     return -1;
   }
@@ -308,7 +346,7 @@ export class PianoRoll {
         return true;
       }
       this.lastTap = { key, at: now };
-      const atEnd = Math.abs(this.bx(q.t + q.d, w, h) - p.x) < HANDLE + 2;
+      const atEnd = Math.abs(this.bx(q.t + q.d, w, h) - p.x) < this.slop(HANDLE + 2);
       if (atEnd) {
         this.markEdit();
         this.drag = { kind: 'len', idx: hit, orig: { ...q } };
@@ -383,7 +421,7 @@ export class PianoRoll {
       return;
     }
     const q = d!.notes[hit];
-    const atEnd = Math.abs(this.bx(q.t + q.d, w, h) - p.x) < HANDLE + 2;
+    const atEnd = Math.abs(this.bx(q.t + q.d, w, h) - p.x) < this.slop(HANDLE + 2);
     this.hover = { kind: atEnd ? 'stretch' : 'note', idx: hit };
   }
 

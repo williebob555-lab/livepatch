@@ -209,6 +209,121 @@ export function addBlockAt(type: string, pos: Vec2): void {
 }
 
 /**
+ * Drop a Library key at a *client* point, if that point is over the workspace.
+ * Shared by the HTML5 `drop` handler and the touch drag below, so the two
+ * gestures land a block in exactly the same way — including the
+ * plugin-onto-an-existing-VST-block case.
+ */
+function dropLibraryKey(key: string, clientX: number, clientY: number): boolean {
+  const canvas = ed.renderer.canvas;
+  const r = canvas.getBoundingClientRect();
+  if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return false;
+  const pos = ed.renderer.toCanvas({ x: clientX - r.left, y: clientY - r.top });
+  if (key.startsWith('vst:')) {
+    const target = blockAt(doc.graph, pos);
+    if (target?.type === 'vst') {
+      const rec = vstPluginList().find((p) => p.cid === key.slice(4));
+      if (rec) {
+        applyPluginToBlock(target, rec);
+        return true;
+      }
+    }
+  }
+  addBlockAt(key, pos);
+  return true;
+}
+
+/**
+ * Touch/pen drag-out from a Library tile.
+ *
+ * ### Why this exists
+ *
+ * The tiles are `draggable` and rely on HTML5 drag-and-drop, which Chromium
+ * drives from **mouse input only** — a touchscreen never produces `dragstart`.
+ * So on a tablet or a touch laptop the Library could not place a block at all
+ * ("you can't pull blocks out of the library"); double-tap-to-centre was the
+ * entire vocabulary.
+ *
+ * ### Why the threshold is horizontal
+ *
+ * The Library scrolls vertically and long-press already opens the tile's
+ * context menu, so neither of the two obvious gestures is free. A drag that
+ * starts out predominantly **sideways** is not a scroll and is not a hold, and
+ * it happens to be the direction the canvas is in from either dock side. A
+ * predominantly vertical start hands the gesture back to the scroller and never
+ * captures the pointer, so the list still flicks normally.
+ */
+function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent): void {
+  const startX = down.clientX;
+  const startY = down.clientY;
+  const id = down.pointerId;
+  let ghost: HTMLElement | null = null;
+  let active = false;
+  let dead = false;
+
+  const cleanup = (): void => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onUp);
+    ghost?.remove();
+    ghost = null;
+    try {
+      tile.releasePointerCapture(id);
+    } catch {
+      /* pointer already gone */
+    }
+  };
+
+  function onMove(ev: PointerEvent): void {
+    if (ev.pointerId !== id || dead) return;
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    if (!active) {
+      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+      // Vertical intent → this is a scroll, not a drag. Bow out entirely.
+      if (Math.abs(dy) > Math.abs(dx)) {
+        dead = true;
+        cleanup();
+        return;
+      }
+      active = true;
+      try {
+        tile.setPointerCapture(id);
+      } catch {
+        /* capture is best-effort; the window listeners still work */
+      }
+      ghost = document.createElement('div');
+      ghost.className = 'lib-drag-ghost';
+      ghost.textContent = entry.title;
+      document.body.appendChild(ghost);
+    }
+    // Once dragging, the page must not also pan/scroll under the finger.
+    ev.preventDefault();
+    if (ghost) {
+      ghost.style.left = ev.clientX + 'px';
+      ghost.style.top = ev.clientY + 'px';
+    }
+    const over = ed.renderer.canvas.getBoundingClientRect();
+    const inside =
+      ev.clientX >= over.left && ev.clientX <= over.right && ev.clientY >= over.top && ev.clientY <= over.bottom;
+    ghost?.classList.toggle('over', inside);
+  }
+
+  function onUp(ev: PointerEvent): void {
+    if (ev.pointerId !== id) return;
+    const wasActive = active;
+    cleanup();
+    // A tap that never became a drag is left alone — click/dblclick/long-press
+    // all still reach the tile.
+    if (wasActive) dropLibraryKey(entry.key, ev.clientX, ev.clientY);
+  }
+
+  window.addEventListener('pointermove', onMove, { passive: false });
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+}
+
+/**
  * The Library's pinned (and, failing that, recently used) entries as menu
  * items, for the canvas's own right-click menu.
  *
@@ -645,6 +760,16 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
       ev.dataTransfer!.setData('text/livepatch-block', e.key);
       ev.dataTransfer!.effectAllowed = 'copy';
       hideHoverCard();
+    });
+    // HTML5 drag-and-drop is MOUSE ONLY — Chromium never synthesizes dragstart
+    // from touch, so on a touchscreen the Library was a dead end: the only way
+    // to place a block was double-tap-to-centre. This is the pointer-event
+    // fallback: press, drag past a threshold, and a ghost follows the finger
+    // onto the canvas. Mouse pointers are left to the native DnD path above,
+    // which already works and carries the OS drag cursor.
+    tile.addEventListener('pointerdown', (ev) => {
+      if (ev.pointerType === 'mouse' || ev.button !== 0) return;
+      beginTouchDrag(e, tile, ev);
     });
     tile.addEventListener('dblclick', () => addAtCenter(e.key));
     tile.addEventListener('contextmenu', (ev) => {
@@ -1152,6 +1277,18 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
               });
             });
             r.append(i, browse);
+          } else if (spec.type === 'string' && spec.multiline) {
+            // Prose (a Comment's text): a textarea, so newlines are typed
+            // rather than pasted. Committed on 'change' (blur) like the
+            // single-line box — one history entry per edit, not per keystroke.
+            const t = document.createElement('textarea');
+            t.rows = 4;
+            t.value = String(v ?? '');
+            t.addEventListener('change', () => {
+              doc.pushHistory();
+              ed.setParamLive(b, spec, t.value, null);
+            });
+            r.appendChild(t);
           } else if (spec.type === 'string') {
             const i = document.createElement('input');
             i.type = 'text';
@@ -2455,21 +2592,10 @@ export function initPanels(editor: Editor): void {
     const type = e.dataTransfer?.getData('text/livepatch-block');
     if (!type) return;
     e.preventDefault();
-    const r = canvas.getBoundingClientRect();
-    const pos = editor.renderer.toCanvas({ x: e.clientX - r.left, y: e.clientY - r.top });
     // A plugin dropped onto an existing VST block loads into that block
-    // (cassette-into-deck gesture); anywhere else it spawns a new block.
-    if (type.startsWith('vst:')) {
-      const target = blockAt(doc.graph, pos);
-      if (target?.type === 'vst') {
-        const rec = vstPluginList().find((p) => p.cid === type.slice(4));
-        if (rec) {
-          applyPluginToBlock(target, rec);
-          return;
-        }
-      }
-    }
-    addBlockAt(type, pos);
+    // (cassette-into-deck gesture); anywhere else it spawns a new block. Shared
+    // with the touch drag so both gestures land identically.
+    dropLibraryKey(type, e.clientX, e.clientY);
   });
 }
 

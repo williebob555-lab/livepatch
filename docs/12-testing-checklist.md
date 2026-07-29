@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-07-25._
+_Last verified: 2026-07-28._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -119,9 +119,91 @@ here and now doesn't, that's the bug.
       `amb-rotate` moves the field; `amb-encode → amb-binaural` images on
       headphones. All ambi blocks share the `[W,Y,Z,X]` channel layout — a
       swapped axis rotates/mirrors silently.
+- [ ] **The Ambi Encode pad works all the way in.** Drag it outward along one
+      angle: the image must *tighten* as it goes (it is directivity, not
+      direction), and at the centre every speaker must be equal — the source
+      comes from everywhere. Wiggling around the centre must NOT swing the image
+      left/right; if it does, the vector is being normalised again.
+- [ ] **Ambisonics is level-matched to the Panner.** A/B `panner3d` against
+      `amb-encode → amb-decode` with the same source: no obvious level jump
+      (measured within ~1 dB), and no single speaker at full scale. Same for
+      `amb-binaural` on headphones — a full-scale mono source should land near
+      −3 dBFS per ear, not above 0.
+- [ ] **Pianola length.** Author a roll whose last note ends well before the
+      declared end (e.g. one note in an 8-beat roll). It must loop on the
+      **repeat bar**, not on the last note-off, and the playhead must reach the
+      right edge exactly as the loop wraps. Scriptable: drive the kernel and
+      check the note-on interval equals `beats / bpm × 60`.
+- [ ] The playhead must glide, not step, while playing — it is dead-reckoned
+      between the ~15 Hz engine fixes.
 - [ ] `spatial-scope`: draws the rig layout with audio off; each speaker lights
       by its live level under the native engine; height speakers show the
       accent ring. Channel order matches the rig.
+- [ ] **Spatial Scope on the WEB engine.** `webaudio` is the *default* engine,
+      and its surround blocks are all stubbed — so this is what a new user
+      actually sees first. The scope must still light up (per-channel analysers
+      on the wide hub, `Unit.setChans`, docs/04). It reading permanently dark
+      was the "surround visualizer wasn't doing anything" report, and it had
+      nothing to do with ASIO.
+- [ ] **Device narrower than the rig.** Put an 8-speaker rig on a *stereo*
+      Windows endpoint (any laptop) and play loud, correlated material.
+      - No popping or distortion. (Old behaviour: 8 unity feeds summed onto 2
+        channels = peak 4.000 through `clip()`.)
+      - The Speaker Rig face shows the fold banner, e.g. `8 spk → 2 ch ·
+        6 folded`. A truncation you cannot see is the same bug in a costume.
+      - All three `fold` modes (Fold / Drop / Wrap) stay under full scale.
+        Scriptable — drive the kernel directly with full-scale correlated feeds
+        on every speaker and check the per-channel peak (expect ≈ 0.995, the
+        limiter ceiling).
+- [ ] `speaker-monitor`: click a bar to mute that speaker, shift-click to solo.
+      Muted/soloed-out bars dim and get a strike; solo overrides mute and
+      releasing solo restores the mutes. Mute/solo transitions must be
+      **click-free** — they ramp across the quantum.
+- [ ] `chan-pick`: picks the channels you asked for (check against the wire's
+      channel legend), and a channel the bus doesn't carry is silent, not
+      wrapped.
+- [ ] **Built-in CV inputs show modulation.** Wire an `orbit` into a
+      `panner3d`'s x/y and watch the XY pad: the purple marker must track the
+      source around the room. Same for `amb-encode` x/y/z and `amb-rotate` yaw
+      (which also moves under `spin`).
+- [ ] **CV indicators mean a cable, not a port.** Add a CV input to a knob and
+      patch nothing: **no** purple marker and **no** corner dot. Plug a cable
+      in — both appear. Unplug — both go. Then check the same for a built-in
+      CV port (a Panner's `z` with nothing on it must stay clean while `x`/`y`
+      are driven). Finally confirm *Remove CV input* still appears for the
+      added-but-unpatched port — the toggle keys on existence, the indicators
+      on wiring, and conflating the two breaks one or the other.
+- [ ] Repeat the above for a widget **mirrored into the Dock from inside a
+      subgraph**: the cable lives in a graph that isn't open, and a graph-local
+      lookup would wrongly report it unwired.
+- [ ] **Truncation is legible.** A wide net into a stereo port shows `12→2` on
+      the wire, and hovering it lists the channels with the dropped ones struck
+      through and named. This is the only warning the user gets that a
+      truncation is happening — it is legal by design (docs/02) but must never
+      be invisible.
+
+## Touch / pen input (`src/ui/editor.ts`, `panels.ts`, `clipview.ts`)
+
+Test on a real touchscreen — synthesized pointer events don't reproduce the
+OS-level gestures that cause most of these.
+
+- [ ] **Library drag-out by touch.** Press a tile and drag *sideways* onto the
+      canvas: a ghost chip follows the finger, highlights over the workspace,
+      and drops a block. HTML5 DnD is mouse-only, so this is a separate code
+      path (`beginTouchDrag`) and mouse drag must keep working too.
+- [ ] **Library scrolls by touch.** A predominantly *vertical* drag on a tile
+      scrolls the list and does NOT drag a block out.
+- [ ] **Slow block drags don't summon a menu.** Drag a block slowly and
+      precisely by touch, and again with a precision touchpad. No context menu,
+      and the block must not snap back to where it started. Both the OS and our
+      own long-press timer can cause this — see docs/07.
+- [ ] **Long-press still works.** Press and *hold* without moving: the context
+      menu opens as before. The fix above must not have killed the feature.
+- [ ] Ports, wire ends, roll notes, note stretch handles and rig speakers are
+      all grabbable with a finger (tolerances widen ~2.6× for touch/pen).
+      Verify mouse precision is *unchanged*.
+- [ ] Piano roll pinch zooms **both** axes — spread horizontally for time,
+      vertically for pitch.
 
 ## VST hosting changes (`native/vsthost`, `engine/src/vst.ts`)
 
@@ -469,6 +551,106 @@ Drive the engine over the protocol and read **signed post-CV values** out of the
 range −1..1) so the reported value is `clamp(2*cv, −1, 1)`; net rms gives |cv|.
 Run the same cases on the web engine (`runtime.modValueFor` after
 `runtime.setAudio(true)`) and compare. CV/logic is currently 19/19 identical.
+
+## The runtime diagnostics log — ask for this file first
+
+Every run writes one JSONL file to
+`%APPDATA%/LivePatch/diagnostics/livepatch-<timestamp>.log` (last 10 kept).
+It is meant to be **handed over**: when someone reports a pop, an xrun storm or
+a device opening at the wrong width, this file is the first thing to ask for.
+
+Written **only by the Electron main process** (`electron/main.cjs`). That is a
+design constraint, not an accident: main already sees every engine message —
+they all funnel through `pushToRenderer` — and every engine stderr line, so the
+log never goes near the audio pump. File IO on the pump thread is one of the
+faults this log exists to catch; it must not become a way to cause one.
+
+Records:
+
+| kind | what |
+|---|---|
+| `session` | app/Electron/Node/Chrome versions, OS, CPU, cores, RAM, userData path |
+| `devices` | every enumerated endpoint with its in/out channel counts |
+| `engine-spawn` / `engine-exit` | pid, which runtime, entry path, exit code |
+| `engine-stderr` | 4000 chars (the status bar truncates to 400 — VST `UI_ERR` reasons get cut mid-sentence) |
+| `status` | the 2 s telemetry: `xruns`, `load`, `loadMax`, `jitterQ`, `late`, `frames`, `latencyFrames`, `sampleRate`, `api` |
+| `app` | whatever the renderer contributes via `diagLog(kind, data)` |
+
+Two things make it actually diagnostic rather than just verbose:
+
+- **`xrunsDelta`** is derived on every `status`. The engine reports xruns as a
+  running total, so a file of totals makes you subtract by hand to find the only
+  interesting part — the rate, and when it changed.
+- **The GC probe is on by default** (`LIVEPATCH_ENGINE_GCLOG`, set at spawn;
+  `=0` opts out). A GC pause on the engine thread stalls the audio pump and is
+  undetectable after the fact. A `gc ... max=` line next to a non-zero
+  `xrunsDelta` is the signature of a GC stall taking out the pump.
+
+**`levels`, `mods` and `visuals` are deliberately dropped.** They arrive at
+20-30 Hz and would bury the signal under tens of MB of meter readings.
+
+Reading it: the `t` field is seconds since session start, so
+`xrunsDelta` against `t` gives the xrun rate directly.
+
+## Zero-allocation guard (reusable) — run this when chasing a periodic pop
+
+```
+npm run build:engine && node --expose-gc scripts/audio-alloc-test.cjs
+```
+
+Allocating in `process` does not sound wrong, fail a test, or look like
+anything in a profile. The garbage piles up until V8 collects it, and the
+collection is a **pop** — steady, musical-sounding, and very hard to trace back
+to the line that caused it. On the engine's thread a GC pause stalls the audio
+pump directly (see the `LIVEPATCH_ENGINE_GCLOG` probe in `engine/src/main.ts`).
+
+The specific trap it was written for: **`dst.set(src.subarray(0, n))`.**
+`subarray` returns a *new TypedArray view object* every call. It reads as a
+pure copy. The shared `copy()` helper used it, so every connected kernel was
+allocating a view per channel per quantum (measured: 8/quantum on a 10-kernel
+patch, now 0).
+
+Two independent measurements, because either alone misleads:
+
+1. **`Float32Array.prototype.subarray` is counted directly** — exact and
+   unambiguous for the construct that caused it. Must be 0.
+2. **Heap growth at two run lengths**, where *the slope is the assertion*. V8's
+   own JIT/inline-cache growth costs tens of B/quantum early and decays to
+   near zero; a real allocation stays flat. Measuring once, short, reports a
+   clean audio path as dirty — the first version of this script did exactly
+   that (410 B/quantum) and was measuring **its own** `{in: buf}` literal.
+
+**If you add to this script, hoist everything out of the drive loop.** A
+harness that allocates per quantum costs ~40 B/quantum, the same order as the
+bug being hunted.
+
+## Spatial / utility kernel probe (reusable)
+
+```
+npm run build:engine && node scripts/spatial-kernel-test.cjs
+```
+
+Covers `note-space`, `feedback` and `spectral-scatter` headlessly — the three
+blocks whose failure modes are *silent* rather than loud. Each case asserts on
+numbers, because "audio came out" is true of every one of these bugs:
+
+- **note-space** — each axis source maps to the range it claims (pitch across
+  Low..High, velocity, channel 0..15, round-robin wrapping at `voices`),
+  note-off *holds* position instead of recentring, MIDI passes through with its
+  sub-quantum `offset`, and the slew is an exponential glide of the right
+  **shape** (one time constant lands on 1 − e⁻¹, five arrive). Asserting the
+  shape and not merely "it moved" is what catches a slew that has quietly
+  become a jump or a per-quantum step.
+- **feedback** — DC is blocked, *and* the same case with `dcblock` off shows DC
+  passing (without the control, the first assertion passes just as well when
+  the whole loop has died). The limiter holds the ceiling against an 8× input;
+  damping attenuates 8 kHz against an open-loop control; an 8-channel bus comes
+  out 8 channels wide with per-channel identity preserved.
+- **spectral-scatter** — low and high tones land on *different* speakers, the
+  LFE is never fed by the panner, total energy stays inside a constant-power
+  window (the crossover cascade neither eats nor doubles the signal), spin
+  redistributes over time, silence in gives silence out, and changing `Bands`
+  mid-run stays finite (the filter-state reset).
 
 ## Deterministic clock-drift sim (reusable)
 

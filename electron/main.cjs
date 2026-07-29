@@ -2,12 +2,148 @@
 // Owns: window lifecycle, native file dialogs (import/export), the local scene
 // registry on disk, in-app updates, and (in the future) supervision of the
 // native audio engine process (see README "Native engine protocol").
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 
 const SCENE_EXT = '.lps'; // LivePatch Scene (JSON)
+
+// ============================================================================
+// Runtime diagnostics log — one file per run, meant to be handed to someone.
+//
+// Written **only from the Electron main process**. That is the whole design
+// constraint: main already sees every engine message (they all pass through
+// `pushToRenderer`) and every engine stderr line, so nothing here goes near the
+// audio pump. File IO on the pump thread is the bug this log exists to find; it
+// must not be a way to cause it (docs/10, rule 1).
+//
+// What it is for: the class of fault that is invisible in a screenshot and gone
+// by the time you look — periodic pops, xruns, GC stalls, a device opening at
+// the wrong width, an engine that quietly died and restarted.
+//
+// Deliberately NOT logged: `levels`, `mods` and `visuals`. Those arrive at
+// 20-30 Hz and would bury the signal in tens of MB of meter readings. `status`
+// is the useful stream — it carries xruns, load, loadMax, jitter and buffer
+// geometry every 2 s — and it is small enough to keep all of.
+// ============================================================================
+const DIAG_MAX_BYTES = 8 * 1024 * 1024; // hard cap; a wedged engine can be chatty
+const DIAG_KEEP_FILES = 10;
+let diagFd = null;
+let diagPath = null;
+let diagBytes = 0;
+let diagCapped = false;
+let diagStartMs = Date.now();
+let diagLastXruns = null;
+
+function diagDir() {
+  const dir = path.join(app.getPath('userData'), 'diagnostics');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Keep the folder from growing forever — the user only ever sends the latest. */
+function diagPrune() {
+  try {
+    const dir = diagDir();
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith('livepatch-') && f.endsWith('.log'))
+      .map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t);
+    for (const { f } of files.slice(DIAG_KEEP_FILES)) fs.unlinkSync(path.join(dir, f));
+  } catch {
+    /* pruning is best-effort; never block startup on it */
+  }
+}
+
+function diagInit() {
+  if (diagFd !== null) return;
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    diagPath = path.join(diagDir(), `livepatch-${stamp}.log`);
+    diagFd = fs.openSync(diagPath, 'a');
+    diagStartMs = Date.now();
+    diagPrune();
+    // Header first: nine times out of ten the answer is in the environment
+    // (wrong sample rate, 2-channel device under a 7.1 rig, engine running on
+    // electron-as-node because no real node.exe was found).
+    diagWrite('session', {
+      app: app.getVersion(),
+      electron: process.versions.electron,
+      chrome: process.versions.chrome,
+      node: process.versions.node,
+      platform: `${os.platform()} ${os.release()}`,
+      arch: process.arch,
+      cpu: (os.cpus()[0] || {}).model,
+      cores: os.cpus().length,
+      totalMemMB: Math.round(os.totalmem() / 1048576),
+      userData: app.getPath('userData'),
+      argv: process.argv.slice(1),
+    });
+  } catch (err) {
+    diagFd = null; // logging must never take the app down
+    process.stderr.write('LivePatch: could not open diagnostics log: ' + String(err) + '\n');
+  }
+}
+
+/** Append one JSONL record. `kind` groups records; `data` is free-form. */
+function diagWrite(kind, data) {
+  if (diagFd === null) diagInit();
+  if (diagFd === null || diagCapped) return;
+  try {
+    const line =
+      JSON.stringify({ t: ((Date.now() - diagStartMs) / 1000).toFixed(3), kind, ...data }) + '\n';
+    diagBytes += Buffer.byteLength(line);
+    if (diagBytes > DIAG_MAX_BYTES) {
+      diagCapped = true;
+      fs.writeSync(diagFd, JSON.stringify({ kind: 'capped', note: 'log size limit reached' }) + '\n');
+      return;
+    }
+    fs.writeSync(diagFd, line);
+  } catch {
+    /* a failed write must not cascade into the app */
+  }
+}
+
+/**
+ * Tee an engine message into the log, filtered.
+ *
+ * `status` gets one derived field the raw message does not have: **xrunsDelta**.
+ * The engine reports xruns as a running total, so a file full of totals makes
+ * you subtract by hand to find the interesting thing, which is the *rate* and
+ * exactly when it changed. A non-zero delta next to a `gc` line with a big
+ * `max=` is the signature of a GC stall taking out the audio pump.
+ */
+function diagFromEngine(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  const op = msg.op;
+  if (op === 'levels' || op === 'mods' || op === 'visuals' || op === 'midi-seen') return;
+  if (op === 'status') {
+    const rec = { ...msg };
+    delete rec.op;
+    if (typeof msg.xruns === 'number') {
+      rec.xrunsDelta = diagLastXruns === null ? 0 : msg.xruns - diagLastXruns;
+      diagLastXruns = msg.xruns;
+    }
+    diagWrite('status', rec);
+    return;
+  }
+  if (op === 'devices') {
+    // Names and channel counts only — the full descriptors are long and the
+    // interesting question is just "what was available, and how wide".
+    const list = Array.isArray(msg.devices) ? msg.devices : [];
+    diagWrite('devices', {
+      count: list.length,
+      devices: list.map((d) => `${d.api}:${d.name} in=${d.inputChannels} out=${d.outputChannels}`),
+    });
+    return;
+  }
+  const rec = { ...msg };
+  delete rec.op;
+  diagWrite(op || 'engine', rec);
+}
 
 function scenesDir() {
   const dir = path.join(app.getPath('userData'), 'scenes');
@@ -171,6 +307,10 @@ function pushToRenderer(msg) {
   if (process.env.LIVEPATCH_ENGINE_SMOKE) {
     console.log('[engine]', JSON.stringify(msg).slice(0, 300));
   }
+  // Tee to the diagnostics log before delivery: every engine message already
+  // funnels through here, so this one line captures the whole stream without
+  // touching the engine or the audio path.
+  diagFromEngine(msg);
   if (engineWin && !engineWin.isDestroyed()) engineWin.webContents.send('engine:message', msg);
 }
 
@@ -184,6 +324,13 @@ function spawnEngine() {
   const nodeExe = findNodeExe();
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
+  // GC telemetry on by default now that there is a file to put it in. The probe
+  // is a PerformanceObserver that only sums counters and reports every 2 s
+  // (`engine/src/main.ts`) — negligible next to what it buys, since a GC pause
+  // on the engine thread stalls the audio pump and is otherwise undetectable
+  // after the fact. Set LIVEPATCH_ENGINE_GCLOG=0 to opt out.
+  if (env.LIVEPATCH_ENGINE_GCLOG === undefined) env.LIVEPATCH_ENGINE_GCLOG = '1';
+  else if (env.LIVEPATCH_ENGINE_GCLOG === '0') delete env.LIVEPATCH_ENGINE_GCLOG;
   if (!nodeExe) {
     pushToRenderer({
       op: 'status',
@@ -203,6 +350,12 @@ function spawnEngine() {
     windowsHide: true,
   });
   engineProc = p;
+  diagWrite('engine-spawn', {
+    pid: p.pid,
+    runtime: nodeExe || process.execPath + ' (electron-as-node)',
+    entry,
+    gcProbe: env.LIVEPATCH_ENGINE_GCLOG === '1',
+  });
   let carry = '';
   p.stdout.on('data', (chunk) => {
     carry += chunk.toString('utf8');
@@ -222,9 +375,14 @@ function spawnEngine() {
     const text = String(chunk).trim();
     // RtMidi prints a benign WinMM notice when no MIDI devices are connected.
     if (!text || /MidiInWinMM|no MIDI input devices/i.test(text)) return;
+    // The log keeps more of it than the status bar shows: stderr is where the
+    // VST host's UI_ERR diagnostics land (docs/13) and 400 chars truncates them
+    // mid-reason.
+    diagWrite('engine-stderr', { text: text.slice(0, 4000) });
     pushToRenderer({ op: 'status', error: 'engine stderr: ' + text.slice(0, 400) });
   });
   p.on('exit', (code) => {
+    diagWrite('engine-exit', { code, wanted: engineWanted });
     engineProc = null;
     if (!engineWanted) return;
     // Throttled auto-restart: max 3 within 20s, then give up loudly.
@@ -377,6 +535,53 @@ function createWindow() {
   else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   engineWin = win;
 }
+
+/**
+ * Exactly one LivePatch per user profile.
+ *
+ * Without this lock a second launch shares one `userData` directory with the
+ * first, and Chromium's disk caches are single-writer. That is what produces
+ * the startup spew:
+ *
+ *   cache_util_win.cc  Unable to move the cache: Access is denied. (0x5)
+ *   disk_cache.cc      Unable to create cache
+ *   gpu_disk_cache.cc  Gpu Cache Creation failed: -2
+ *
+ * Those three are cosmetic in themselves — Chromium falls back to an
+ * in-memory cache and the app runs — but they are a *symptom worth taking
+ * seriously*, because the second instance does not stop at the cache:
+ *
+ *   - It spawns its **own native engine process**, which opens the same audio
+ *     devices. Two engines sharing one endpoint is a direct cause of xruns and
+ *     dropouts, and the second one is invisible in the UI.
+ *   - The session store (leveldb under `userData`) is also single-writer, so
+ *     autosave from two instances races.
+ *
+ * So the fix is a real one, not log suppression. The second launch hands its
+ * argv to the running instance and exits; the running window is raised, which
+ * is also what a user double-clicking the icon again actually wants.
+ */
+if (!app.requestSingleInstanceLock()) {
+  // Say so on the way out. A silent exit is the wrong failure mode in dev: if a
+  // previous run left a zombie `electron.exe` holding the lock, the next launch
+  // would just... not appear, with nothing anywhere explaining why. One line
+  // costs nothing and turns "the app won't start" into "kill the stale process".
+  process.stderr.write(
+    'LivePatch: another instance already owns this profile — raising it and exiting.\n' +
+      'If no window appears, a previous run is still alive: taskkill /IM electron.exe /F\n',
+  );
+  app.quit();
+  // `quit()` unwinds asynchronously — returning here would let the rest of this
+  // module keep initialising (spawning an engine, registering IPC) in a process
+  // that is on its way out. Exit now instead.
+  process.exit(0);
+}
+app.on('second-instance', () => {
+  if (!engineWin) return;
+  if (engineWin.isMinimized()) engineWin.restore();
+  engineWin.show();
+  engineWin.focus();
+});
 
 app.whenReady().then(() => {
   // ---- Scene registry (userData/scenes/*.lps) ----
@@ -557,6 +762,24 @@ app.whenReady().then(() => {
   ipcMain.handle('cassettes:savePcm', (_e, id, data) => {
     fs.writeFileSync(path.join(cassettesDir(), safeId(id) + '.pcm'), Buffer.from(data));
     return true;
+  });
+
+  // ---- Diagnostics log ----
+  // `diag:log` lets the renderer contribute what only it knows: which engine is
+  // selected, the patch's shape, the rig width, a UI action just before a pop.
+  // The renderer never touches the file itself — one writer, one file.
+  ipcMain.handle('diag:log', (_e, kind, data) => {
+    diagWrite(typeof kind === 'string' ? kind : 'app', data && typeof data === 'object' ? data : {});
+    return true;
+  });
+  ipcMain.handle('diag:path', () => {
+    if (diagFd === null) diagInit();
+    return diagPath;
+  });
+  ipcMain.handle('diag:reveal', () => {
+    if (diagFd === null) diagInit();
+    if (diagPath) shell.showItemInFolder(diagPath);
+    return diagPath;
   });
 
   // ---- Native engine ----

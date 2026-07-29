@@ -87,6 +87,39 @@ changed" failure.
 `npm version` refuses to run on a dirty tree, so commit first — that is the
 only manual gate left.
 
+### If a release uploads but never appears
+
+**An existing draft with the same tag silently wins over `releaseType`.**
+`electron-publish/out/gitHubPublisher.js` does `if (release.draft) return
+release` when matching an existing release by tag — it reuses the draft and
+never reconsiders whether it should have been published. So a draft left over
+from an abandoned run swallows every later upload for that version, the build
+reports success, and the app keeps saying "up to date".
+
+Worse, **drafts are invisible to unauthenticated API calls**, so
+`curl .../releases` shows nothing and the release looks like it never
+uploaded. Always check with a token:
+
+```
+$h=@{Authorization="Bearer $env:GH_TOKEN"}
+Invoke-RestMethod https://api.github.com/repos/<owner>/<repo>/releases -Headers $h |
+  % { "$($_.tag_name) draft=$($_.draft) assets=$($_.assets.Count)" }
+```
+
+Fix: publish the draft, or delete it and re-run. Deleting a *release* leaves
+its git tag behind, which is where stray tags come from.
+
+### Rebuild these before shipping, or the release quietly loses them
+
+Neither is covered by `npm run ship`, and neither fails loudly:
+
+- **Touched `native/vsthost`?** Run `npm run build:vsthost`. The addon is
+  gitignored and packaged from your local `build/Release/`; the `filter` in
+  `electron-builder.yml` copies it *only when present*, so a stale or missing
+  addon ships a build where VST3 hosting is silently unavailable.
+- **Touched `brand/*.svg`?** Run `npm run brand`. `build/icon.ico` and
+  `brand/png/` are generated, and the README banner is served from `png/`.
+
 `publish.releaseType: release` means uploads go **live immediately** rather
 than sitting as a draft. That removes the last click, at the cost of the
 safety net: a broken build reaches users the moment the upload finishes. Set

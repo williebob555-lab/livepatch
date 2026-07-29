@@ -1612,6 +1612,23 @@ function build(body: HTMLElement): DockTabHandle {
       invalidate();
     },
   };
+  /**
+   * Last playhead value the engine actually reported, and when it landed.
+   *
+   * The engine ships transport on the visuals timer at ~15 Hz, but the canvas
+   * draws at 60. Painting the raw value means the bar advances in ~66 ms steps
+   * and sits up to 66 ms behind the notes you are hearing — visible stutter and
+   * a constant lag, both of which read as "the playhead is out of sync".
+   *
+   * So the raw value is treated as a *fix* and the bar is dead-reckoned from it
+   * between fixes: tempo is known exactly, so the extrapolation rate is exact
+   * and the only error is the constant IPC delay on the fix itself. Capped at
+   * `MAX_EXTRAP` so a stalled or stopped engine can never let the bar run away
+   * on its own.
+   */
+  let posFix = { pos: -1, at: 0 };
+  const MAX_EXTRAP = 0.25; // seconds of dead reckoning per fix
+
   const syncRollTransport = (b: Block, rd: RollData | null): void => {
     const player = playerFor(b);
     rollPlayer = player ?? null;
@@ -1624,13 +1641,34 @@ function build(body: HTMLElement): DockTabHandle {
       const v = player.params[id];
       return typeof v === 'number' ? Math.max(0, Math.min(1, v)) : dflt;
     };
-    rollTransport.endBeats = rollPlayEnd(rd);
+    const endBeats = rollPlayEnd(rd);
+    rollTransport.endBeats = endBeats;
     rollTransport.regStart = frac('regStart', 0);
     rollTransport.regEnd = frac('regEnd', 1);
     // While scrubbing, the pointer owns the playhead — an engine frame arriving
     // mid-drag would otherwise yank it back to where playback actually is.
-    if (tp && tp.pos >= 0) rollTransport.pos = tp.pos;
-    else if (roll.drag.kind !== 'seek') rollTransport.pos = frac('seek', 0);
+    if (tp && tp.pos >= 0) {
+      const now = performance.now();
+      if (tp.pos !== posFix.pos) posFix = { pos: tp.pos, at: now };
+      let p = posFix.pos;
+      if (tp.playing) {
+        const bpm = Math.max(1, Number(player.params.bpm) || 120);
+        const elapsed = Math.min(MAX_EXTRAP, (now - posFix.at) / 1000);
+        p += ((elapsed * bpm) / 60 / endBeats) * (roll.drag.kind === 'seek' ? 0 : 1);
+        // Respect the repeat bars: dead reckoning must wrap where playback
+        // wraps, or the bar sails past the loop point for a frame or two.
+        const a = Math.min(rollTransport.regStart, rollTransport.regEnd);
+        const bEnd = Math.max(rollTransport.regStart, rollTransport.regEnd);
+        const span = bEnd - a;
+        if (span > 1e-6 && p > bEnd) {
+          p = player.params.loop === false ? bEnd : a + ((p - a) % span);
+        }
+      }
+      rollTransport.pos = Math.max(0, Math.min(1, p));
+    } else if (roll.drag.kind !== 'seek') {
+      posFix = { pos: -1, at: 0 };
+      rollTransport.pos = frac('seek', 0);
+    }
     roll.transport = rollTransport;
   };
 
@@ -1796,7 +1834,26 @@ function build(body: HTMLElement): DockTabHandle {
   // the second finger for both surfaces. Same shape as the workspace canvas's
   // gesture handler, scoped to whichever surface is showing.
   const pointers = new Map<number, Vec>();
-  let gesture: { dist: number; midX: number; midY: number; view: typeof view; rollView: RollView } | null = null;
+  let gesture: {
+    dist: number;
+    /** Per-axis finger separations, for the roll's independent x/y zoom. */
+    spanX: number;
+    spanY: number;
+    midX: number;
+    midY: number;
+    view: typeof view;
+    rollView: RollView;
+  } | null = null;
+
+  /**
+   * Floor for a pinch's per-axis separation.
+   *
+   * Two fingers side by side have a vertical separation near zero, and a ratio
+   * of two near-zero numbers is noise — it would make the pitch axis explode
+   * the instant the fingers levelled out. Below this the axis simply stops
+   * zooming, which is also the intuitive reading of a horizontal pinch.
+   */
+  const PINCH_FLOOR = 40;
 
   const beginGesture = (): void => {
     const pts = [...pointers.values()];
@@ -1808,6 +1865,8 @@ function build(body: HTMLElement): DockTabHandle {
     const dy = pts[0].y - pts[1].y;
     gesture = {
       dist: Math.max(1, Math.hypot(dx, dy)),
+      spanX: Math.max(PINCH_FLOOR, Math.abs(dx)),
+      spanY: Math.max(PINCH_FLOOR, Math.abs(dy)),
       midX: (pts[0].x + pts[1].x) / 2,
       midY: (pts[0].y + pts[1].y) / 2,
       view: { ...view },
@@ -1828,16 +1887,27 @@ function build(body: HTMLElement): DockTabHandle {
     if (b && isRollBlock(b.type)) {
       const g0 = gesture.rollView;
       const rr = roll.gridRect(canvas.clientWidth, canvas.clientHeight);
-      const span = Math.max(0.5, Math.min(256, g0.beats * zoom));
+      // The roll is a genuinely 2D editor, so its pinch is per-axis: a
+      // horizontal spread zooms time, a vertical one zooms PITCH. Without the
+      // vertical half there was no way to zoom pitch by touch at all — rows sat
+      // at whatever `rows` happened to be, often near the 5 px floor, and a
+      // note row that small cannot be hit however generous the slop is.
+      const zoomX = gesture.spanX / Math.max(PINCH_FLOOR, Math.abs(dx));
+      const zoomY = gesture.spanY / Math.max(PINCH_FLOOR, Math.abs(dy));
+      const span = Math.max(0.5, Math.min(256, g0.beats * zoomX));
+      const rows = Math.max(6, Math.min(96, Math.round(g0.rows * zoomY)));
       // Anchor the beat under the start midpoint; pan by the midpoint move.
       const frac = (gesture.midX - rr.x) / Math.max(1, rr.w);
       const anchorBeat = g0.t0 + frac * g0.beats;
       roll.view.beats = span;
+      roll.view.rows = rows;
       roll.view.t0 = Math.max(0, anchorBeat - frac * span - ((midX - gesture.midX) / rr.w) * span);
-      roll.view.lo = Math.max(
-        0,
-        Math.min(127 - g0.rows, Math.round(g0.lo - (midY - gesture.midY) / roll.rowH(canvas.clientHeight))),
-      );
+      // Keep the note under the vertical midpoint put while `rows` changes,
+      // then apply the midpoint's own travel as a pan.
+      const vFrac = (gesture.midY - rr.y) / Math.max(1, rr.h);
+      const anchorNote = g0.lo + (1 - vFrac) * g0.rows;
+      const lo = anchorNote - (1 - vFrac) * rows - (midY - gesture.midY) / roll.rowH(canvas.clientHeight);
+      roll.view.lo = Math.max(0, Math.min(127 - rows, Math.round(lo)));
     } else {
       const g0 = gesture.view;
       const span0 = g0.t1 - g0.t0;
@@ -1859,6 +1929,9 @@ function build(body: HTMLElement): DockTabHandle {
     const p = toSurface(e);
     const b = target();
     if (!b) return;
+    // Every grab tolerance in the roll widens for a fingertip — see
+    // `TOUCH_SLOP` in pianoroll.ts. Set before any hit test runs.
+    roll.touch = e.pointerType !== 'mouse';
     try {
       canvas.setPointerCapture(e.pointerId);
     } catch {}
@@ -1956,6 +2029,7 @@ function build(body: HTMLElement): DockTabHandle {
 
   canvas.addEventListener('pointermove', (e) => {
     const p = toSurface(e);
+    roll.touch = e.pointerType !== 'mouse';
     noSnap = e.altKey;
     // Ctrl held = "this drag selects" — the cursor has to say so before the
     // button goes down, or the modifier is invisible.
@@ -2174,6 +2248,11 @@ function build(body: HTMLElement): DockTabHandle {
 
   canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    // Not on top of a live drag. Windows touch press-and-hold and precision
+    // touchpad tap-and-hold both synthesize this with their own loose movement
+    // slop, so a slow note drag or bar drag would open a menu over itself —
+    // the same failure as on the workspace canvas (see editor.ts).
+    if (drag.kind !== 'none' || gesture || roll.drag.kind !== 'none') return;
     const b = target();
     if (!b) return;
     const p = toSurface(e);

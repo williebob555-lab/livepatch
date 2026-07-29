@@ -266,6 +266,34 @@ export const eqFmtHz = (f: number): string =>
 export const eqPlotRect = (r: Rect): Rect => ({ x: r.x + 2, y: r.y + 3, w: r.w - 4, h: r.h - 16 });
 
 // ============================================================================
+// Speaker bar meters — shared layout so the renderer and editor agree on the
+// hit map (docs/07-ui.md: one painter, one geometry, or the two drift).
+// ============================================================================
+export const SPEAKER_METER_PAD = 4;
+
+/** Column geometry for `n` speaker bars inside `r`. */
+export function speakerBarSlots(r: Rect, n: number): { slot: number; barW: number } {
+  const slot = (r.w - SPEAKER_METER_PAD * 2) / Math.max(1, n);
+  return { slot, barW: Math.max(2, Math.min(18, slot - 2)) };
+}
+
+/**
+ * Which speaker column contains `p`, or −1.
+ *
+ * Hit testing is by the **whole column**, not the drawn bar: the bar can be a
+ * couple of pixels wide on a 16-speaker rig, and a target that small is
+ * unusable with a finger and irritating with a mouse. The full-height column
+ * also means a muted (empty) bar is still clickable to un-mute.
+ */
+export function speakerBarAt(r: Rect, p: { x: number; y: number }, n: number): number {
+  if (n <= 0) return -1;
+  if (p.y < r.y || p.y > r.y + r.h) return -1;
+  const { slot } = speakerBarSlots(r, n);
+  const i = Math.floor((p.x - r.x - SPEAKER_METER_PAD) / slot);
+  return i >= 0 && i < n ? i : -1;
+}
+
+// ============================================================================
 // Keyboard widget — shared layout so the renderer and editor agree on hit map.
 // ============================================================================
 export interface KeyRect {

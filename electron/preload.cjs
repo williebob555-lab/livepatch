@@ -3,6 +3,10 @@ const { contextBridge, ipcRenderer } = require('electron');
 // Native bridge. The renderer checks for `window.livepatchNative` and falls
 // back to localStorage / browser file pickers when absent (plain-browser dev).
 contextBridge.exposeInMainWorld('livepatchNative', {
+  // Diagnostics log (one file per run, written by the main process only).
+  diagLog: (kind, data) => ipcRenderer.invoke('diag:log', kind, data),
+  diagPath: () => ipcRenderer.invoke('diag:path'),
+  diagReveal: () => ipcRenderer.invoke('diag:reveal'),
   listScenes: () => ipcRenderer.invoke('scenes:list'),
   saveScene: (name, json) => ipcRenderer.invoke('scenes:save', name, json),
   loadScene: (name) => ipcRenderer.invoke('scenes:load', name),

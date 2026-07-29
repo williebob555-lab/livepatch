@@ -1,6 +1,6 @@
 # 09 — Persistence, Assets, and the Tape System
 
-_Last verified: 2026-07-25. Files: `src/core/persist.ts`, `src/core/session.ts`,
+_Last verified: 2026-07-27. Files: `src/core/persist.ts`, `src/core/session.ts`,
 `src/core/cassettes.ts`, `src/core/rolls.ts`, `src/core/sampler.ts`,
 `src/core/customblocks.ts`, `src/core/prefs.ts`, `src/core/takehistory.ts`,
 `src/core/encode/*`,
@@ -264,10 +264,31 @@ RollData { bpm, beats, notes }
 ```
 
 - **A roll is its own timeline.** There is no clip layer between the notes and
-  the player, so what the piano roll draws *is* the list the Pianola is handed
-  and the two cannot disagree. `rollPlayEnd` is the span a player loops over
-  (the last sounding beat, floored at the declared length), and a reported
-  playhead is a fraction of exactly that.
+  the player, so what the piano roll draws *is* the list the Pianola is handed.
+  `rollPlayEnd` is the span a player loops over (the last sounding beat,
+  **floored at the declared `beats`**, so trailing silence counts), and a
+  reported playhead is a fraction of exactly that.
+
+  **The length is pushed to the engines, never re-derived there** — as the
+  `beats` param, alongside `notes`, by `syncRolls`. Both engines had been
+  computing it from the note list alone (`max(1, last note end)`), which drops
+  the trailing silence. Since `d.beats` is rounded *up* to a whole beat, almost
+  every roll has some, so almost every roll had two different lengths — and
+  `regStart`/`regEnd` and the reported playhead are all **fractions** of it:
+  - the playhead ran fast and reached the right edge before the music did,
+    drifting further the longer the roll ("the bar gets out of sync");
+  - the repeat bars resolved to the wrong beats, so the loop cut early ("it
+    doesn't repeat exactly on the repeat bars"). Measured: an 8-beat roll whose
+    last note ended at beat 1 looped **every 0.5 s instead of every 4 s**.
+
+  Three implementations must agree: `rollPlayEnd` (`core/rolls.ts`), `rollEnd`
+  (native kernel), `rollBeats` (web unit). **Change one, change all three.**
+- **The drawn playhead is dead-reckoned between engine fixes.** Transport
+  arrives on the visuals timer at ~15 Hz while the canvas draws at 60, so
+  painting the raw value steps in ~66 ms jumps and sits a frame behind the
+  notes you hear. `clipview` treats each engine value as a fix and advances it
+  by wall-clock × tempo, wrapping at the repeat bars and capped at 0.25 s so a
+  stopped engine can never let the bar run away on its own.
 - **Time is in beats, not seconds**, so a roll can be re-tempoed without
   touching the notes and a take can be quantized after the fact.
 - `parseRoll` **ignores** a `clips` key rather than rejecting the file: rolls

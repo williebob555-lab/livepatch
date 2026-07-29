@@ -149,7 +149,9 @@ export function refSize(r: ResolvedRef, cs?: ControlStyle): { w: number; h: numb
         ? { w: 210, h: 120 }
         : r.visual === 'midimon'
           ? { w: 180, h: 96 }
-          : { w: 156, h: 88 };
+          : r.visual === 'speakers'
+            ? { w: 200, h: 104 }
+            : { w: 156, h: 88 };
   if (!r.spec) return { w: 60, h: 24 };
   const kind = SWAPPABLE_WIDGETS.has(r.spec.widget) && cs?.kind ? cs.kind : r.spec.widget;
   return { ...widgetSize[kind] };
@@ -173,16 +175,24 @@ export function controlOfStyle(spec: ParamSpec, cs?: ControlStyle): { kind: Para
  * streams learned values tagged src:'midi' and `paintWidget` colors per source.
  */
 export function modOf(b: Block, paramId: string, nodeId: string, container: Block | null): number | null {
-  if (hasCvPort(b, paramId, container) || b.midiMaps?.[paramId]) return runtime.modValueFor(nodeId, paramId);
+  if (cvPatched(b, paramId, container) || builtinCvPatched(b, paramId) || b.midiMaps?.[paramId])
+    return runtime.modValueFor(nodeId, paramId);
   return null;
 }
 
 /** Marker color source for a param's live indicator ('cv' wins over midi). */
 export function modSrcOf(b: Block, paramId: string, container: Block | null): 'cv' | 'midi' | null {
-  if (hasCvPort(b, paramId, container)) return 'cv';
+  if (cvPatched(b, paramId, container) || builtinCvPatched(b, paramId)) return 'cv';
   return b.midiMaps?.[paramId] ? 'midi' : null;
 }
 
+/**
+ * Does a CV port targeting `paramId` **exist** — the block's own `cv:<param>`,
+ * or a `cv:<block>:<param>` on the subgraph container around it?
+ *
+ * This is the question the *Add / Remove CV input* toggles ask, so it must stay
+ * about existence. Indicators ask `cvPatched` instead.
+ */
 export function hasCvPort(b: Block, paramId: string, container: Block | null): boolean {
   return (
     b.ports.some((p) => p.modParam === paramId && !p.modChild) ||
@@ -190,8 +200,59 @@ export function hasCvPort(b: Block, paramId: string, container: Block | null): b
   );
 }
 
-/** Binding badges: corner dots showing what drives a widget — a CV port
- *  (theme.cvIndicatorColor) and/or a learned MIDI binding. */
+/**
+ * Is such a port **patched in** — does it actually have a cable on it?
+ *
+ * This is what every CV indicator keys on: the live marker and the corner
+ * badge. Existence is not enough. A `cv:<param>` port exists from the moment
+ * the user adds it, so keying the indicator on the port lit a purple dot on a
+ * param nothing was modulating — noise, on exactly the widgets whose job is to
+ * say what *is* moving.
+ *
+ * (MIDI is deliberately not treated this way: a learned binding has no cable to
+ * check, and it is live the moment it exists.)
+ */
+export function cvPatched(b: Block, paramId: string, container: Block | null): boolean {
+  return (
+    b.ports.some((p) => p.modParam === paramId && !p.modChild && doc.isPortWired(b.id, p.id)) ||
+    !!container?.ports.some(
+      (p) => p.modChild === b.id && p.modParam === paramId && doc.isPortWired(container.id, p.id),
+    )
+  );
+}
+
+/**
+ * A **built-in** audio-rate CV input whose port id is the param id — the
+ * Panner 3D's `x`/`y`/`z`, Ambi Encode's `x`/`y`/`z`, Ambi Rotate's `yaw`.
+ *
+ * These are declared in the block def rather than added by the user, and the
+ * kernel reads them straight out of its input buffers instead of going through
+ * the `cv:<param>` modulation path — so nothing ever calls `setParam` for them.
+ * Without this the XY pad on a Panner sat frozen on its knob value while an
+ * Orbit swung the source right around the room: the modulation was audible and
+ * invisible, which is the exact opposite of what this app is for.
+ *
+ * **Patched in only**, like `hasCvPort` — these ports are declared by the block
+ * def and so are always present, which would otherwise mean a permanent marker
+ * on every panner in the patch. Belt and braces with the engine, which also
+ * reports `NaN` for an unwired input (`liveParams`, engine/src/dsp.ts): the
+ * document answer works with audio off, the engine answer keeps unwired ports
+ * off the mods stream entirely.
+ *
+ * This gates only the **live marker**, not `drawBindingBadges`: the corner dot
+ * means "something is bound here", and for a built-in port the wire plugged
+ * into it already says that far more clearly than a 2 px dot.
+ */
+function builtinCvPatched(b: Block, paramId: string): boolean {
+  return b.ports.some(
+    (p) => p.id === paramId && p.dir === 'in' && p.role === 'cv' && !p.modParam && doc.isPortWired(b.id, p.id),
+  );
+}
+
+/** Binding badges: corner dots showing what drives a widget — a **patched**
+ *  CV port (theme.cvIndicatorColor) and/or a learned MIDI binding. An added
+ *  but unpatched CV port gets no dot: the port itself is already visible on
+ *  the block edge, and a dot there claims something is driving the value. */
 export function drawBindingBadges(
   g: CanvasRenderingContext2D,
   b: Block,
@@ -200,7 +261,7 @@ export function drawBindingBadges(
   theme: Theme,
   container: Block | null,
 ): void {
-  const cv = hasCvPort(b, paramId, container);
+  const cv = cvPatched(b, paramId, container);
   const midi = !!b.midiMaps?.[paramId];
   if (!cv && !midi) return;
   let x = rect.x + rect.w - 4;

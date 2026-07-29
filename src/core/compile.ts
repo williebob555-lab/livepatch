@@ -182,6 +182,8 @@ function walk(g: Graph, prefix: string, out: CompiledGraph, rigJson?: string): v
   const isSub = new Set<string>();
   for (const b of g.blocks) {
     const def = getDef(b.type);
+    // Canvas-only scenery (Comment): never becomes a node on any engine.
+    if (def.noCompile) continue;
     if (def.isSubgraph && b.graph) {
       isSub.add(b.id);
       walk(b.graph, prefix + b.id + '/', out, rigJson);

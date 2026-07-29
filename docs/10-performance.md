@@ -1,6 +1,6 @@
 # 10 — Performance: What Makes It Fast, What Makes It Slow
 
-_Last verified: 2026-07-25._
+_Last verified: 2026-07-27._
 
 > Read this before changing anything in an audio path, a render loop, or an IO
 > stream. Every rule below traces to a measured regression. "Do not make it
@@ -77,6 +77,30 @@ depending on device.
   from the engine's hot paths.
 - **Splicing across clocks.** Dropping/repeating samples to cap a buffer is the
   "click once a minute" bug. Resample instead.
+- **Calling `Smooth.step` inside the sample loop.** `Smooth` advances **one
+  quantum per call** — that is its contract, and its coefficient is computed
+  from `ctx.n`. Calling it per sample runs a 15–50 ms time constant to
+  completion inside a single quantum, so the "smoothing" is a step with extra
+  arithmetic. Found and fixed three times now, each time as a click report:
+  `amb-decode` (documented in its own comment: it also handed each speaker a
+  different point on the ramp, swinging the image sideways for the length of a
+  gain change), `amb-encode` (gain), and `distance` (both the distance glide and
+  the gain — and there the collapsed glide *teleports a delay-line read
+  pointer*, which is a click by construction). A kernel that needs a per-sample
+  glide computes a one-sample coefficient once per quantum and applies it in the
+  loop; it does not reach for `Smooth`.
+- **Stepping a coefficient at quantum boundaries while something moves it.** At
+  128 frames / 48 kHz that is ~370 discontinuities a second. Anything driven by
+  CV or by a knob drag (which sends a param message every frame) has to **ramp
+  across the quantum** — the `panner3d` pattern: hold the value the last sample
+  used, compute `(target − current)/n`, and add it per sample. This is why
+  `upmix`, `panner3d` and now every ambisonic kernel look the way they do.
+- **Summing more channels into a hardware channel than it can hold.** The
+  `speaker-rig` fold: an 8-speaker rig wrapped onto a stereo endpoint at unity
+  per speaker peaked at **4.000** and went through the device's `clip()`. Power
+  normalisation alone got it to 2.360 — still clipping. It needs a real
+  brick-wall limiter on the folded channels. See
+  [`05-native-engine.md`](05-native-engine.md).
 - **Hardcoded latency constants.** Too small → underruns on bursty devices; too
   large → dozens of ms of needless delay. Setpoints self-tune per device.
 - **Metering every net every frame at large FFT.** The web engine's per-frame

@@ -491,6 +491,21 @@ export class GraphExec {
     // has both (the learn writes the CV base; the CV entry is the live value).
     for (const [key, rec] of this.midiLive)
       if (!this.modIndex.has(key)) out.push({ node: rec.node, param: rec.param, value: rec.value, src: 'midi' });
+    // Params a kernel drives from a BUILT-IN cv input rather than through a
+    // `cv:<param>` port (panner3d x/y/z, amb-encode x/y/z, amb-rotate yaw).
+    // Nothing calls setParam for those, so without this the widget sits frozen
+    // on the knob value while the audio moves — see `Kernel.liveParams`. A
+    // `cv:` port on the same param wins: that one is the applied value.
+    for (const rec of this.nodes.values()) {
+      if (!rec.kernel.liveParams) continue;
+      const live = rec.kernel.liveParams();
+      for (const param in live) {
+        const v = live[param];
+        if (!Number.isFinite(v)) continue;
+        if (this.modIndex.has(rec.id + ' ' + param)) continue;
+        out.push({ node: rec.id, param, value: v });
+      }
+    }
     return out;
   }
 

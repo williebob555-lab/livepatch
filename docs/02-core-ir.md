@@ -1,6 +1,6 @@
 # 02 — Core IR: Types, Registry, Compiler, Signal Model
 
-_Last verified: 2026-07-24. Files: `src/core/types.ts`, `src/core/registry.ts`,
+_Last verified: 2026-07-28. Files: `src/core/types.ts`, `src/core/registry.ts`,
 `src/core/compile.ts`._
 
 This is the heart of the app. Everything else is either producing this IR
@@ -199,13 +199,26 @@ interface BlockDef {
   type; title; category; desc;
   inputs: PortSpec[]; outputs: PortSpec[]; params: ParamSpec[];
   visual?: VisualKind;         // engine-fed live visual on the face
-  customFace?: 'cassette';     // fully custom-drawn face (renderer special case)
+  customFace?: 'cassette' | 'roll' | 'comment';  // fully custom-drawn face
   isSubgraph?: boolean;        // container you can enter
   isControl?: boolean;         // pure control emitter (knob/fader/pad)
   style?: BlockStyle; minW?; minH?;
   stubbed?: boolean;           // native-only: web engine passes through, shows NATIVE badge
+  noCompile?: boolean;         // canvas-only scenery: never becomes a node at all
 }
 ```
+
+**`stubbed` and `noCompile` are not the same thing.** A `stubbed` block *is*
+compiled and does reach both engines — the web engine simply has no unit for it
+and passes audio through (that is the surround pattern: native implements it,
+web is the stereo preview). A `noCompile` block is skipped by `walk()` entirely
+and has no compiled node on **either** engine, which is right for something
+that was never a signal processor — today, only `comment`.
+
+Without `noCompile` a portless block still compiles to a node that both engines
+resolve to a pass-through. Harmless in itself, but it puts scenery in the audio
+graph and leans on the same unknown-type fallback that hides a missing kernel
+(rule 2) — worth one line to keep the two situations distinguishable.
 
 Registry helpers you will reuse instead of re-implementing:
 

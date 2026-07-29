@@ -27,7 +27,16 @@ export const widgetSize: Record<WidgetKind, { w: number; h: number }> = {
 };
 
 const visualSize = (v: string): { w: number; h: number } =>
-  v === 'meter' ? { w: 26, h: 92 } : v === 'eq' ? { w: 210, h: 120 } : v === 'midimon' ? { w: 180, h: 96 } : { w: 156, h: 88 };
+  v === 'meter'
+    ? { w: 26, h: 92 }
+    : v === 'eq'
+      ? { w: 210, h: 120 }
+      : v === 'midimon'
+        ? { w: 180, h: 96 }
+        : // Per-speaker bars need width per channel and room for labels.
+          v === 'speakers'
+          ? { w: 200, h: 104 }
+          : { w: 156, h: 88 };
 
 /** Widget kinds that may be hot-swapped for one another (same drag semantics). */
 export const SWAPPABLE_WIDGETS: ReadonlySet<string> = new Set(['knob', 'fader', 'hfader']);
