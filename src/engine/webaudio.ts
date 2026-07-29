@@ -41,6 +41,18 @@ export interface Unit {
   transport?(): TransportFrame | null;
   /** Per-frame control-rate hook (gates, sample&hold, random LFOs). dt seconds. */
   tick?(dt: number): void;
+  /**
+   * Wide-bus sink that wants per-channel levels for its visual (Spatial Scope,
+   * Speaker Rig / Monitor meters). The engine splits the net feeding this unit
+   * into one analyser per channel and pushes the RMS here; the unit just holds
+   * the numbers and hands them back through `visual.chans`.
+   *
+   * Declaring it is what *turns the split on* — a channel splitter plus 16
+   * analysers per wide net is not something to build for nets nobody is
+   * watching, so it is opt-in per sink, the same shape as the native engine's
+   * `watch-visuals` gating.
+   */
+  setChans?(levels: Float32Array): void;
   dispose(): void;
 }
 
@@ -74,6 +86,12 @@ interface NetRec {
   wireIds: string[];
   /** CV sinks on this net: params modulated by the net's summed signal. */
   mods: ModRec[];
+  /** Per-channel metering, built only when a sink declares `setChans` and the
+   *  bus is actually wide. See `Unit.setChans`. */
+  chanSplit?: ChannelSplitterNode;
+  chanAnalysers?: AnalyserNode[];
+  chanLevels?: Float32Array;
+  chanSinks?: Unit[];
 }
 
 /**
@@ -232,6 +250,7 @@ export class WebAudioEngine implements EngineAdapter {
       try {
         rec.hub.disconnect();
         rec.analyser.disconnect();
+        rec.chanSplit?.disconnect();
       } catch {
         /* ignore */
       }
@@ -392,6 +411,31 @@ export class WebAudioEngine implements EngineAdapter {
       hub.connect(analyser);
       this.netConns.push({ from: hub, to: analyser });
       const rec: NetRec = { hub, analyser, level: { rms: 0, peak: 0 }, wireIds: net.wireIds, mods };
+      // ---- per-channel metering ----
+      // Every wide block is stubbed on this engine, so before this the Spatial
+      // Scope drew the layout and then sat dead however loud the patch was —
+      // the "surround visualizer isn't doing anything" report. The signal is
+      // right there on the hub; it just needed splitting.
+      const chanSinks = net.sinks
+        .map((s) => this.units.get(s.node)?.unit)
+        .filter((u): u is Unit => !!u?.setChans);
+      if (width > 2 && chanSinks.length) {
+        const split = ctx.createChannelSplitter(width);
+        hub.connect(split);
+        this.netConns.push({ from: hub, to: split });
+        const ans: AnalyserNode[] = [];
+        for (let c = 0; c < width; c++) {
+          const a = ctx.createAnalyser();
+          a.fftSize = 256;
+          a.smoothingTimeConstant = 0;
+          split.connect(a, c);
+          ans.push(a);
+        }
+        rec.chanSplit = split;
+        rec.chanAnalysers = ans;
+        rec.chanLevels = new Float32Array(width);
+        rec.chanSinks = chanSinks;
+      }
       this.nets.push(rec);
       for (const id of net.wireIds) this.wireLevels.set(id, rec.level);
     }
@@ -448,6 +492,20 @@ export class WebAudioEngine implements EngineAdapter {
         net.level.rms *= 0.95;
         net.level.peak *= 0.96;
         continue;
+      }
+      // Per-channel levels ride the same ⅓-rate budget as the wire meters —
+      // this is a picture, not a control path.
+      if (net.chanAnalysers && net.chanLevels) {
+        const lv = net.chanLevels;
+        for (let c = 0; c < net.chanAnalysers.length; c++) {
+          net.chanAnalysers[c].getFloatTimeDomainData(this.scratch);
+          let s2 = 0;
+          for (let i = 0; i < this.scratch.length; i++) s2 += this.scratch[i] * this.scratch[i];
+          const rms = Math.sqrt(s2 / this.scratch.length);
+          // Fast attack, slow release — same feel as the native `spatial-scope`.
+          lv[c] = rms > lv[c] ? rms : lv[c] * 0.85 + rms * 0.15;
+        }
+        for (const u of net.chanSinks!) u.setChans!(lv);
       }
       net.analyser.getFloatTimeDomainData(this.scratch);
       let sum = 0;

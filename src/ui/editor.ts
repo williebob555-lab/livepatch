@@ -46,7 +46,7 @@ import {
   syncBlockSize,
   widgetSize,
 } from './layout';
-import { MenuItem, colorModal, showContextMenu, promptModal, closeMenus, hideBanner, showBanner } from './menus';
+import { MenuItem, colorModal, showContextMenu, promptModal, promptTextModal, closeMenus, hideBanner, showBanner } from './menus';
 import { addWidgetToDock, isWidgetDocked, removeWidgetFromDock } from './widgetdock';
 import { showDockTab } from './dockpanel';
 import { nudgeUiScale, resetUiScale } from './uiscale';
@@ -68,15 +68,19 @@ import {
   pressedKeys,
   sampleHandleAt,
   seqCellAt,
+  speakerBarAt,
   val2norm,
   xyAxes,
 } from './widgets';
+import { toggleSpeakerMute } from '../core/rig';
 
 const BRANCH_DEADZONE = 28; // px of trunk arc kept clear near endpoints
 const BRANCH_DRAG_MIN = 8;
 const BUNDLE_SNAP = 14;
 const WIRE_HIT_TOL = 6;
-const END_GRAB = 11;
+/** Mouse-sized radius for grabbing a wire end; scaled up for touch/pen at the
+ *  call site, where the pointer type is known. */
+const BASE_END_GRAB = 11;
 
 type DragState =
   | { kind: 'none' }
@@ -219,6 +223,8 @@ export class Editor {
   private longPressFired = false;
   /** Suppress the OS-synthesized contextmenu right after our own long-press. */
   private suppressNativeCtxUntil = 0;
+  /** When the last drag ended — see `dragIsLive`. */
+  private dragEndedAt = 0;
   /** Sticky "this wheel stream is a trackpad" hint (see isTrackpadPan). */
   private trackpadUntil = 0;
   /** Directions currently held for WASD/arrow workspace panning. */
@@ -246,6 +252,17 @@ export class Editor {
       // A touch long-press already opened our menu; don't double up when the OS
       // then synthesizes its own contextmenu for the same press.
       if (performance.now() < this.suppressNativeCtxUntil) return;
+      // Never open a menu on top of a live drag.
+      //
+      // Our own long-press timer is cancelled once a finger travels 10 px, but
+      // it is not the only source of this event: Windows' touch press-and-hold
+      // and a precision-touchpad tap-and-hold both synthesize `contextmenu`
+      // with their own (much looser) movement slop, and a precise, slow block
+      // drag stays inside it. The result was a block snapping back to where it
+      // started with a menu over it — "moving blocks for too long prompts the
+      // right click". Whoever synthesized it, a menu during a drag is wrong,
+      // so the guard is on the drag rather than on the source.
+      if (this.dragIsLive()) return;
       this.contextMenu(e);
     });
     window.addEventListener('keydown', (e) => this.keyDown(e));
@@ -683,6 +700,18 @@ export class Editor {
     doc.touch('selection');
   }
 
+  /**
+   * Is a real drag in progress (or did one just finish)?
+   *
+   * "Just finished" matters because a synthesized `contextmenu` can arrive
+   * slightly *after* the pointerup that ended the drag — releasing a finger and
+   * then getting a menu is the same bug one frame later.
+   */
+  private dragIsLive(): boolean {
+    if (this.drag.kind !== 'none' || this.gesture) return true;
+    return performance.now() - this.dragEndedAt < 250;
+  }
+
   private clearLongPress(): void {
     if (this.longPressTimer) {
       clearTimeout(this.longPressTimer);
@@ -700,7 +729,17 @@ export class Editor {
   // ---------- pointer down ----------
   private pointerDown(e: PointerEvent): void {
     closeMenus();
-    this.renderer.canvas.setPointerCapture(e.pointerId);
+    // Capture keeps a drag alive past the canvas edge, but it THROWS for a
+    // pointer id the element never saw — some pen/touch stacks re-issue ids,
+    // and synthetic events always do. Unguarded, that exception aborted
+    // `pointerDown` before any hit test ran, so the press did nothing at all.
+    // Every other canvas in the app already wraps this (clipview, widgetdock,
+    // rigview); this one was the outlier.
+    try {
+      this.renderer.canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* the drag still tracks through the window-level move/up events */
+    }
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const p = this.pt(e);
 
@@ -722,6 +761,14 @@ export class Editor {
       this.clearLongPress();
       this.longPressTimer = window.setTimeout(() => {
         this.longPressTimer = 0;
+        // The finger has stayed within 10 px (or the move handler would have
+        // cancelled this), but it has already NUDGED the block — `moved` is set
+        // by the first pointermove of a drag, at any distance. Firing here
+        // would `abortDrag()`, snapping the block back to where it started, and
+        // put a menu over it: a careful, slow reposition punished for being
+        // careful. If the user has begun moving something, they are moving it.
+        const d = this.drag;
+        if (d.kind === 'blocks' && d.moved) return;
         this.longPressFired = true;
         this.suppressNativeCtxUntil = performance.now() + 800;
         this.abortDrag();
@@ -749,9 +796,14 @@ export class Editor {
     }
 
     const theme = doc.scene.theme;
+    // Ports, wire ends and branch points are all a handful of pixels across —
+    // fine for a cursor, hopeless for a fingertip that also covers what it is
+    // aiming at. Every grab radius below this point widens for touch/pen, and
+    // is unchanged for mouse.
+    const grab = e.pointerType === 'mouse' ? 1 : 2.6;
 
     // 1. Ports: grab existing wire end (single-link unbind) or start a new wire.
-    const ph = portAt(doc.graph, p, theme.portRadius + 6);
+    const ph = portAt(doc.graph, p, (theme.portRadius + 6) * grab);
     if (ph) {
       doc.pushHistory();
       const occupied = doc.wireAtPort(ph.block.id, ph.port.id);
@@ -797,12 +849,13 @@ export class Editor {
     }
 
     // 3. Wires: endpoint grab / branch root / branch spawn / select.
-    const wh = this.renderer.paths.hit(p, WIRE_HIT_TOL / this.renderer.view.scale + theme.wireWidth);
+    const wh = this.renderer.paths.hit(p, (WIRE_HIT_TOL / this.renderer.view.scale + theme.wireWidth) * grab);
     if (wh) {
       const wire = doc.wire(wh.wireId)!;
       const path = this.renderer.paths.get(wh.wireId)!;
       const dStart = vDist(p, path.pts[0]);
       const dEnd = vDist(p, path.pts[path.pts.length - 1]);
+      const END_GRAB = BASE_END_GRAB * grab;
       if (dEnd < END_GRAB && !wire.b.port) {
         doc.pushHistory();
         this.drag = { kind: 'wireEnd', wire, end: 'b', created: false };
@@ -901,6 +954,31 @@ export class Editor {
         startQ: Number(b.params['q' + band] ?? 1),
       };
       if (!shift) this.applyEq(this.drag as Extract<DragState, { kind: 'eq' }>, p);
+      return true;
+    }
+    // Speaker meters: click a bar to mute that speaker, shift-click to solo it.
+    // A click, not a drag — nothing is set on `this.drag`, so pointerup has
+    // nothing to finish. Missing every bar falls through to block dragging, so
+    // the block is still movable by its own visual.
+    if (item.ref === 'visual' && getDef(b.type).visual === 'speakers' && b.type === 'speaker-monitor') {
+      const o = contentOrigin(b, theme);
+      const n = Math.max(2, doc.scene.rig?.speakers.length ?? 0);
+      const i = speakerBarAt({ x: o.x + item.x, y: o.y + item.y, w: item.w, h: item.h }, p, n);
+      if (i < 0) return false;
+      doc.pushHistory();
+      const nodeId = runtime.nodeId(b.id);
+      if (shift) {
+        // Solo toggles: clicking the soloed speaker again releases it.
+        const cur = Math.round(Number(b.params.solo ?? 0));
+        const next = cur === i + 1 ? 0 : i + 1;
+        b.params.solo = next;
+        runtime.sendParam(nodeId, 'solo', next);
+      } else {
+        const next = toggleSpeakerMute(b.params.mute, i);
+        b.params.mute = next;
+        runtime.sendParam(nodeId, 'mute', next);
+      }
+      doc.touch('param');
       return true;
     }
     let spec: ParamSpec | undefined;
@@ -1731,6 +1809,7 @@ export class Editor {
   private pointerUp(e: PointerEvent): void {
     this.pointers.delete(e.pointerId);
     this.clearLongPress();
+    if (this.drag.kind !== 'none' || this.gesture) this.dragEndedAt = performance.now();
     // Finishing (or dropping below two fingers on) a gesture: don't fall through
     // to the single-pointer release logic.
     if (this.gesture) {
@@ -1936,6 +2015,17 @@ export class Editor {
             doc.touch('structure');
           });
         }
+        return;
+      }
+      // A Comment *is* its text, so double-click edits the text rather than
+      // renaming the block — the name is never drawn on it.
+      if (b.type === 'comment') {
+        promptTextModal('Comment', String(b.params.text ?? '')).then((v) => {
+          if (v == null) return;
+          doc.pushHistory();
+          b.params.text = v;
+          doc.touch('param');
+        });
         return;
       }
       // Double-clicking a widget operates the widget — never rename/enter.

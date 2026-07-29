@@ -479,6 +479,85 @@ registerUnit('delay', (params, env) => {
   };
 });
 
+/**
+ * Feedback — mirrors the `feedback` kernel in `engine/src/dsp.ts`.
+ *
+ * The DelayNode is load-bearing here in a way it is not on the native engine:
+ * Web Audio only permits a cycle through a delay, and it silently enforces a
+ * one-render-quantum minimum. That is the same one quantum the native
+ * executor's topological sort produces, so `time` means the same thing on both
+ * engines — extra delay on top of the quantum.
+ *
+ * Two sanctioned approximations: the DC blocker is a 20 Hz highpass rather
+ * than the kernel's explicit one-pole, and the limiter is a WaveShaper, which
+ * clamps its input domain to ±1 and so hard-limits rather than saturating
+ * above `ceiling`. Both preserve the *behaviour* that matters — a loop that
+ * can't rail or run away.
+ */
+registerUnit('feedback', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const dl = ctx.createDelay(2.1);
+  const hp = ctx.createBiquadFilter();
+  const lp = ctx.createBiquadFilter();
+  const shaper = ctx.createWaveShaper();
+  const outG = ctx.createGain();
+  hp.type = 'highpass';
+  lp.type = 'lowpass';
+  shaper.oversample = '2x';
+  let ceiling = Math.max(0.05, num(params.ceiling, 0.9));
+  let limit = params.limit !== false;
+
+  const buildCurve = (): void => {
+    const n = 1024;
+    const c = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = ((i / (n - 1)) * 2 - 1) / ceiling;
+      const a = x < -3 ? -3 : x > 3 ? 3 : x;
+      const a2 = a * a;
+      c[i] = (ceiling * (a * (27 + a2))) / (27 + 9 * a2);
+    }
+    shaper.curve = c;
+  };
+  const route = (): void => {
+    lp.disconnect();
+    shaper.disconnect();
+    if (limit) {
+      lp.connect(shaper);
+      shaper.connect(outG);
+    } else lp.connect(outG);
+  };
+
+  inG.connect(dl);
+  dl.connect(hp);
+  hp.connect(lp);
+  buildCurve();
+  route();
+  dl.delayTime.value = Math.max(0, num(params.time, 0));
+  lp.frequency.value = Math.max(20, num(params.damp, 8000));
+  hp.frequency.value = params.dcblock !== false ? 20 : 1;
+  outG.gain.value = Math.max(0, num(params.amount, 0.85));
+
+  return {
+    inlet: () => inG,
+    outlet: () => outG,
+    setParam: (id, v) => {
+      if (id === 'amount') smooth(outG.gain, ctx, Math.max(0, num(v, 0.85)));
+      else if (id === 'time') smooth(dl.delayTime, ctx, Math.max(0, Math.min(2, num(v, 0))));
+      else if (id === 'damp') smooth(lp.frequency, ctx, Math.max(20, num(v, 8000)));
+      else if (id === 'dcblock') hp.frequency.value = v === true || v === 1 ? 20 : 1;
+      else if (id === 'ceiling') {
+        ceiling = Math.max(0.05, num(v, 0.9));
+        buildCurve();
+      } else if (id === 'limit') {
+        limit = v === true || v === 1;
+        route();
+      }
+    },
+    dispose: () => [inG, dl, hp, lp, shaper, outG].forEach((n) => n.disconnect()),
+  };
+});
+
 registerUnit('compressor', (params, env) => {
   const c = env.ctx.createDynamicsCompressor();
   c.threshold.value = num(params.threshold, -24);
@@ -627,6 +706,42 @@ registerUnit('spectrogram', (_p, env) => analyserUnit(env, 2048));
 registerUnit('spectrum', (_p, env) => analyserUnit(env, 1024));
 registerUnit('scope', (_p, env) => analyserUnit(env, 2048));
 registerUnit('meter', (_p, env) => analyserUnit(env, 1024));
+
+/**
+ * Per-speaker monitoring on the web engine.
+ *
+ * The DSP of the surround blocks is native-only and stays that way — this
+ * engine's destination is stereo. But *watching* a wide bus needs no DSP, only
+ * the levels already flowing through the net hub, and without these units the
+ * Spatial Scope drew a speaker layout that never lit up no matter how loud the
+ * patch was. Since the web engine is the DEFAULT engine (prefs `engine:
+ * 'webaudio'`), that was every user's first impression of the surround
+ * monitoring — hence "the surround visualizer wasn't doing anything".
+ *
+ * `passThrough` distinguishes an in-line block (Speaker Monitor) from a
+ * terminal sink (Spatial Scope, Speaker Rig). Neither applies gain here: mute
+ * and solo are native DSP, and the face meters make it obvious which engine
+ * you are on because a muted speaker still reads its level.
+ */
+function chanMeterUnit(env: UnitEnv, passThrough: boolean): Unit {
+  const g = env.ctx.createGain();
+  // Grown by `setChans`; the engine hands us its own array each poll.
+  let levels: number[] = [];
+  return {
+    inlet: () => g,
+    outlet: () => (passThrough ? g : null),
+    setParam: () => {},
+    setChans: (lv) => {
+      if (levels.length !== lv.length) levels = new Array(lv.length).fill(0);
+      for (let i = 0; i < lv.length; i++) levels[i] = lv[i];
+    },
+    visual: { chans: () => levels },
+    dispose: () => g.disconnect(),
+  };
+}
+registerUnit('spatial-scope', (_p, env) => chanMeterUnit(env, false));
+registerUnit('speaker-rig', (_p, env) => chanMeterUnit(env, false));
+registerUnit('speaker-monitor', (_p, env) => chanMeterUnit(env, true));
 
 // ---------- Controls (ConstantSource emitters) ----------
 function constUnit(params: P, env: UnitEnv, valueId = 'value'): Unit {
@@ -1090,6 +1205,96 @@ registerUnit('midi-cv', (params, env) => {
       else if (ev.type === 'pressure' || ev.type === 'polyat') set('press', ev.velocity);
       else if (ev.type === 'cc' && ev.note === ccnum) set('cc', ev.velocity);
     },
+    dispose: () => {
+      for (const c of Object.values(outs)) {
+        c.stop();
+        c.disconnect();
+      }
+    },
+  };
+});
+
+/**
+ * Note Space — note property → position CV. Mirrors the `note-space` kernel in
+ * `engine/src/dsp.ts`; the axis-source strings come from `NOTE_SPACE_SRC` in
+ * `blocks/defs.ts` and all three copies must agree.
+ *
+ * Position moves on note-on only and holds through the release (sample-and-hold,
+ * like `midi-cv`'s pitch). `slew` becomes the `setTargetAtTime` time constant,
+ * which is the web engine's equivalent of the kernel's per-sample glide.
+ */
+registerUnit('note-space', (params, env) => {
+  const mk = (): ConstantSourceNode => {
+    const c = env.ctx.createConstantSource();
+    c.offset.value = 0;
+    c.start();
+    return c;
+  };
+  const outs: Record<string, ConstantSourceNode> = { x: mk(), y: mk(), z: mk() };
+  const p: P = { ...params };
+  const target = [0, 0, 0];
+  const held: number[] = [];
+  let out: ((ev: MidiEvent) => void) | null = null;
+  let rr = 0;
+  let rnd = (Math.round(num(p.seed, 1)) >>> 0) || 1;
+  const nextRand = (): number => {
+    rnd ^= (rnd << 13) >>> 0;
+    rnd >>>= 0;
+    rnd ^= rnd >>> 17;
+    rnd ^= (rnd << 5) >>> 0;
+    rnd >>>= 0;
+    return rnd / 4294967296;
+  };
+  const clamp1 = (v: number): number => (v < -1 ? -1 : v > 1 ? 1 : v);
+  const axisValue = (src: string, ev: MidiEvent, r: number): number => {
+    if (src === 'Pitch') {
+      const lo = Math.round(num(p.low, 36));
+      const hi = Math.round(num(p.high, 96));
+      return hi > lo ? clamp1(((ev.note - lo) / (hi - lo)) * 2 - 1) : 0;
+    }
+    if (src === 'Velocity') return clamp1(ev.velocity * 2 - 1);
+    if (src === 'Channel') return clamp1((ev.channel / 15) * 2 - 1);
+    if (src === 'Random') return clamp1(r * 2 - 1);
+    if (src === 'Round-robin') {
+      const v = Math.max(2, Math.round(num(p.voices, 4)));
+      return clamp1(((rr % v) / (v - 1)) * 2 - 1);
+    }
+    return 0;
+  };
+  const push = (): void => {
+    const spread = num(p.spread, 0.9);
+    const tc = Math.max(0.0005, num(p.slew, 0.05));
+    const t = env.ctx.currentTime;
+    const keys = ['x', 'y', 'z'];
+    for (let i = 0; i < 3; i++) outs[keys[i]].offset.setTargetAtTime(target[i] * spread, t, tc);
+  };
+  return {
+    inlet: () => null,
+    outlet: (port) => outs[port] ?? null,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'seed') rnd = (Math.round(num(v, 1)) >>> 0) || 1;
+      // Spread/slew are continuous: re-push so turning them moves the source now.
+      if (id === 'spread' || id === 'slew') push();
+    },
+    midiIn: (ev) => {
+      if (ev.type === 'on') {
+        held.push(ev.note);
+        const r0 = nextRand();
+        const r1 = nextRand();
+        const r2 = nextRand();
+        target[0] = axisValue(str(p.xsrc, 'Pitch'), ev, r0);
+        target[1] = axisValue(str(p.ysrc, 'Velocity'), ev, r1);
+        target[2] = axisValue(str(p.zsrc, 'Off'), ev, r2);
+        rr++;
+        push();
+      } else if (ev.type === 'off') {
+        const i = held.lastIndexOf(ev.note);
+        if (i >= 0) held.splice(i, 1);
+      }
+      out?.(ev);
+    },
+    setMidiOut: (cb) => (out = cb),
     dispose: () => {
       for (const c of Object.values(outs)) {
         c.stop();
@@ -2334,7 +2539,9 @@ registerUnit('midi-recorder', (params, env) => {
  */
 registerUnit('midi-player', (params, env) => {
   let notes: RollNote[] = parseRollNotes(str(params.notes));
-  let beats = rollBeats(notes);
+  /** Authored roll length, pushed with the notes by `syncRolls`. */
+  let declared = num(params.beats, 0);
+  let beats = rollBeats(notes, declared);
   let bpm = num(params.bpm, 120);
   let loop = params.loop !== false;
   let transpose = Math.round(num(params.transpose, 0));
@@ -2370,7 +2577,11 @@ registerUnit('midi-player', (params, env) => {
       const pressed = v === 1 || v === true;
       if (id === 'notes') {
         notes = parseRollNotes(str(v));
-        beats = rollBeats(notes);
+        beats = rollBeats(notes, declared);
+        if (pos > beats) pos = 0;
+      } else if (id === 'beats') {
+        declared = num(v, 0);
+        beats = rollBeats(notes, declared);
         if (pos > beats) pos = 0;
       } else if (id === 'regStart') regStart = num(v, 0);
       else if (id === 'regEnd') regEnd = num(v, 1);
@@ -2415,7 +2626,9 @@ registerUnit('midi-player', (params, env) => {
       const d = getRollData(r.assetId);
       if (d) {
         notes = d.notes.slice();
-        beats = Math.max(1, d.beats);
+        // Not `max(1, d.beats)`: a note may run past the declared length, and
+        // truncating there would cut it off. Same rule as `rollPlayEnd`.
+        beats = rollBeats(notes, d.beats);
       }
     },
     tick: (dt) => {
@@ -2496,10 +2709,21 @@ function parseRollNotes(s: string): RollNote[] {
     return [];
   }
 }
-const rollBeats = (notes: RollNote[]): number => {
+/**
+ * The roll's playable end, in beats. **Mirrors `rollPlayEnd`
+ * (`src/core/rolls.ts`) and the native kernel's `rollEnd` — change one, change
+ * all three.**
+ *
+ * The last sounding beat, floored at the roll's *authored* length so trailing
+ * silence still plays and still loops. `declared` arrives as the `beats` param
+ * alongside the notes; deriving the length from the notes alone gave a shorter
+ * roll than the piano roll draws, which desynced the playhead and moved the
+ * repeat bars (see `syncRolls`).
+ */
+const rollBeats = (notes: RollNote[], declared = 0): number => {
   let b = 0;
   for (const n of notes) b = Math.max(b, n.t + n.d);
-  return Math.max(1, b);
+  return Math.max(1, b, declared);
 };
 
 // ---------- Dynamics: Gate (tick-driven envelope follower) ----------

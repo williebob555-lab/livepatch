@@ -385,6 +385,14 @@ export interface Theme {
   wireCoreColor: string;
   /** Extra px of thickness a wide wire gets over a stereo one. */
   wireWideExtra: number;
+  /**
+   * Border colour for wires on a signal **cycle**. Loops are legal — the
+   * executor breaks them with one quantum of delay — but they are otherwise
+   * invisible, so an accidental one reads as a broken block rather than as the
+   * ring it is. Replacing the border (not the signal colour) keeps the level
+   * metering on a looped wire readable.
+   */
+  wireLoopColor: string;
 
   selectionColor: string;
   marqueeFill: string;
@@ -445,6 +453,7 @@ export const defaultTheme = (): Theme => ({
   bundleSpacing: 5,
   wireCoreColor: '#e8eef8',
   wireWideExtra: 2,
+  wireLoopColor: '#e0b24f',
 
   selectionColor: '#4da3ff',
   marqueeFill: 'rgba(77,163,255,0.12)',

@@ -1,6 +1,6 @@
 # 06 — Audio IO, Clock Drift, and Latency
 
-_Last verified: 2026-07-24. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
+_Last verified: 2026-07-27. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
 `engine/src/midi.ts`, `scripts/midi-latency.cjs`._
 
 This is the most performance- and correctness-sensitive code in the app, and the
@@ -201,6 +201,28 @@ that speaker's `out` hardware channel.
   signed kernel driver). The sanctioned Windows surround route is the user's
   VB-Audio virtual devices: app → 8-channel VAIO/VB-Matrix → `speaker-rig` in
   Windows mode. ASIO mode has no such limit.
+
+#### When the device is narrower than the rig (2026-07-27)
+
+**`pushOutputCh` drops an out-of-range channel. It must not wrap.**
+
+It used to fall back to `mix[ch % 2]`. With a 7.1 rig on a stereo endpoint —
+the default state on any laptop, and nothing about the patch says otherwise —
+all eight speaker feeds landed on two channels at unity each. Four correlated
+copies is +12 dB straight into `clip()`: measured peak **4.000** per output
+channel, i.e. gross distortion, and completely silent about it. That is the
+"frequent popping with Surround blocks and multi-channel" report.
+
+Deciding what to do about a too-narrow device needs the **speaker layout**, so
+it belongs in the `speaker-rig` kernel, which has it — see the fold modes,
+power normalisation and brick-wall limiter in
+[`05-native-engine.md`](05-native-engine.md). By the time a feed reaches
+`pushOutputCh` it has already been folded onto a channel that exists; dropping
+is the safe floor for anything that slips through, and silence beats distortion.
+
+`IoManager.outChannels(device, asio)` reports what a route actually has (0 while
+nothing is open) so the kernel can build that plan. It is read once per quantum
+from `process`, so it stays a map lookup and allocates nothing.
 
 **`multi-in` is the multichannel capture block.** One wide output; channel `i`
 of the bus is device channel `first + i`. `Channels` sets the width (the port

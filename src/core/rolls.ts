@@ -287,10 +287,33 @@ export function syncRolls(): void {
       const asset = rollAssetFor(b, g);
       const d = asset ? getRollData(asset) : null;
       const want = d ? JSON.stringify(d.notes.map((n) => [n.n, r6(n.t), r6(n.d), r6(n.v)])) : '';
-      if ((b.params.notes ?? '') === want) continue;
-      b.params.notes = want;
-      runtime.sendParam([...path, b.id].join('/'), 'notes', want);
-      changed = true;
+      // The roll's LENGTH travels with its notes.
+      //
+      // The engine used to derive it from the notes alone (`max(1, last note
+      // end)`) while the renderer used `rollPlayEnd` — which floors at the
+      // authored `d.beats`, so trailing silence counts. Any roll with trailing
+      // silence (i.e. almost all of them, since `d.beats` is rounded up to a
+      // whole beat) therefore had two different lengths, and everything
+      // expressed as a *fraction* of the roll came apart:
+      //   • the playhead ran fast and hit the right edge before the music did
+      //     — it drifts further the longer the roll, which reads as "the bar
+      //     gets out of sync";
+      //   • `regStart`/`regEnd` are fractions, so the repeat bars resolved to
+      //     the wrong beats and the loop cut early — "it doesn't repeat exactly
+      //     on the repeat bars".
+      // One source of truth, pushed the same way the notes are.
+      const wantBeats = d ? r6(rollPlayEnd(d)) : 1;
+      const node = [...path, b.id].join('/');
+      if ((b.params.notes ?? '') !== want) {
+        b.params.notes = want;
+        runtime.sendParam(node, 'notes', want);
+        changed = true;
+      }
+      if (b.params.beats !== wantBeats) {
+        b.params.beats = wantBeats;
+        runtime.sendParam(node, 'beats', wantBeats);
+        changed = true;
+      }
     }
   };
   visit(doc.scene.root, []);

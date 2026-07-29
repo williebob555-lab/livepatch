@@ -287,3 +287,37 @@ export function nextSpeakerId(rig: Rig): string {
   while (taken.has('s' + n)) n++;
   return 's' + n;
 }
+
+// ---------------------------------------------------------------------------
+// Per-speaker mute / solo (Speaker Monitor)
+//
+// Both live in ordinary params so they persist, undo, and reach the engine
+// through the normal `set-param` path: `mute` is one '0'/'1' per speaker,
+// index-aligned with `rig.speakers`, and `solo` is a 1-based speaker number
+// (0 = no solo) because solo is exclusive by definition. The engine kernel
+// parses the identical strings — keep the two readings in step.
+// ---------------------------------------------------------------------------
+
+/** Is speaker `i` flagged muted by the `mute` bitmask string? */
+export const isSpeakerMuted = (mask: unknown, i: number): boolean =>
+  typeof mask === 'string' && mask.charAt(i) === '1';
+
+/** `mask` with speaker `i` toggled, padded out to reach `i`. */
+export function toggleSpeakerMute(mask: unknown, i: number): string {
+  const s = typeof mask === 'string' ? mask : '';
+  const padded = s.length > i ? s : s + '0'.repeat(i + 1 - s.length);
+  const next = padded.slice(0, i) + (padded.charAt(i) === '1' ? '0' : '1') + padded.slice(i + 1);
+  // Trailing zeros carry no information and would grow the string forever.
+  return next.replace(/0+$/, '');
+}
+
+/**
+ * Is speaker `i` actually silent right now — the question the meter asks.
+ * Solo wins over mute: soloing speaker 3 silences everything else regardless
+ * of what the mute mask says, and un-soloing puts the mutes back.
+ */
+export function isSpeakerSilenced(mute: unknown, solo: unknown, i: number): boolean {
+  const s = typeof solo === 'number' ? Math.round(solo) : 0;
+  if (s > 0) return i !== s - 1;
+  return isSpeakerMuted(mute, i);
+}

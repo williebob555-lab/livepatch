@@ -1,6 +1,6 @@
 # 04 — Web Audio Engine
 
-_Last verified: 2026-07-24. Files: `src/engine/webaudio.ts`,
+_Last verified: 2026-07-27. Files: `src/engine/webaudio.ts`,
 `src/blocks/units.ts`, `src/engine/engine.ts`._
 
 The in-app engine. Builds a live `AudioNode` graph from a `CompiledGraph` on the
@@ -76,6 +76,24 @@ you add a factory, any block you forget.
      is still the **stereo preview** engine — its destination is stereo and
      every wide block is `stubbed` — but a net passing through it keeps its
      channels instead of losing them here.
+   - **Per-channel metering** is built for a wide net when some sink declares
+     `Unit.setChans`: a `ChannelSplitterNode` plus one small analyser per
+     channel, read on the same ⅓-rate budget as the wire meters and pushed to
+     the sink, which hands it back through `visual.chans`.
+
+     Declaring `setChans` is what turns the split on — a splitter plus 16
+     analysers per wide net is not something to build for nets nobody is
+     watching, so it is opt-in per sink, the same shape as the native engine's
+     `watch-visuals` gating. `spatial-scope`, `speaker-rig` and
+     `speaker-monitor` declare it (`chanMeterUnit` in `src/blocks/units.ts`).
+
+     **Why this exists:** the surround DSP is native-only and stays that way,
+     but *watching* a wide bus needs no DSP — only the levels already flowing
+     through the hub. Without it the Spatial Scope drew a speaker layout that
+     never lit up however loud the patch was, and since `webaudio` is the
+     **default engine** (`prefs.engine`), that was every user's first
+     impression of the surround monitoring. It is the "surround visualizer
+     wasn't doing anything" report, and it had nothing to do with ASIO.
 4. CV sinks (`snk.mod`) are handled as **control-rate param modulation**, not by
    patching an audio inlet — see below.
 

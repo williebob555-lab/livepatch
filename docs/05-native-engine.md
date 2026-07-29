@@ -1,6 +1,6 @@
 # 05 — Native Engine
 
-_Last verified: 2026-07-25. Files: `engine/src/*`, `src/engine/native.ts`,
+_Last verified: 2026-07-27. Files: `engine/src/*`, `src/engine/native.ts`,
 `electron/main.cjs`, `electron/preload.cjs`._
 
 The native engine is a **separate OS process** that runs the DSP graph on real
@@ -136,11 +136,39 @@ interface Kernel {
   midiIn?; midiOut?; externalMidi?;   // midi
   tapeIn?; tapeOut?; tapeAssetId?;     // tape
   visualTime?: Float32Array; visualLevel?(): [number, number];
-  visualChans?(): number[];            // per-channel RMS (spatial scope)
+  visualChans?(): number[];            // per-channel RMS (spatial scope, speaker meters)
+  liveParams?(): Record<string, number>; // params the kernel drives itself
   dispose?();
 }
 registerKernel(type, (params, services) => Kernel);
 ```
+
+### `liveParams` — modulation the renderer cannot otherwise see
+
+Most modulation reaches a param through a `cv:<param>` port, which the graph
+applies with `setParam`, so the renderer already knows the post-CV value and
+paints the purple marker from it.
+
+A handful of blocks instead take modulation on a **built-in audio-rate input**
+and read it straight out of `ins` inside `process`: `panner3d` (`x`/`y`/`z`),
+`amb-encode` (`x`/`y`/`z`), `amb-rotate` (`yaw`, which also moves under `spin`).
+Nothing calls `setParam` for those, so before this hook the XY pad on a Panner
+3D sat frozen at its knob value while an Orbit swung the source around the
+room — audible modulation, invisible widget.
+
+`GraphExec.modsPayload` merges `liveParams()` into the ordinary mods stream at
+~30 Hz. Two rules:
+
+- **Report a param only while its input is actually wired.** Publish `NaN`
+  otherwise; the payload drops non-finite values. Reporting the knob value for
+  an unpatched port would light a live marker on every panner in the patch,
+  which tells the user nothing.
+- **A real `cv:<param>` port on the same param wins** — that one is the applied
+  value.
+
+The renderer side is `hasBuiltinCvPort` in `src/ui/facepaint.ts`, which gates
+the live marker but deliberately **not** the binding badge: for a built-in port
+the wire plugged into it already says the binding exists.
 
 - `Buf = Float32Array[]` — **one array per channel**, all preallocated to
   `MAXQ` frames, allocated via `allocBuf(width)`. **Zero allocation in
@@ -343,31 +371,160 @@ channel layout and axis mapping** (`ambEnc`: `xa(front)=y, ya(left)=−x,
 za(up)=z`) — mixing them up rotates or mirrors the field silently, so the
 convention is stated once at the top of the ambisonic section and never varied.
 
-- **`amb-encode`** — mono/stereo + X/Y/Z direction → B-format (W unity, the
-  directional part = the source direction).
+**The pipeline is always Encode → (Rotate / Transform) → Decode.** A B-format
+wire is not a speaker feed and is not listenable on its own; wiring one straight
+to a Speaker Rig sends W/X/Y/Z to the first four speakers, which sounds like a
+broken mix because it is one. The block descriptions say so explicitly now —
+"encode to a first-order ambisonic field" told a user who did not already know
+ambisonics nothing at all, which is why the group read as not working.
+
+- **`amb-encode`** — mono/stereo + X/Y/Z → B-format (W unity, the directional
+  part = the source direction scaled by the vector's length).
+
+  **X/Y/Z is a point in the unit BALL, not a direction on the sphere.** The
+  vector used to be normalised, which made the block feel broken in two ways,
+  both measured: dragging the XY pad outward along a fixed angle produced
+  *byte-identical* decoded gains at radius 0.05 and 1.0 (half the pad's travel
+  was inert), and the centre was a singularity where a 2 % move flipped the
+  image hard left↔right (L/R 0.63/0.98 → 0.98/0.63). Clamping into the ball
+  instead makes the radius mean **directivity** — rim = as focused as first
+  order gets, centre = pure W, no direction at all — and the singularity becomes
+  unreachable, because approaching it takes the directivity to zero. Still not
+  distance; that is `distance`.
 - **`amb-rotate`** — rotates the directional vector (yaw about up, pitch about
-  left, roll about front) plus a continuous `spin`. W untouched.
-- **`amb-transform`** — `width` scales the directional part vs W (focus↔widen),
-  `focus` is an FOA dominance/zoom toward an axis, `mirror` negates the left
-  component.
+  left, roll about front) plus a continuous `spin`. W untouched. The three
+  sequential rotations are composed into **one 3×3 matrix** so the inner loop is
+  nine multiplies and there is something to ramp; `spinPhase` wraps to `[0,1)`
+  rather than accumulating forever (an hour of spin was computing `sin` of ~10⁴
+  radians at visibly coarsened resolution).
+- **`amb-transform`** — `width` scales the directional part vs W (a
+  **directivity** control: 0 = every source from everywhere, 1 = as recorded,
+  2 = over-focused), `focus` is Gerzon **zoom** toward an axis
+  (`W' = W + k·D`, `D' = D + k·W`, with `k = (λ²−1)/(λ²+1)` and `λ = 4^focus`),
+  `mirror` negates the left component. The previous `focus` was an ad-hoc
+  approximation that was neither energy-preserving nor bounded — part of why
+  the block "didn't seem to be working correctly".
+
+**Gain staging, same doctrine as `upmix`.** Width above 1 and any Focus both
+raise the decoded peak, and the old code shipped that straight to the speakers.
+A **global trim** now bounds the worst-case decoded pressure to what an
+untransformed field would give: for a unit source the decoded pressure is
+`0.5·(W' + u·D')`, so `|p| ≤ 0.5·(1+width)·(1+|k|)`, and the trim is the
+reciprocal when that exceeds 1. Global, so the spatial balance is untouched;
+**exactly 1.0 at default params**, so it only engages where the transform would
+otherwise get louder.
+
+**Every ambisonic kernel ramps its coefficients across the quantum.** The
+direction/matrix is sampled once per quantum, so a moving source stepped the
+coefficients ~370×/s at 128 frames — a burst of clicks the moment anything
+moved, and one of the "popping when using Surround blocks" reports.
+`amb-encode` additionally called `Smooth.step` **per sample**, which advances
+one *quantum* per call and therefore raced the gain knob to its target in
+~1/370 s — a step, not a smooth. See the `Smooth.step` trap in
+[`10-performance.md`](10-performance.md).
 - **`amb-decode`** — cardioid (in-phase) decoder: `p_i = 0.5·(W + xa_i·X +
   ya_i·Y + za_i·Z)`, no negative gains so it stays robust and blur-free on any
   rig. Subs get nothing. Output follows the rig width.
+
+  **Normalised against the rig.** That formula has no speaker-count term, so its
+  loudness grew with the rig and its peak sat at exactly 1.0 for a full-scale
+  source pointed at a speaker — no headroom. Measured on an 8-speaker rig, an
+  Encode→Decode chain came out at power **2.04 against `panner3d`'s 1.00 for
+  the same source**: +6.2 dB, so swapping one block for the other jumped the
+  level and two ambisonic sources clipped. `panner3d` is constant-power
+  (Σg² = 1), so that is the target — a global gain, computed at rebuild from
+  the mean Σg² over the rig's *own* speaker directions (the right sampling
+  domain: it is exactly the coverage this rig has). After: power 1.13, peak
+  0.55.
 - **`amb-binaural`** — decodes to **6 fixed virtual speakers** (±front/left/up)
   and runs a mini ITD+shadow head model, so headphone monitoring of a field
   needs no rig. Regression cover checks encode→decode localization (front,
   overhead), that a 90° field rotation moves a front source off-centre, and
   that ambi-binaural images a left source in the left ear.
 
-### `spatial-scope` — per-speaker radar
+  **Also normalised**, and this one was worse: summing six virtual speakers into
+  two ears measured **1.75 per ear omni, 2.0 hard-panned** for a full-scale
+  source — 5–6 dB into the clipper, so every ambisonic patch monitored on
+  headphones was distorting. Calibrated so the omni case lands at −3 dBFS per
+  ear (where a centred mono source sits under an equal-power law), derived from
+  the virtual-speaker geometry at construction rather than hardcoded. After:
+  0.71 omni, 0.81 hard-panned.
 
-A sink that keeps a **smoothed RMS per channel** (fast-attack/slow-release, like
-a meter) updated cheaply in `process`, published via a new `visualChans()`
-kernel hook → the `chans` field on the visuals message → the renderer draws
-each channel at its speaker's real angle (`drawSpatialScope`, reading
-`doc.scene.rig`). The layout draws with audio off; it lights up when levels
-arrive. This is the first per-channel telemetry — the net-level protocol still
-ships one rms/peak pair per net.
+### Per-speaker monitoring — `spatial-scope`, `speaker-monitor`, `chan-pick`
+
+All three hang off one idea: **you cannot mix what you cannot see**. A wide bus
+carries one channel per speaker and the net-level protocol only ships one
+rms/peak pair, so without per-channel telemetry a surround patch is a black box.
+
+- **`spatial-scope`** — a sink that keeps a **smoothed RMS per channel**
+  (fast-attack/slow-release, like a meter) updated cheaply in `process`,
+  published via `visualChans()` → the `chans` field on the visuals message →
+  the renderer draws each channel at its speaker's real angle
+  (`drawSpatialScope`, reading `doc.scene.rig`). The layout draws with audio
+  off; it lights up when levels arrive.
+- **`speaker-monitor`** — in-line on the bus (wide in, wide out) with
+  per-speaker **mute** and **solo** plus the same `chans` telemetry, drawn as
+  labelled bar meters (`visual: 'speakers'`). `solo` is a 1-based speaker
+  number (0 = off) because solo is exclusive by definition; `mute` is one
+  `'0'`/`'1'` per speaker, index-aligned with the rig. **Both gains ramp across
+  the quantum** — a hard gate on a running signal is a step discontinuity, i.e.
+  a click produced by the very block you are using to hunt clicks. The renderer
+  parses the identical strings in `src/core/rig.ts` (`isSpeakerMuted`,
+  `toggleSpeakerMute`, `isSpeakerSilenced`) — **change one, change both.**
+- **`chan-pick`** — any two channels of a wide bus as a stereo pair. A stereo
+  sink on a wide net silently takes channels 0 and 1 (docs/02 truncation
+  rules); this is how you take 7 and 8. A channel the bus does not carry reads
+  as silence rather than wrapping — inventing content on a monitoring path
+  defeats the point.
+
+`speaker-rig` publishes `chans` too, so the output block's own face shows what
+each speaker is being sent.
+
+The radar and the bars are deliberately both available: the radar says *where*
+the energy is, the bars say *how much*, and reading a level off a dot's radius
+is guesswork.
+
+### `speaker-rig` — the fold, and the popping bug it fixes
+
+**This was the cause of the "frequent popping on multichannel" report.**
+
+`pushOutputCh` used to wrap an out-of-range channel onto `ch % 2`. With a 7.1
+rig on a stereo endpoint — *the default state on any laptop* — all eight
+speaker feeds landed on two channels at **unity each**. Four correlated copies
+is +12 dB, the device's `clip()` shredded every one of them, and nothing
+anywhere reported it. Measured on an 8-speaker rig with full-scale correlated
+feeds: peak **4.000** per output channel.
+
+The fold is now decided in `speaker-rig`, which is the only place that knows
+the speaker layout, and it is a user choice (`fold` param):
+
+| mode | behaviour |
+|------|-----------|
+| `Fold` (default) | surplus speakers are downmixed onto the available channels **by direction** — a speaker's azimuth picks its pan position, so a rear-left lands left and a centre lands centre, instead of wherever `% 2` put it |
+| `Drop` | surplus speakers are silent — honest, and right when the rig models a room you are only monitoring part of |
+| `Wrap` | the old `% 2` mapping, but normalised so it cannot clip |
+
+Two layers of gain staging, because one is not enough:
+
+1. **Power normalisation** (`1/√k` per destination channel) holds the level
+   right for real material and bounds the fully-correlated worst case at `√k`
+   instead of `k`. Measured: 4.000 → **2.360**. Better, still clipping.
+2. **A brick-wall limiter on the folded channels** — instant attack (the gain
+   drops to exactly what the sample needs, so overshoot is impossible), ~120 ms
+   release. Measured: **0.995**, i.e. the ceiling, in every mode. Real material
+   never engages it, so folding stays as loud as it should be.
+
+Normalising by `k` instead would guarantee the bound in one step but cost ~7 dB
+on ordinary uncorrelated surround content — the wrong trade for the common case.
+
+The fold is **visible**: the kernel publishes `__folded` (speakers with no
+channel of their own) and `__chans` (what the device actually offers) through
+`liveParams`, and the block face draws `8 spk → 2 ch · 6 folded`. A truncation
+you cannot see is the same bug in a different costume.
+
+`IoManager.outChannels(device, asio)` is how the kernel learns the real channel
+count; it is re-read once per quantum (a map lookup) so a stream that opens
+narrower than the rig is noticed the quantum it happens.
 
 ### Intentional cross-engine divergences (not bugs)
 

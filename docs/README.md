@@ -79,6 +79,18 @@ avoid stepping on the invariants that keep it fast and correct.
 9. **Only the app's single rAF loop animates anything.** The Dock's canvases
    take `onFrame` from it; a tab that starts its own loop burns CPU while
    hidden. See [`10-performance.md`](10-performance.md).
+10. **A gain that moves must ramp across the quantum, and `Smooth.step` is
+    per-QUANTUM, not per-sample.** Stepping a coefficient at quantum boundaries
+    is ~370 discontinuities a second; calling `Smooth.step` in a sample loop
+    collapses its time constant to one quantum. Both are clicks, and both have
+    been found more than once. See [`10-performance.md`](10-performance.md).
+11. **Never let more signal into a hardware channel than it can hold, and never
+    truncate silently.** Wrapping a 7.1 rig onto a stereo endpoint at unity is
+    +12 dB into `clip()`. Fold deliberately, bound the result, and *show* the
+    user it happened. See [`05-native-engine.md`](05-native-engine.md).
+12. **`setPointerCapture` always goes in a `try/catch`**, and no context menu
+    ever opens on top of a live drag. Both cost whole interactions on touch and
+    pen. See [`07-ui.md`](07-ui.md).
 
 ## Document index
 
@@ -110,4 +122,4 @@ avoid stepping on the invariants that keep it fast and correct.
   with the harnesses in [`12-testing-checklist.md`](12-testing-checklist.md)
   rather than trusting a stale figure.
 
-_Last verified against the codebase: 2026-07-23._
+_Last verified against the codebase: 2026-07-27._

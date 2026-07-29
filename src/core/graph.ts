@@ -346,7 +346,19 @@ export class GraphDoc {
     this.graph.blocks.push(b);
     // A freshly dropped wide-port block takes the def's placeholder width;
     // point it at the real one before anything compiles.
-    if (['speaker-rig', 'multi-in', 'upmix', 'binaural', 'panner3d', 'amb-decode', 'spatial-scope'].includes(type))
+    if (
+      [
+        'speaker-rig',
+        'multi-in',
+        'upmix',
+        'binaural',
+        'panner3d',
+        'amb-decode',
+        'spatial-scope',
+        'speaker-monitor',
+        'chan-pick',
+      ].includes(type)
+    )
       this.syncRigPorts();
     this.touch('structure');
     return b;
@@ -687,11 +699,19 @@ export class GraphDoc {
         // Speaker Rig follows the scene's layout; Multi In follows its own
         // Channels param. Both are "a wide port whose width isn't a constant",
         // so both are re-derived here rather than at their edit sites.
-        if (b.type === 'speaker-rig' || b.type === 'binaural' || b.type === 'spatial-scope') {
+        if (b.type === 'speaker-monitor') {
+          // In-line on the bus: BOTH ends carry one channel per speaker.
+          for (const p of b.ports) if (p.kind === 'audio') set(p, rigWidth);
+        } else if (b.type === 'speaker-rig' || b.type === 'binaural' || b.type === 'spatial-scope' || b.type === 'chan-pick') {
           // All take the rig on their (wide) input; their outputs, if any, are
           // stereo or none.
           for (const p of b.ports) if (p.dir === 'in' && p.kind === 'audio') set(p, rigWidth);
-        } else if (b.type === 'upmix' || b.type === 'panner3d' || b.type === 'amb-decode') {
+        } else if (
+          b.type === 'upmix' ||
+          b.type === 'panner3d' ||
+          b.type === 'amb-decode' ||
+          b.type === 'spectral-scatter'
+        ) {
           // A narrow/B-format input and CV inputs stay as declared; only the
           // speaker output follows the rig.
           for (const p of b.ports) if (p.dir === 'out' && p.kind === 'audio') set(p, rigWidth);
@@ -1011,6 +1031,46 @@ export class GraphDoc {
    *  state (the renderer's wire colours) can cache against the same key. */
   get netRevision(): number {
     return this.netRev;
+  }
+
+  /**
+   * Does this port currently have a wire on it?
+   *
+   * The question CV indicators ask. A `cv:<param>` port exists from the moment
+   * the user adds it, so keying an indicator on the port's *existence* lights
+   * it up before anything is patched — the marker then sits on a param nothing
+   * is modulating, which is exactly the noise the indicators exist to cut
+   * through.
+   *
+   * **Scene-wide, unlike `netIndex`**, which only walks the open graph: the
+   * Dock mirrors widgets from any subgraph, and asking about a block one level
+   * down must not silently answer "not wired". Block ids are unique across the
+   * scene (every clone path goes through `makeRemapper`), so one flat set is
+   * enough; a collision would only make a badge appear slightly too eagerly.
+   *
+   * Memoized on `netRev` like the net index, and for the same reason — this is
+   * on the frame path, once per widget.
+   */
+  isPortWired(blockId: string, portId: string): boolean {
+    return this.wiredPorts().has(blockId + '\0' + portId);
+  }
+
+  private wiredCache: { rev: number; set: Set<string> } | null = null;
+  private wiredPorts(): Set<string> {
+    if (this.wiredCache && this.wiredCache.rev === this.netRev) return this.wiredCache.set;
+    const set = new Set<string>();
+    const visit = (g: Graph): void => {
+      for (const w of g.wires) {
+        // A wire end being dragged has `float` instead of `port` — it is
+        // genuinely unplugged, so it correctly contributes nothing.
+        if (w.a.port) set.add(w.a.port.blockId + '\0' + w.a.port.portId);
+        if (w.b.port) set.add(w.b.port.blockId + '\0' + w.b.port.portId);
+      }
+      for (const b of g.blocks) if (b.graph) visit(b.graph);
+    };
+    visit(this.scene.root);
+    this.wiredCache = { rev: this.netRev, set };
+    return set;
   }
 
   /**

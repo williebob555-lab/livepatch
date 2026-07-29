@@ -70,9 +70,26 @@ export interface ParamSpec {
    * picker ("Browse…") instead of a raw text box. 'vst3' picks a .vst3 plugin.
    */
   filePick?: 'vst3';
+  /** A string param whose value is prose: Properties gives it a textarea
+   *  instead of a one-line input, and newlines survive editing. */
+  multiline?: boolean;
 }
 
-export type VisualKind = 'spectrogram' | 'scope' | 'meter' | 'spectrum' | 'eq' | 'midimon' | 'spatial';
+/**
+ * `speakers` is the per-speaker bar meter: one labelled bar per channel of a
+ * wide bus, fed by the same `chans` telemetry as `spatial`. The two are
+ * deliberately both available — the radar says *where* the energy is, the bars
+ * say *how much*, and reading a level off a dot's radius is guesswork.
+ */
+export type VisualKind =
+  | 'spectrogram'
+  | 'scope'
+  | 'meter'
+  | 'spectrum'
+  | 'eq'
+  | 'midimon'
+  | 'spatial'
+  | 'speakers';
 
 export interface BlockDef {
   type: string;
@@ -88,7 +105,16 @@ export interface BlockDef {
   /** Live visual painted on the block face, fed by the engine. */
   visual?: VisualKind;
   /** Fully custom-drawn face (renderer special case) instead of face items. */
-  customFace?: 'cassette' | 'roll';
+  customFace?: 'cassette' | 'roll' | 'comment';
+  /**
+   * Never reaches an engine: the compiler skips the block entirely, so it has
+   * no compiled node, no kernel, and no place in the parity audit. For blocks
+   * that exist purely on the canvas (Comment). Without this a portless block
+   * still compiles to a node that both engines resolve to a pass-through —
+   * harmless, but it puts scenery in the audio graph, and "harmless today"
+   * is how the unknown-type pass-through trap gets set.
+   */
+  noCompile?: boolean;
   /** Subgraph container: entering it opens a subwindow of its own graph. */
   isSubgraph?: boolean;
   /** Pure control emitter (knob/fader/pad blocks). */

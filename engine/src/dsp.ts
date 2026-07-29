@@ -49,8 +49,16 @@ export interface Services {
   /** Multichannel capture: one channel by absolute index. Missing = silence. */
   pullInputCh: (device: string, ch: number, out: Float32Array, n: number) => void;
   pushOutput: (device: string, L: Float32Array, R: Float32Array, n: number) => void;
-  /** Multichannel playback: single channel `ch` (0..7) of a surround device. */
+  /** Multichannel playback: single channel `ch` (0..7) of a surround device.
+   *  A channel the device does not have is **dropped**, not wrapped — see
+   *  `IoManager.pushOutputCh` and the `speaker-rig` fold. */
   pushOutputCh: (device: string, ch: number, buf: Float32Array, n: number) => void;
+  /**
+   * How many output channels are actually available on a route, or 0 while
+   * nothing is open yet. `speaker-rig` needs this to know when the rig is
+   * wider than the hardware and it has to fold rather than overflow.
+   */
+  outChannels: (device: string, asio: boolean) => number;
   pullAsioIn: (ch: number, out: Float32Array, n: number) => void;
   pushAsioOut: (ch: number, buf: Float32Array, n: number) => void;
   hardwareChanged: () => void;
@@ -118,6 +126,24 @@ export interface Kernel {
    *  audio thread (visuals timer) — the kernel keeps a smoothed level per
    *  channel updated cheaply in `process` and returns a snapshot here. */
   visualChans?(): number[];
+  /**
+   * Live values of params this kernel drives **itself**, for the renderer's
+   * CV indicators.
+   *
+   * Most modulation reaches a param through a `cv:<param>` port, which the
+   * graph applies via `setParam` — so the renderer already knows the post-CV
+   * value. A handful of blocks instead take modulation on a *built-in audio-rate
+   * input* (`panner3d`'s x/y/z, `amb-encode`'s x/y/z, `amb-rotate`'s yaw) and
+   * read it straight out of `ins` inside `process`. Nothing ever calls
+   * `setParam` for those, so before this hook existed the XY pad on a Panner 3D
+   * sat frozen at the knob value while an Orbit swung the source around the
+   * room — "I can't see what I'm hearing".
+   *
+   * Read off the audio thread on the mods timer (~30 Hz); implementations
+   * publish plain numbers they already track, so `process` stays
+   * allocation-free.
+   */
+  liveParams?(): Record<string, number>;
   /** Current step index for the sequencer playhead (−1 = none). */
   visualStep?(): number;
   /**
@@ -296,9 +322,30 @@ const sumInto = (dst: Buf, src: Buf | undefined, n: number): void => {
     for (let i = 0; i < n; i++) d[i] += s[i];
   }
 };
+/**
+ * Copy `n` frames per channel, clearing whatever the source didn't reach.
+ *
+ * **The inner loop is hand-written rather than `dst[c].set(src[c].subarray(0,
+ * n))`, and that is not a style preference.** `subarray` returns a *new
+ * TypedArray view object* — a heap allocation — every time it is called. This
+ * helper runs once per connected kernel per channel per quantum, so at 128
+ * frames / 48 kHz a modest patch was allocating thousands of throwaway views a
+ * second in the audio callback. Nothing leaks and nothing sounds wrong for a
+ * while; the garbage simply accumulates until V8 collects it, and *that* is a
+ * pop every couple of seconds (docs/10, rule 1 — "the audio callback allocates
+ * nothing"). It is the same reason `sumInto` above is written out longhand.
+ *
+ * `set` itself is fine — it is only the `subarray` that allocates. If you ever
+ * need the whole buffer, `dst[c].set(src[c])` allocates nothing; it just copies
+ * MAXQ frames instead of `n`.
+ */
 const copy = (dst: Buf, src: Buf | undefined, n: number): void => {
   const w = src ? (dst.length < src.length ? dst.length : src.length) : 0;
-  for (let c = 0; c < w; c++) dst[c].set(src![c].subarray(0, n));
+  for (let c = 0; c < w; c++) {
+    const d = dst[c];
+    const s = src![c];
+    for (let i = 0; i < n; i++) d[i] = s[i];
+  }
   // Clear the channels the source didn't reach, or last quantum's contents
   // smear through them forever.
   for (let c = w; c < dst.length; c++) dst[c].fill(0, 0, n);
@@ -738,6 +785,17 @@ registerKernel('multi-in', (params, sv) => {
  * distance changes the read rate, which shifts pitch — the physical effect,
  * not a pitch-shifter bolted on. The delay line is preallocated (max ~50 m ≈
  * 7000 frames at 48k → 16384).
+ *
+ * ### Why the smoothing is hand-rolled here rather than a `Smooth`
+ *
+ * `Smooth.step` advances **one quantum** per call — that is its contract. This
+ * kernel needs a per-*sample* glide (the Doppler tap moves every sample), and
+ * calling `step` inside the sample loop raced both the distance and the gain to
+ * their targets inside a single quantum: a 50 ms time constant collapsed to
+ * ~2.7 ms. A jumping `dist` CV then teleported the delay read pointer, which is
+ * a click by construction — the same failure the `amb-decode` note describes,
+ * and one of the "popping when moving a source" reports. So the coefficient is
+ * computed once per quantum for a **one-sample** step and applied in the loop.
  */
 registerKernel('distance', (params) => {
   const LEN = 16384;
@@ -748,8 +806,12 @@ registerKernel('distance', (params) => {
   const airL = new Biquad();
   const airR = new Biquad();
   let airFc = -1;
-  const gSm = new Smooth(1);
-  const dSm = new Smooth(num(params.distance, 3), 0.05); // smooth distance → smooth Doppler
+  /** Per-sample glide time constants (seconds). Distance is the slow one — it
+   *  drives the Doppler tap, so its rate of change *is* the pitch shift. */
+  const D_TC = 0.05;
+  const G_TC = 0.015;
+  let dCur = num(params.distance, 3);
+  let gCur = 1;
 
   const tap = (ch: Float32Array, d: number): number => {
     let pos = w - d;
@@ -775,30 +837,30 @@ registerKernel('distance', (params) => {
       const dopAmt = num(p.doppler, 0.5);
       // Distance for this quantum (CV overrides the knob).
       const dTarget = dcv ? Math.abs(dcv[0][n - 1]) * 50 : num(p.distance, 3);
-      dSm.set(dTarget);
       // Air-absorption cutoff closes as the source recedes (only recompute on
       // change — a biquad update per sample is wasteful and zippers).
-      const d0 = dSm.cur;
-      const fc = Math.max(500, 20000 * Math.exp(-airAmt * d0 * 0.15));
+      const fc = Math.max(500, 20000 * Math.exp(-airAmt * dCur * 0.15));
       if (Math.abs(fc - airFc) > fc * 0.02) {
         airL.lowpass(ctx.sr, fc, 0.707);
         airR.lowpass(ctx.sr, fc, 0.707);
         airFc = fc;
       }
+      // One-sample one-pole coefficients, computed once for the quantum.
+      const kd = 1 - Math.exp(-1 / (ctx.sr * D_TC));
+      const kg = 1 - Math.exp(-1 / (ctx.sr * G_TC));
       for (let i = 0; i < n; i++) {
         const l = src ? src[0][i] : 0;
         const r = src ? (src.length > 1 ? src[1][i] : src[0][i]) : 0;
         dL[w] = l;
         dR[w] = r;
-        const d = dSm.step(ctx);
-        const g = 1 / Math.pow(Math.max(1, d), roll);
-        gSm.set(g);
-        const gg = gSm.step(ctx);
+        dCur += (dTarget - dCur) * kd;
+        const g = 1 / Math.pow(Math.max(1, dCur), roll);
+        gCur += (g - gCur) * kg;
         // Doppler delay in frames; dopAmt scales how much of the physical
         // delay is applied (0 = distance cues without pitch motion).
-        const delay = Math.min(LEN - 2, (d / 343) * ctx.sr * dopAmt);
-        oL[i] = tap(dL, delay) * gg;
-        oR[i] = tap(dR, delay) * gg;
+        const delay = Math.min(LEN - 2, (dCur / 343) * ctx.sr * dopAmt);
+        oL[i] = tap(dL, delay) * gCur;
+        oR[i] = tap(dR, delay) * gCur;
         w = (w + 1) % LEN;
       }
       // Air-absorption low-pass over the whole quantum (Biquad is buffer-wise).
@@ -1021,6 +1083,392 @@ registerKernel('orbit', (params) => {
   };
 });
 
+/** A pannable speaker prepared for panning: position in metres plus the unit
+ *  direction. Built by whichever kernel owns the rig (see `panner3d.rebuild`). */
+export interface PanSpeaker {
+  x: number;
+  y: number;
+  z: number;
+  ux: number;
+  uy: number;
+  uz: number;
+}
+
+/**
+ * Distance-based amplitude panning gains for one source position, written into
+ * `out` starting at `base`.
+ *
+ * Shared by `panner3d` and `spectral-scatter`, which is the point: two copies
+ * of a panning law is exactly how the picture on screen and the sound in the
+ * room start to disagree, and that class of bug is unfindable from the
+ * listening position (the same reasoning as the mirrored rig math in
+ * `rig.ts`). Allocation-free — the caller owns `out`.
+ *
+ * Gain falls off as `1/d^aExp` with `blur` softening the singularity at a
+ * speaker, then the vector is constant-power normalized.
+ */
+export function dbapInto(
+  spk: PanSpeaker[],
+  px: number,
+  py: number,
+  pz: number,
+  blur: number,
+  aExp: number,
+  out: Float32Array,
+  base: number,
+): void {
+  let sum = 0;
+  for (let j = 0; j < spk.length; j++) {
+    const s = spk[j];
+    const dx = px - s.x;
+    const dy = py - s.y;
+    const dz = pz - s.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz + blur * blur);
+    const g = 1 / Math.pow(d, aExp);
+    out[base + j] = g;
+    sum += g * g;
+  }
+  const norm = sum > 1e-12 ? 1 / Math.sqrt(sum) : 0;
+  for (let j = 0; j < spk.length; j++) out[base + j] *= norm;
+}
+
+/**
+ * Spectral Scatter — a source split by frequency and scattered across the rig.
+ * Def (and the rationale for a filterbank rather than an STFT) in
+ * `src/blocks/defs.ts`.
+ *
+ * Band split is a complementary Linkwitz-Riley cascade: at each crossover the
+ * running signal is lowpassed into the band and highpassed onward, so the
+ * bands sum flat. LR4 = two cascaded Butterworth sections, which is why there
+ * are two biquads per side.
+ *
+ * Every filter for the maximum band count is allocated at construction, so
+ * turning `Bands` is coefficient math only — nothing allocates once audio is
+ * running (docs/10). Changing the split *does* reset the filter states: an
+ * LR section carrying state for a different corner frequency is a burst, not a
+ * glide.
+ */
+registerKernel('spectral-scatter', (params) => {
+  const MAXB = 16;
+  let rig = parseRig(params[RIG_PARAM]);
+  let buf = allocBuf(8);
+  const p: Record<string, ParamValue> = { ...params };
+  const gain = new Smooth(num(params.gain, 1));
+
+  // Band split scratch. `mono` is the folded input, `run` the signal still
+  // travelling down the crossover chain, `band[i]` each extracted band.
+  const mono = new Float32Array(MAXQ);
+  const run = new Float32Array(MAXQ);
+  const band: Float32Array[] = [];
+  for (let i = 0; i < MAXB; i++) band.push(new Float32Array(MAXQ));
+  const lpA: Biquad[] = [];
+  const lpB: Biquad[] = [];
+  const hpA: Biquad[] = [];
+  const hpB: Biquad[] = [];
+  for (let i = 0; i < MAXB; i++) {
+    lpA.push(new Biquad());
+    lpB.push(new Biquad());
+    hpA.push(new Biquad());
+    hpB.push(new Biquad());
+  }
+
+  // Pannable speakers (subs excluded — bass management feeds those, never a
+  // panner), and the bus channel each one maps back to.
+  const spk: PanSpeaker[] = [];
+  let idx: number[] = [];
+  let count = 0;
+  let R = 1;
+  // Per-band gain vectors, laid out band-major: band b, speaker j at b*MAXCH+j.
+  const curG = new Float32Array(MAXB * MAXCH);
+  const tgtG = new Float32Array(MAXB * MAXCH);
+  let phase = 0;
+  let coeffSr = 0;
+  let coeffBands = 0;
+  let coeffLow = 0;
+  let coeffHigh = 0;
+  let reprime = true;
+
+  const rebuildRig = (): void => {
+    spk.length = 0;
+    idx = [];
+    count = rig ? rig.speakers.length : 0;
+    if (count > buf.length) buf = allocBuf(count);
+    if (!rig) return;
+    let maxd = 0.5;
+    for (let i = 0; i < rig.speakers.length; i++) {
+      const s = rig.speakers[i];
+      if (s.lfe) continue;
+      const v = speakerVec(s);
+      const d = Math.max(0.01, s.dist);
+      spk.push({ x: v.x * d, y: v.y * d, z: v.z * d, ux: v.x, uy: v.y, uz: v.z });
+      idx.push(i);
+      if (d > maxd) maxd = d;
+    }
+    R = maxd;
+    // Speaker j means a different direction after a rig edit — ramping from
+    // the old vector is a click on every rig change (same reasoning as
+    // `panner3d.rebuild`).
+    curG.fill(0);
+    reprime = true;
+  };
+  rebuildRig();
+
+  /** Crossover corners: N−1 points spaced logarithmically from Low to High. */
+  const setCoeffs = (sr: number, nb: number, low: number, high: number): void => {
+    const lo = Math.max(20, Math.min(low, high));
+    const hi = Math.max(lo * 1.05, high);
+    for (let k = 0; k < nb - 1; k++) {
+      const f = nb <= 2 ? Math.sqrt(lo * hi) : lo * Math.pow(hi / lo, k / (nb - 2));
+      lpA[k].setType('lowpass', sr, f, 0, Math.SQRT1_2);
+      lpB[k].setType('lowpass', sr, f, 0, Math.SQRT1_2);
+      hpA[k].setType('highpass', sr, f, 0, Math.SQRT1_2);
+      hpB[k].setType('highpass', sr, f, 0, Math.SQRT1_2);
+      lpA[k].reset();
+      lpB[k].reset();
+      hpA[k].reset();
+      hpB[k].reset();
+    }
+    coeffSr = sr;
+    coeffBands = nb;
+    coeffLow = lo;
+    coeffHigh = hi;
+  };
+
+  /** Deterministic per-band angle for the Random pattern. */
+  const randAngle = (b: number, seed: number): number => {
+    let h = (b * 2654435761 + seed * 40503) >>> 0;
+    h ^= h >>> 15;
+    h = Math.imul(h, 2246822519) >>> 0;
+    h ^= h >>> 13;
+    return (h >>> 0) / 4294967296;
+  };
+
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === RIG_PARAM) {
+        rig = parseRig(v);
+        rebuildRig();
+      } else if (id === 'gain') gain.set(num(v, 1));
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      for (let c = 0; c < buf.length; c++) buf[c].fill(0, 0, n);
+      if (!spk.length) return;
+
+      const nb = Math.max(2, Math.min(MAXB, Math.round(num(p.bands, 8))));
+      const low = num(p.low, 120);
+      const high = num(p.high, 9000);
+      if (ctx.sr !== coeffSr || nb !== coeffBands || low !== coeffLow || high !== coeffHigh) {
+        setCoeffs(ctx.sr, nb, low, high);
+        reprime = true;
+      }
+
+      // ---- fold to mono, then split ----
+      const src = ins.in;
+      if (src) {
+        const w = Math.min(src.length, 2);
+        const sc = 1 / w;
+        for (let i = 0; i < n; i++) {
+          let s = 0;
+          for (let c = 0; c < w; c++) s += src[c][i];
+          run[i] = mono[i] = s * sc;
+        }
+      } else {
+        run.fill(0, 0, n);
+        mono.fill(0, 0, n);
+      }
+      // Longhand copies: `run.subarray(0, n)` would allocate a view per band
+      // per quantum, which is the GC-pop trap `copy` above documents.
+      for (let k = 0; k < nb - 1; k++) {
+        const bk = band[k];
+        for (let i = 0; i < n; i++) bk[i] = run[i];
+        lpA[k].process(bk, n);
+        lpB[k].process(bk, n);
+        hpA[k].process(run, n);
+        hpB[k].process(run, n);
+      }
+      const last = band[nb - 1];
+      for (let i = 0; i < n; i++) last[i] = run[i];
+
+      // ---- per-band target positions → DBAP gains ----
+      const spin = num(p.spin, 0);
+      const rot = ins['rot']?.[0];
+      const rotCv = rot ? rot[0] : 0; // control-rate: one sample per quantum
+      const width = num(p.width, 0.85);
+      const elev = num(p.elev, 0);
+      const blur = Math.max(0.05, num(p.spread, 0.2) * R);
+      const seed = Math.round(num(p.seed, 1));
+      const mode = str(p.mode, 'Rising');
+      const TWO_PI = Math.PI * 2;
+      phase += (spin * n) / ctx.sr;
+      if (phase > 1e6 || phase < -1e6) phase = 0;
+      for (let b = 0; b < nb; b++) {
+        const t = nb > 1 ? b / (nb - 1) : 0.5;
+        let turn: number;
+        if (mode === 'Falling') turn = 1 - t;
+        else if (mode === 'Alternate') turn = (b % 2 === 0 ? 0.25 : 0.75) + t * 0.5;
+        else if (mode === 'Random') turn = randAngle(b, seed);
+        else turn = t;
+        const a = (turn + phase + rotCv) * TWO_PI;
+        // Rig convention: +x right, +y front, azimuth positive CCW, so x uses
+        // −sin (see `speakerVec` in rig.ts — this sign is the single most
+        // flippable thing in the subsystem).
+        const px = -Math.sin(a) * width * R;
+        const py = Math.cos(a) * width * R;
+        const pz = elev * (t * 2 - 1) * R;
+        dbapInto(spk, px, py, pz, blur, 2, tgtG, b * MAXCH);
+      }
+      // ---- accumulate bands into speaker channels, ramping gains ----
+      const gv = gain.step(ctx);
+      // Reprime *after* `gv` is known: `curG` holds post-gain values, so
+      // priming it from the raw targets would jump by the gain on the first
+      // quantum after a rig edit — the exact click the reprime exists to avoid.
+      if (reprime) {
+        for (let i = 0; i < curG.length; i++) curG[i] = tgtG[i] * gv;
+        reprime = false;
+      }
+      const inv = 1 / n;
+      for (let b = 0; b < nb; b++) {
+        const bk = band[b];
+        const base = b * MAXCH;
+        for (let j = 0; j < spk.length; j++) {
+          const g0 = curG[base + j];
+          const g1 = tgtG[base + j] * gv;
+          if (g0 === 0 && g1 === 0) continue;
+          const dst = buf[idx[j]];
+          const step = (g1 - g0) * inv;
+          let g = g0;
+          for (let i = 0; i < n; i++) {
+            dst[i] += bk[i] * g;
+            g += step;
+          }
+          curG[base + j] = g1;
+        }
+      }
+    },
+    visualChans: () => {
+      const outv: number[] = [];
+      for (let c = 0; c < count; c++) {
+        let s = 0;
+        const ch = buf[c];
+        for (let i = 0; i < 128; i++) s += ch[i] * ch[i];
+        outv.push(Math.sqrt(s / 128));
+      }
+      return outv;
+    },
+  };
+});
+
+/**
+ * Note Space — a note's properties become a position. Def in
+ * `src/blocks/defs.ts`; the axis-source strings are mirrored from
+ * `NOTE_SPACE_SRC` there, so a new option needs a case in both files.
+ *
+ * Position moves on note-**on** only and holds through the release, matching
+ * `midi-cv`'s sample-and-hold pitch line: letting go of a key should not fling
+ * the source back to the middle of the room.
+ *
+ * MIDI passes through untouched, so this drops into an existing chain rather
+ * than branching it — and since nothing is re-voiced here, there is no note
+ * bookkeeping to get wrong (docs/08 stuck-note rule).
+ */
+registerKernel('note-space', (params) => {
+  const bx = stereo();
+  const by = stereo();
+  const bz = stereo();
+  /** Axis-indexed view of the three output buffers, built **once**. Building
+   *  `[bx, by, bz]` inside `process` allocates an array per quantum — the same
+   *  GC-pop trap documented on `copy` above. */
+  const axisBuf: Buf[] = [bx, by, bz];
+  const p: Record<string, ParamValue> = { ...params };
+  const target = [0, 0, 0]; // pre-spread, −1..1
+  const cur = [0, 0, 0];
+  const held: number[] = [];
+  const draw = [0, 0, 0]; // per-note randoms, one per axis
+  let rr = 0;
+  let rnd = (Math.round(num(params.seed, 1)) >>> 0) || 1;
+
+  /** xorshift32 — deterministic for a given Seed, and allocation-free. */
+  const nextRand = (): number => {
+    rnd ^= (rnd << 13) >>> 0;
+    rnd >>>= 0;
+    rnd ^= rnd >>> 17;
+    rnd ^= (rnd << 5) >>> 0;
+    rnd >>>= 0;
+    return rnd / 4294967296;
+  };
+
+  const clamp1 = (v: number): number => (v < -1 ? -1 : v > 1 ? 1 : v);
+
+  const axisValue = (src: string, ev: MidiEvent, r: number): number => {
+    if (src === 'Pitch') {
+      const lo = Math.round(num(p.low, 36));
+      const hi = Math.round(num(p.high, 96));
+      return hi > lo ? clamp1(((ev.note - lo) / (hi - lo)) * 2 - 1) : 0;
+    }
+    if (src === 'Velocity') return clamp1(ev.velocity * 2 - 1);
+    if (src === 'Channel') return clamp1((ev.channel / 15) * 2 - 1);
+    if (src === 'Random') return clamp1(r * 2 - 1);
+    if (src === 'Round-robin') {
+      const v = Math.max(2, Math.round(num(p.voices, 4)));
+      return clamp1(((rr % v) / (v - 1)) * 2 - 1);
+    }
+    return 0; // 'Off'
+  };
+
+  const k: Kernel = {
+    out: (port) => (port === 'x' ? bx : port === 'y' ? by : port === 'z' ? bz : null),
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'seed') rnd = (Math.round(num(v, 1)) >>> 0) || 1;
+    },
+    midiOut: null,
+    midiIn: (ev, offset) => {
+      if (ev.type === 'on') {
+        held.push(ev.note);
+        // Always draw all three, whether or not an axis is using Random, so the
+        // sequence a Seed produces doesn't change when you re-assign an axis.
+        draw[0] = nextRand();
+        draw[1] = nextRand();
+        draw[2] = nextRand();
+        target[0] = axisValue(str(p.xsrc, 'Pitch'), ev, draw[0]);
+        target[1] = axisValue(str(p.ysrc, 'Velocity'), ev, draw[1]);
+        target[2] = axisValue(str(p.zsrc, 'Off'), ev, draw[2]);
+        rr++;
+      } else if (ev.type === 'off') {
+        const i = held.lastIndexOf(ev.note);
+        if (i >= 0) held.splice(i, 1);
+      }
+      // Pass through unchanged, offset intact (sub-quantum timing, docs/06).
+      k.midiOut?.(ev, offset);
+    },
+    process: (_ins, ctx) => {
+      const spread = num(p.spread, 0.9);
+      const sl = num(p.slew, 0.05);
+      // Slew is a glide time, so the coefficient is per-sample here (this is a
+      // per-sample ramp, not a Smooth.step — see docs/10 rule 10).
+      const a = sl <= 0.0005 ? 0 : Math.exp(-1 / (sl * ctx.sr));
+      for (let ax = 0; ax < 3; ax++) {
+        const t = target[ax];
+        const ab = axisBuf[ax];
+        const l = ab[0];
+        const r = ab[1];
+        let s = cur[ax];
+        for (let i = 0; i < ctx.n; i++) {
+          s = t + (s - t) * a;
+          const v = s * spread;
+          l[i] = v;
+          r[i] = v;
+        }
+        cur[ax] = s;
+      }
+    },
+  };
+  return k;
+});
+
 /**
  * Panner 3D — a source placed and moved in the rig.
  *
@@ -1061,6 +1509,14 @@ registerKernel('panner3d', (params) => {
   let lastX = NaN;
   let lastY = NaN;
   let lastZ = NaN;
+  /** Next quantum starts AT the targets rather than ramping to them (set by
+   *  `rebuild`, where the gain array's meaning changed under us). */
+  let reprime = false;
+  /** Position actually used last quantum — published to the CV indicators so
+   *  the XY pad tracks an Orbit instead of sitting on the knob value. */
+  let liveX = num(params.x, 0);
+  let liveY = num(params.y, 0);
+  let liveZ = num(params.z, 0);
 
   const rebuild = (): void => {
     idx = [];
@@ -1080,6 +1536,12 @@ registerKernel('panner3d', (params) => {
     }
     R = maxd;
     lastX = lastY = lastZ = NaN; // force a recompute
+    // `curG[j]` is indexed by *pannable* speaker, and this rebuild just
+    // renumbered them — entry j now means a different speaker. Ramping from a
+    // gain that belonged to some other direction is a click on every rig edit,
+    // so start the next quantum from the new targets instead.
+    curG.fill(0);
+    reprime = true;
   };
   rebuild();
 
@@ -1107,19 +1569,7 @@ registerKernel('panner3d', (params) => {
   };
 
   const computeDBAP = (px: number, py: number, pz: number, blur: number, aExp: number): void => {
-    let sum = 0;
-    for (let j = 0; j < spk.length; j++) {
-      const s = spk[j];
-      const dx = px - s.x;
-      const dy = py - s.y;
-      const dz = pz - s.z;
-      const d = Math.sqrt(dx * dx + dy * dy + dz * dz + blur * blur);
-      const g = 1 / Math.pow(d, aExp);
-      tgtG[j] = g;
-      sum += g * g;
-    }
-    const norm = sum > 1e-12 ? 1 / Math.sqrt(sum) : 0;
-    for (let j = 0; j < spk.length; j++) tgtG[j] *= norm;
+    dbapInto(spk, px, py, pz, blur, aExp, tgtG, 0);
   };
 
   const computeVBAP = (px: number, py: number, pz: number): boolean => {
@@ -1216,17 +1666,32 @@ registerKernel('panner3d', (params) => {
     setWidth: (_port, w) => {
       if (w > buf.length) buf = allocBuf(w);
     },
+    liveParams: () => ({ x: liveX, y: liveY, z: liveZ }),
     process: (ins, ctx) => {
       const n = ctx.n;
       for (let c = 0; c < buf.length; c++) buf[c].fill(0, 0, n);
       if (!count || !spk.length) return;
       const src = ins.in;
       if (!src) return;
-      recompute(posOf(ins.x, num(p.x, 0), n), posOf(ins.y, num(p.y, 0), n), posOf(ins.z, num(p.z, 0), n));
+      const px = posOf(ins.x, num(p.x, 0), n);
+      const py = posOf(ins.y, num(p.y, 0), n);
+      const pz = posOf(ins.z, num(p.z, 0), n);
+      // Only a WIRED input is reported as modulation. Publishing the knob value
+      // for an unpatched port would light a live marker on every panner in the
+      // patch, which says nothing. NaN is the "not modulated" signal — the mods
+      // payload drops non-finite values.
+      liveX = ins.x ? px : NaN;
+      liveY = ins.y ? py : NaN;
+      liveZ = ins.z ? pz : NaN;
+      recompute(px, py, pz);
       const L = src[0];
       const Rr = src.length > 1 ? src[1] : src[0];
       const gl = gain.step(ctx);
       // Per-sample ramp from current to target gains: smooth movement.
+      if (reprime) {
+        reprime = false;
+        for (let j = 0; j < spk.length; j++) curG[j] = tgtG[j];
+      }
       const inv = 1 / n;
       for (let j = 0; j < spk.length; j++) {
         const c = idx[j];
@@ -1475,11 +1940,60 @@ registerKernel('spatial-scope', () => {
 // layout — mixing them up rotates or mirrors the field silently.
 const ambEnc = (dx: number, dy: number, dz: number): [number, number, number] => [-dx, dz, dy]; // → [Y, Z, X]
 
-/** Ambi Encode — a source into a B-format field at an X/Y/Z direction. */
+/**
+ * Ambi Encode — place a mono/stereo source in a B-format field.
+ *
+ * The source is folded to mono and written as an omni component (W) plus three
+ * figure-of-eight components (X/Y/Z) whose balance encodes where it comes from.
+ *
+ * ### X/Y/Z is a point in the unit BALL, not a direction on the sphere
+ *
+ * The vector used to be **normalised**, so only its angle mattered. Two
+ * consequences, both of which made the block feel broken:
+ *
+ * - Dragging the XY pad outward along a fixed angle did *nothing at all* —
+ *   measured identical decoded gains at radius 0.05 and 1.0, so half the pad's
+ *   travel was inert.
+ * - The centre was a singularity. At radius ~0.014 a 2 % move flipped the image
+ *   hard left↔right (measured: L/R 0.63/0.98 → 0.98/0.63). The pad was dead
+ *   along a radius and hypersensitive across one.
+ *
+ * So the vector is **clamped to the unit ball** instead of projected onto the
+ * sphere, and its length becomes *directivity*: at the rim the source is as
+ * focused as first order gets, at the centre it is pure W — no direction at
+ * all, decoding equally to every speaker, which is a genuinely useful "it is
+ * everywhere" and the correct limit of moving inward. Near the centre the angle
+ * stops mattering *because* the radius has taken the directivity to zero, so
+ * the singularity cannot be reached.
+ *
+ * This is still not distance — it is how *pointy* the source is. Use `Distance`
+ * for distance.
+ *
+ * ### Gains ramp across the quantum
+ *
+ * The direction is sampled once per quantum (last sample of the CV, matching
+ * `panner3d`), but applying it as a step is a burst of clicks the moment
+ * anything moves the source — an Orbit into `x`/`y` changes the encode
+ * coefficients ~370×/s at 128 frames. So the four coefficients ramp
+ * per-sample from last quantum's values to this one's, exactly as `panner3d`
+ * ramps its speaker gains. `gain` rides the same ramp: it used to call
+ * `Smooth.step` per sample, which advances one *quantum* per call and
+ * therefore raced the knob to its target in ~1/370 s — a step, not a smooth.
+ */
 registerKernel('amb-encode', (params) => {
   const buf = allocBuf(4);
   const p: Record<string, ParamValue> = { ...params };
   const gain = new Smooth(num(params.gain, 1));
+  // Live coefficients (what the last sample used) and this quantum's targets.
+  let cW = 1;
+  let cY = 0;
+  let cZ = 0;
+  let cX = 0;
+  let primed = false;
+  // Last direction actually used, published to the renderer's CV indicators.
+  let lastX = num(params.x, 0);
+  let lastY = num(params.y, 0);
+  let lastZ = num(params.z, 0);
   const posOf = (b: Buf | undefined, param: number, n: number): number => (b ? b[0][n - 1] : param);
   return {
     out: () => buf,
@@ -1487,6 +2001,8 @@ registerKernel('amb-encode', (params) => {
       p[id] = v;
       if (id === 'gain') gain.set(num(v, 1));
     },
+    // The live direction, for the renderer's CV indicators (docs/07-ui.md).
+    liveParams: () => ({ x: lastX, y: lastY, z: lastZ }),
     process: (ins, ctx) => {
       const n = ctx.n;
       for (let c = 0; c < 4; c++) buf[c].fill(0, 0, n);
@@ -1495,38 +2011,97 @@ registerKernel('amb-encode', (params) => {
       let x = posOf(ins.x, num(p.x, 0), n);
       let y = posOf(ins.y, num(p.y, 0), n);
       let z = posOf(ins.z, num(p.z, 0), n);
-      // Normalize to a direction (the field is directional, not positional).
-      const len = Math.hypot(x, y, z) || 1;
-      x /= len;
-      y /= len;
-      z /= len;
-      const [Y, Z, X] = ambEnc(x, y, z);
+      // Wired inputs only — see the note in `panner3d`. NaN = not modulated.
+      lastX = ins.x ? x : NaN;
+      lastY = ins.y ? y : NaN;
+      lastZ = ins.z ? z : NaN;
+      // Clamp into the unit ball — do NOT project onto the sphere. Length is
+      // directivity (see the note above); a zero vector stays zero, which is
+      // omni rather than "front".
+      const len = Math.hypot(x, y, z);
+      if (len > 1) {
+        const k = 1 / len;
+        x *= k;
+        y *= k;
+        z *= k;
+      }
+      const [tY, tZ, tX] = ambEnc(x, y, z);
+      const g = gain.step(ctx);
+      const tW = g;
+      const gY = tY * g;
+      const gZ = tZ * g;
+      const gX = tX * g;
+      if (!primed) {
+        primed = true;
+        cW = tW;
+        cY = gY;
+        cZ = gZ;
+        cX = gX;
+      }
+      const inv = 1 / n;
+      const sW = (tW - cW) * inv;
+      const sY = (gY - cY) * inv;
+      const sZ = (gZ - cZ) * inv;
+      const sX = (gX - cX) * inv;
       const W = buf[0];
       const bY = buf[1];
       const bZ = buf[2];
       const bX = buf[3];
       for (let i = 0; i < n; i++) {
-        const s = (src.length > 1 ? (src[0][i] + src[1][i]) * 0.5 : src[0][i]) * gain.step(ctx);
-        W[i] = s; // SN3D: W unity
-        bY[i] = s * Y;
-        bZ[i] = s * Z;
-        bX[i] = s * X;
+        const s = src.length > 1 ? (src[0][i] + src[1][i]) * 0.5 : src[0][i];
+        W[i] = s * (cW + sW * i); // SN3D: W carries the source at unity
+        bY[i] = s * (cY + sY * i);
+        bZ[i] = s * (cZ + sZ * i);
+        bX[i] = s * (cX + sX * i);
       }
+      cW = tW;
+      cY = gY;
+      cZ = gZ;
+      cX = gX;
     },
   };
 });
 
-/** Ambi Rotate — spin the whole field (yaw/pitch/roll + continuous spin). */
+/**
+ * Ambi Rotate — turn the whole recorded scene, as one rigid rotation.
+ *
+ * This is the move ambisonics exists for: one 3×3 matrix on the X/Y/Z
+ * components turns *everything* in the field at once — every source, and the
+ * reverberant space with them — with no re-panning and no loss. Yaw spins the
+ * scene about the vertical axis (the head-turn), pitch tips it front-to-back,
+ * roll banks it left-to-right. `Spin` is a free-running yaw in Hz on top, and
+ * the `yaw` CV adds ±180° so the scene can track a controller.
+ *
+ * W is untouched: rotation moves direction, not energy.
+ *
+ * ### Ramped, and the phase is wrapped
+ *
+ * The matrix is rebuilt once per quantum, so a moving yaw would step the
+ * coefficients ~370×/s — audible as a rasp on any dense field. The nine
+ * entries ramp per-sample instead. `spinPhase` wraps to [0,1) rather than
+ * accumulating forever, which kept losing mantissa bits (a spin left running
+ * for an hour ends up computing `sin` of ~10⁴ radians with visibly coarsened
+ * resolution).
+ */
 registerKernel('amb-rotate', (params) => {
   const buf = allocBuf(4);
   const p: Record<string, ParamValue> = { ...params };
   let spinPhase = 0;
+  // Rotation matrix, live (`m`) and this quantum's target (`t`). Row-major on
+  // (xa, ya, za) — front, left, up.
+  const m = new Float64Array(9);
+  const t = new Float64Array(9);
+  let primed = false;
+  /** Total yaw actually applied (param + spin + CV), wrapped to ±180 — the
+   *  renderer shows it on the Yaw knob so a spin is visible, not just audible. */
+  let liveYaw = num(params.yaw, 0);
   const posOf = (b: Buf | undefined, param: number, n: number): number => (b ? b[0][n - 1] : param);
   return {
     out: () => buf,
     setParam: (id, v) => {
       p[id] = v;
     },
+    liveParams: () => ({ yaw: liveYaw }),
     process: (ins, ctx) => {
       const n = ctx.n;
       const src = ins.in;
@@ -1534,8 +2109,13 @@ registerKernel('amb-rotate', (params) => {
       if (!src || src.length < 4) return;
       const rad = Math.PI / 180;
       spinPhase += (num(p.spin, 0) * n) / ctx.sr;
+      spinPhase -= Math.floor(spinPhase); // keep the phase in [0,1)
       const yawCv = ins.yaw ? posOf(ins.yaw, 0, n) * 180 : 0;
-      const yaw = num(p.yaw, 0) * rad + spinPhase * 2 * Math.PI + yawCv * rad;
+      const yawDeg = num(p.yaw, 0) + spinPhase * 360 + yawCv;
+      // Report the *effective* yaw whenever something other than the knob is
+      // moving it — a running Spin is exactly as invisible as an unshown CV.
+      liveYaw = ins.yaw || num(p.spin, 0) !== 0 ? ((yawDeg + 180) % 360) - 180 : NaN;
+      const yaw = yawDeg * rad;
       const pitch = num(p.pitch, 0) * rad;
       const roll = num(p.roll, 0) * rad;
       const cy = Math.cos(yaw);
@@ -1543,9 +2123,24 @@ registerKernel('amb-rotate', (params) => {
       const cp = Math.cos(pitch);
       const sp = Math.sin(pitch);
       const cr = Math.cos(roll);
-      const sr = Math.sin(roll);
-      // Rotate the directional vector (xa=front, ya=left, za=up). Yaw about up,
-      // pitch about left, roll about front. Channels: X=3(front), Y=1(left), Z=2(up).
+      const sl = Math.sin(roll);
+      // Compose yaw (about za) → pitch (about ya) → roll (about xa) into one
+      // matrix, so the per-sample inner loop is nine multiplies rather than
+      // three sequential rotations (and so ramping has something to ramp).
+      // Row 0 → xa', row 1 → ya', row 2 → za'.
+      t[0] = cp * cy;
+      t[1] = -cp * sy;
+      t[2] = sp;
+      t[3] = sl * sp * cy + cr * sy;
+      t[4] = -sl * sp * sy + cr * cy;
+      t[5] = -sl * cp;
+      t[6] = -cr * sp * cy + sl * sy;
+      t[7] = cr * sp * sy + sl * cy;
+      t[8] = cr * cp;
+      if (!primed) {
+        primed = true;
+        m.set(t);
+      }
       const W = src[0];
       const sY = src[1];
       const sZ = src[2];
@@ -1554,48 +2149,119 @@ registerKernel('amb-rotate', (params) => {
       const oY = buf[1];
       const oZ = buf[2];
       const oX = buf[3];
+      const inv = 1 / n;
+      const d0 = (t[0] - m[0]) * inv;
+      const d1 = (t[1] - m[1]) * inv;
+      const d2 = (t[2] - m[2]) * inv;
+      const d3 = (t[3] - m[3]) * inv;
+      const d4 = (t[4] - m[4]) * inv;
+      const d5 = (t[5] - m[5]) * inv;
+      const d6 = (t[6] - m[6]) * inv;
+      const d7 = (t[7] - m[7]) * inv;
+      const d8 = (t[8] - m[8]) * inv;
+      const m0 = m[0];
+      const m1 = m[1];
+      const m2 = m[2];
+      const m3 = m[3];
+      const m4 = m[4];
+      const m5 = m[5];
+      const m6 = m[6];
+      const m7 = m[7];
+      const m8 = m[8];
       for (let i = 0; i < n; i++) {
-        let xa = sX[i];
-        let ya = sY[i];
-        let za = sZ[i];
-        // yaw (about za): xa,ya
-        let t = xa * cy - ya * sy;
-        ya = xa * sy + ya * cy;
-        xa = t;
-        // pitch (about ya): xa,za
-        t = xa * cp + za * sp;
-        za = -xa * sp + za * cp;
-        xa = t;
-        // roll (about xa): ya,za
-        t = ya * cr - za * sr;
-        za = ya * sr + za * cr;
-        ya = t;
-        oW[i] = W[i];
-        oX[i] = xa;
-        oY[i] = ya;
-        oZ[i] = za;
+        const xa = sX[i];
+        const ya = sY[i];
+        const za = sZ[i];
+        oW[i] = W[i]; // rotation moves direction, not energy
+        oX[i] = xa * (m0 + d0 * i) + ya * (m1 + d1 * i) + za * (m2 + d2 * i);
+        oY[i] = xa * (m3 + d3 * i) + ya * (m4 + d4 * i) + za * (m5 + d5 * i);
+        oZ[i] = xa * (m6 + d6 * i) + ya * (m7 + d7 * i) + za * (m8 + d8 * i);
       }
+      m.set(t);
     },
   };
 });
 
-/** Ambi Transform — width (zoom), focus/dominance along an axis, mirror. */
+/**
+ * Ambi Transform — warp the field: Width (directivity), Focus (zoom toward a
+ * direction), Mirror.
+ *
+ * - **Width** scales the three directional components against the omni one.
+ *   `1` is the field as recorded. Below 1 the directions wash out — at `0`
+ *   only W survives and every source arrives from everywhere at once. Above 1
+ *   the field is *over*-directional: sources pull tighter to their speakers
+ *   than they really were. It is a directivity control, not a stereo-width
+ *   control; there is no L/R axis involved.
+ * - **Focus** is Gerzon **zoom**: it slides the whole field toward (positive)
+ *   or away from (negative) `Focus axis` — front, up or left. Sources near the
+ *   axis get louder and pull together; sources behind it thin out and drift
+ *   toward the antipode. Unlike Width this moves things, not just their
+ *   sharpness. It is a rotation-free warp, so W and the axis component trade
+ *   with each other: `W' = W + k·D`, `D' = D + k·W`, where `k` grows with
+ *   Focus.
+ * - **Mirror** flips left and right by negating the Y component. Nothing else
+ *   changes — it is an exact isometry of the field.
+ *
+ * ### Gain staging (same doctrine as `upmix`)
+ *
+ * Both Width above 1 and any Focus raise the decoded peak, and the previous
+ * implementation shipped that straight to the speakers — a full-scale source
+ * on-axis at Focus 1 decoded past 1.0 and the device's `clip()` shredded it.
+ * A **global trim** now bounds the worst-case decoded pressure to what an
+ * untransformed field would produce: for a unit source, decoded pressure is
+ * `0.5·(W' + u·D')`, so `|p| ≤ 0.5·(1+width)·(1+|k|)`, and the trim is the
+ * reciprocal of that when it exceeds 1. Global, so the spatial balance is
+ * untouched. **With default params the trim is exactly 1.0** — it only engages
+ * where the transform would otherwise get louder, which means Focus and Width
+ * re-shape the field rather than turning it up.
+ *
+ * Coefficients ramp across the quantum; a knob drag sends a param message per
+ * frame and stepping the matrix on each one is a burst of clicks.
+ */
 registerKernel('amb-transform', (params) => {
   const buf = allocBuf(4);
   const p: Record<string, ParamValue> = { ...params };
+  // Live / target coefficients: omni gain, cross terms, directional gain.
+  // (`kw` = W←D, `kd` = D←W, both along the focus axis; symmetric, so one
+  // number, but they are kept separate for clarity at the call site.)
+  const cur = new Float64Array(6); // [gW, k, wX, wY, wZ, trim]
+  const tgt = new Float64Array(6);
+  let primed = false;
+
+  const recompute = (): void => {
+    const width = Math.max(0, num(p.width, 1));
+    const focus = Math.max(-1, Math.min(1, num(p.focus, 0)));
+    // Gerzon zoom coefficient. λ = 4^focus, k = (λ²−1)/(λ²+1) ∈ (−1, 1); the
+    // (λ²±1) form is the dominance matrix already normalised so the omni gain
+    // stays at 1, which is what makes `k` the single number the loop needs.
+    const lam2 = Math.pow(4, 2 * focus);
+    const k = (lam2 - 1) / (lam2 + 1);
+    const peak = 0.5 * (1 + width) * (1 + Math.abs(k));
+    tgt[0] = 1;
+    tgt[1] = k;
+    tgt[2] = width;
+    tgt[3] = width * (on(p.mirror) ? -1 : 1);
+    tgt[4] = width;
+    tgt[5] = peak > 1 ? 1 / peak : 1;
+  };
+  recompute();
+  cur.set(tgt);
+
   return {
     out: () => buf,
     setParam: (id, v) => {
       p[id] = v;
+      recompute();
     },
     process: (ins, ctx) => {
       const n = ctx.n;
       const src = ins.in;
       for (let c = 0; c < 4; c++) buf[c].fill(0, 0, n);
       if (!src || src.length < 4) return;
-      const width = num(p.width, 1);
-      const focus = num(p.focus, 0);
-      const mirror = on(p.mirror);
+      if (!primed) {
+        primed = true;
+        cur.set(tgt);
+      }
       // Focus axis as a unit vector in (xa=front, ya=left, za=up).
       const axis = str(p.axis, 'Front');
       const ax = axis === 'Front' ? 1 : 0;
@@ -1609,27 +2275,33 @@ registerKernel('amb-transform', (params) => {
       const oY = buf[1];
       const oZ = buf[2];
       const oX = buf[3];
+      const inv = 1 / n;
+      const k0 = cur[1];
+      const dk = (tgt[1] - k0) * inv;
+      const wx0 = cur[2];
+      const dwx = (tgt[2] - wx0) * inv;
+      const wy0 = cur[3];
+      const dwy = (tgt[3] - wy0) * inv;
+      const wz0 = cur[4];
+      const dwz = (tgt[4] - wz0) * inv;
+      const tr0 = cur[5];
+      const dtr = (tgt[5] - tr0) * inv;
       for (let i = 0; i < n; i++) {
-        let xa = sX[i] * width;
-        let ya = sY[i] * width * (mirror ? -1 : 1);
-        let za = sZ[i] * width;
-        let w = W[i];
-        if (focus !== 0) {
-          // FOA dominance/zoom toward the axis: trade omni against the axis
-          // component. Positive pulls the field toward the axis.
-          const dir = xa * ax + ya * ay + za * az;
-          const nw = w + focus * dir;
-          const add = focus * w;
-          xa += add * ax;
-          ya += add * ay;
-          za += add * az;
-          w = nw;
-        }
-        oW[i] = w;
-        oX[i] = xa;
-        oY[i] = ya;
-        oZ[i] = za;
+        const k = k0 + dk * i;
+        const trim = tr0 + dtr * i;
+        const w = W[i];
+        // Width first: scale the directional components against the omni one.
+        const xa = sX[i] * (wx0 + dwx * i);
+        const ya = sY[i] * (wy0 + dwy * i);
+        const za = sZ[i] * (wz0 + dwz * i);
+        // Then zoom: W and the axis component trade with each other.
+        const dir = xa * ax + ya * ay + za * az;
+        oW[i] = (w + k * dir) * trim;
+        oX[i] = (xa + k * w * ax) * trim;
+        oY[i] = (ya + k * w * ay) * trim;
+        oZ[i] = (za + k * w * az) * trim;
       }
+      cur.set(tgt);
     },
   };
 });
@@ -1646,9 +2318,26 @@ registerKernel('amb-decode', (params) => {
   const cY = new Float32Array(MAXCH);
   const cZ = new Float32Array(MAXCH);
   const isLfe = new Uint8Array(MAXCH);
+  /**
+   * Global decoder gain, derived from the rig.
+   *
+   * The cardioid decode `0.5·(1 + u_i·d)` has no speaker-count term, so its
+   * loudness grew with the rig and its peak sat at exactly 1.0 for a full-scale
+   * source pointed at a speaker — no headroom at all. Measured on an 8-speaker
+   * rig: an Encode→Decode chain came out at **power 2.04 against the Panner
+   * 3D's 1.00 for the same source**, i.e. +6.2 dB, so swapping one block for
+   * the other jumped the level, and two ambisonic sources clipped.
+   *
+   * `panner3d` is constant-power (Σg² = 1), so that is the target: normalise so
+   * the *mean* Σg² over the rig's own directions is 1. Sampling at the speaker
+   * directions is the right domain — it is exactly the coverage this rig has —
+   * and it is deterministic and rebuild-time only.
+   */
+  let norm = 1;
   const rebuild = (): void => {
     count = rig ? rig.speakers.length : 0;
     if (count > buf.length) buf = allocBuf(count);
+    norm = 1;
     if (!rig) return;
     for (let i = 0; i < count; i++) {
       const s = rig.speakers[i];
@@ -1658,6 +2347,21 @@ registerKernel('amb-decode', (params) => {
       cY[i] = -v.x; // ya (left)
       cZ[i] = v.z; // za (up)
     }
+    let acc = 0;
+    let dirs = 0;
+    for (let d = 0; d < count; d++) {
+      if (isLfe[d]) continue; // a sub is not a direction a source can come from
+      let e = 0;
+      for (let i = 0; i < count; i++) {
+        if (isLfe[i]) continue;
+        const g = 0.5 * (1 + cX[i] * cX[d] + cY[i] * cY[d] + cZ[i] * cZ[d]);
+        e += g * g;
+      }
+      acc += e;
+      dirs++;
+    }
+    const mean = dirs ? acc / dirs : 1;
+    if (mean > 1e-9) norm = 1 / Math.sqrt(mean);
   };
   rebuild();
   return {
@@ -1686,7 +2390,7 @@ registerKernel('amb-decode', (params) => {
       // speaker raced it to its target (so the gain knob stepped instead of
       // smoothing) and handed each speaker a different point on the ramp,
       // which swings the image sideways for the length of a gain change.
-      const g = gain.step(ctx);
+      const g = gain.step(ctx) * norm;
       for (let c = 0; c < count; c++) {
         if (isLfe[c]) continue; // subs have no direction in the decode
         const dst = buf[c];
@@ -1699,8 +2403,25 @@ registerKernel('amb-decode', (params) => {
   };
 });
 
-/** Ambi Binaural — B-format to headphones via 6 virtual speakers + a mini
- *  head model (ITD + head shadow). Fixed directions, so no rig needed. */
+/**
+ * Ambi Binaural — B-format to headphones via 6 virtual speakers + a mini head
+ * model (ITD + head shadow). Fixed directions, so no rig needed.
+ *
+ * ### Level
+ *
+ * Summing six virtual speakers into two ears has a large built-in gain, and
+ * nothing was cancelling it: measured **1.75 per ear for a full-scale omni
+ * source and 2.0 hard-panned** — 5–6 dB into the clipper before anything
+ * downstream touched it. Every ambisonic patch monitored on headphones was
+ * distorting.
+ *
+ * The reference point is the omni (W-only) case, which is normalised to
+ * **−3 dBFS per ear** — the level a centred mono source sits at under an
+ * equal-power law, so it matches the rest of the app. Directional sources come
+ * out below full scale from there (hard left measured 0.81), which leaves real
+ * headroom. Derived from the virtual-speaker geometry at construction, not
+ * hardcoded, so changing `VS` cannot silently un-calibrate it.
+ */
 registerKernel('amb-binaural', (params) => {
   const out: Buf = [new Float32Array(MAXQ), new Float32Array(MAXQ)];
   const p: Record<string, ParamValue> = { ...params };
@@ -1717,25 +2438,52 @@ registerKernel('amb-binaural', (params) => {
   const RING = 128;
   const rings: Float32Array[] = VS.map(() => new Float32Array(RING));
   const wr = new Int32Array(VS.length);
-  // Per-virtual-speaker ITD taps + shadow gains, once (fixed directions).
-  const dL: number[] = [];
-  const dR: number[] = [];
-  const gL: number[] = [];
-  const gR: number[] = [];
+  // Per-virtual-speaker ITD taps + shadow gains. The directions are fixed, so
+  // this only has to run again if the SAMPLE RATE changes — the taps are in
+  // frames. It used to hard-code 48000, which put the ITD ~9 % out at 44.1 k
+  // and ~2× out at 96 k (the image narrows and the front/back cue weakens).
+  // Preallocated (never re-created): `buildTaps` only rewrites the numbers, so
+  // even the rare rate change allocates nothing on the audio thread.
+  const dL = new Float64Array(VS.length);
+  const dR = new Float64Array(VS.length);
+  const gL = new Float64Array(VS.length);
+  const gR = new Float64Array(VS.length);
   const a = 0.0875;
   const aOverC = a / 343;
-  for (const s of VS) {
-    // Virtual speaker Cartesian (right = −ya, front = xa, up = za).
-    const vx = -s.ya;
-    const phiR = Math.acos(Math.max(-1, Math.min(1, vx)));
-    const phiL = Math.PI - phiR;
-    const wood = (phi: number): number => (phi <= Math.PI / 2 ? -aOverC * Math.cos(phi) : aOverC * (phi - Math.PI / 2)) * 48000;
-    const base = aOverC * (Math.PI / 2) * 48000 + 2;
-    dR.push(base + wood(phiR));
-    dL.push(base + wood(phiL));
-    // Simple shadow: near ear brighter/louder, far ear attenuated.
-    gR.push(0.5 + 0.5 * Math.max(0, vx));
-    gL.push(0.5 + 0.5 * Math.max(0, -vx));
+  let tapSr = 0;
+  const buildTaps = (sr: number): void => {
+    if (sr === tapSr || !(sr > 0)) return;
+    tapSr = sr;
+    const base = aOverC * (Math.PI / 2) * sr + 2;
+    for (let vi = 0; vi < VS.length; vi++) {
+      // Virtual speaker Cartesian (right = −ya, front = xa, up = za).
+      const vx = -VS[vi].ya;
+      const phiR = Math.acos(Math.max(-1, Math.min(1, vx)));
+      const phiL = Math.PI - phiR;
+      const wood = (phi: number): number =>
+        (phi <= Math.PI / 2 ? -aOverC * Math.cos(phi) : aOverC * (phi - Math.PI / 2)) * sr;
+      dR[vi] = base + wood(phiR);
+      dL[vi] = base + wood(phiL);
+      // Simple shadow: near ear brighter/louder, far ear attenuated.
+      gR[vi] = 0.5 + 0.5 * Math.max(0, vx);
+      gL[vi] = 0.5 + 0.5 * Math.max(0, -vx);
+    }
+  };
+  buildTaps(48000);
+  /**
+   * Calibration: an omni (W-only) full-scale source lands at −3 dBFS per ear.
+   *
+   * With W = 1 and no directional part every virtual speaker's cardioid feed is
+   * exactly 0.5, so that ear's raw gain is `0.5 · Σ gL`. Reading `gL` rather
+   * than assuming its contents keeps this honest if `VS` or the shadow law
+   * changes. (`gL` and `gR` are mirror images, so either sum will do.)
+   */
+  let earNorm = 1;
+  {
+    let sum = 0;
+    for (let vi = 0; vi < VS.length; vi++) sum += gL[vi];
+    const omniEar = 0.5 * sum;
+    if (omniEar > 1e-9) earNorm = Math.SQRT1_2 / omniEar;
   }
   const tap = (ring: Float32Array, w: number, d: number): number => {
     let pos = w - d;
@@ -1756,6 +2504,9 @@ registerKernel('amb-binaural', (params) => {
       out[0].fill(0, 0, n);
       out[1].fill(0, 0, n);
       if (!src || src.length < 4) return;
+      // Rebuilding the taps allocates nothing in steady state: `buildTaps`
+      // returns immediately unless the device rate actually changed.
+      buildTaps(ctx.sr);
       const W = src[0];
       const Y = src[1];
       const Z = src[2];
@@ -1778,7 +2529,7 @@ registerKernel('amb-binaural', (params) => {
         }
         wr[vi] = w;
       }
-      const gl = level.step(ctx);
+      const gl = level.step(ctx) * earNorm;
       for (let i = 0; i < n; i++) {
         out[0][i] *= gl;
         out[1][i] *= gl;
@@ -1807,47 +2558,379 @@ registerKernel('amb-binaural', (params) => {
 registerKernel('speaker-rig', (params, sv) => {
   const scratch = new Float32Array(MAXQ);
   const chans = new Int32Array(MAXCH); // speaker index → hardware channel (0-based)
+  /**
+   * Fold plan. Every speaker gets up to two destination channels with a gain
+   * each — one entry (gain 1, second channel −1) for the ordinary case where
+   * the hardware has the channel the speaker asked for, two when it has to be
+   * folded down onto the pair that does exist.
+   */
+  const foldA = new Int32Array(MAXCH);
+  const foldB = new Int32Array(MAXCH);
+  const gainA = new Float32Array(MAXCH);
+  const gainB = new Float32Array(MAXCH);
+  /** 1 = this speaker is not being reproduced at all (Drop mode). */
+  const dropped = new Uint8Array(MAXCH);
   let count = 0;
   let device = str(params.device);
   let asio = str(params.api, 'ASIO') !== 'Windows';
+  let mode = str(params.fold, 'Fold');
+  let rig = parseRig(params[RIG_PARAM]);
+  /** Channels the hardware turned out to have when the plan was last built —
+   *  the plan is rebuilt when this changes, which is how a stream opening
+   *  narrower than the rig gets noticed. */
+  let planChans = -1;
+  let folding = false;
   const level = new Smooth(num(params.level, 0.9));
+  /** Scratch for the fold normalisation. Preallocated: `buildPlan` can be
+   *  reached from `process` (the quantum a stream opens narrower than the rig),
+   *  and that path must not allocate. */
+  const foldPow = new Float64Array(MAXCH);
+  /**
+   * Where a fold is summed before it goes to the hardware, so the limiter
+   * below can see the whole channel rather than one speaker's share of it.
+   *
+   * Eight channels (`MAX_WCH`, the Windows endpoint cap) at MAXQ = 64 KB,
+   * allocated once at construction because the no-allocation rule covers every
+   * path `process` can reach. Fold destinations are clamped to this span; the
+   * direction-preserving fold only ever targets 0 and 1 anyway, and a device
+   * with more than eight channels is not one a rig gets folded onto in
+   * practice.
+   */
+  const FOLD_CH = 8;
+  const foldOut: Float32Array[] = [];
+  for (let c = 0; c < FOLD_CH; c++) foldOut.push(new Float32Array(MAXQ));
+  /** Limiter gain state, one per fold channel (1 = not limiting). */
+  const limG = new Float32Array(FOLD_CH).fill(1);
 
-  const readRig = (v: ParamValue | undefined): void => {
-    const rig = parseRig(v);
-    count = 0;
-    if (!rig) return;
-    count = Math.min(MAXCH, rig.speakers.length);
-    for (let i = 0; i < count; i++) chans[i] = outChannel(rig.speakers[i], i) - 1;
+  /**
+   * Build the routing plan. Runs at set-graph / param / reconfigure time only.
+   *
+   * ### Why this exists: the "surround pops on the laptop" bug
+   *
+   * `pushOutputCh` used to wrap an out-of-range channel onto `ch % 2`. With a
+   * 7.1 rig on a stereo endpoint — the default state on any laptop — all eight
+   * speaker feeds landed on two channels at **unity each**. Four correlated
+   * copies is +12 dB, the device's `clip()` shredded every one of them, and
+   * that is the frequent popping on multichannel material. Nothing reported
+   * it, either: the wrap was silent.
+   *
+   * So the fold is decided here, where the rig is known, and it is one of:
+   *
+   * - **Fold** (default) — speakers past the device's channel count are
+   *   downmixed onto the available ones by DIRECTION: a speaker's azimuth
+   *   picks its pan position across whatever channels exist, so a rear-left
+   *   surround lands left and a centre lands centre, instead of wherever
+   *   `% 2` happened to put it. Contributions into one output channel are
+   *   power-normalised (`1/√k`), which holds the summed level roughly constant
+   *   for uncorrelated material and caps the correlated worst case at `√k`
+   *   rather than `k`.
+   * - **Drop** — surplus speakers are silent. Honest, and the right choice
+   *   when the rig models a room you are only monitoring part of.
+   * - **Wrap** — the old `% 2` behaviour, power-normalised so it cannot clip.
+   *   Kept because it is what a channel-count mismatch on a virtual device
+   *   sometimes actually wants.
+   *
+   * `visualChans`/`liveParams` publish the outcome so the block face can say
+   * which speakers are folded and where they went — the point being that a
+   * truncation you cannot see is the same bug in a different costume.
+   */
+  const buildPlan = (): void => {
+    count = rig ? Math.min(MAXCH, rig.speakers.length) : 0;
+    const avail = sv.outChannels(device, asio);
+    planChans = avail;
+    folding = false;
+    for (let i = 0; i < count; i++) {
+      const hw = outChannel(rig!.speakers[i], i) - 1;
+      chans[i] = hw;
+      foldA[i] = hw;
+      foldB[i] = -1;
+      gainA[i] = 1;
+      gainB[i] = 0;
+      dropped[i] = 0;
+      // avail === 0 means no stream is open yet; assume the rig fits and let
+      // the reconfigure that follows rebuild the plan with a real number.
+      if (avail <= 0 || hw < avail) continue;
+      folding = true;
+      if (mode === 'Drop') {
+        dropped[i] = 1;
+        gainA[i] = 0;
+        foldA[i] = -1;
+        continue;
+      }
+      if (mode === 'Wrap' || avail < 2) {
+        foldA[i] = hw % Math.max(1, Math.min(FOLD_CH, avail));
+        continue;
+      }
+      // Direction-preserving fold onto the first two channels (the pair every
+      // endpoint has). +az is the listener's LEFT, so channel 0 = left.
+      const s = rig!.speakers[i];
+      if (s.lfe) {
+        // A sub has no direction: split it evenly rather than picking a side.
+        foldA[i] = 0;
+        foldB[i] = 1;
+        gainA[i] = gainB[i] = Math.SQRT1_2;
+        continue;
+      }
+      const pan = Math.max(-1, Math.min(1, s.az / 90)); // +1 = hard left
+      const th = ((1 - pan) / 2) * (Math.PI / 2); // 0 = left, π/2 = right
+      foldA[i] = 0;
+      foldB[i] = 1;
+      gainA[i] = Math.cos(th);
+      gainB[i] = Math.sin(th);
+    }
+    if (!folding) return;
+    // Power-normalise per destination channel: k contributors each scale by
+    // 1/√k, so uncorrelated material keeps its level and correlated material
+    // peaks at √k instead of k. Counting is by summed power so a speaker
+    // panned mostly left barely counts against the right channel.
+    const span = Math.min(MAXCH, Math.max(2, avail));
+    foldPow.fill(0, 0, span);
+    for (let i = 0; i < count; i++) {
+      if (foldA[i] >= 0 && foldA[i] < span) foldPow[foldA[i]] += gainA[i] * gainA[i];
+      if (foldB[i] >= 0 && foldB[i] < span) foldPow[foldB[i]] += gainB[i] * gainB[i];
+    }
+    for (let c = 0; c < span; c++) foldPow[c] = foldPow[c] > 1 ? 1 / Math.sqrt(foldPow[c]) : 1;
+    for (let i = 0; i < count; i++) {
+      if (foldA[i] >= 0 && foldA[i] < span) gainA[i] *= foldPow[foldA[i]];
+      if (foldB[i] >= 0 && foldB[i] < span) gainB[i] *= foldPow[foldB[i]];
+    }
   };
-  readRig(params[RIG_PARAM]);
+  buildPlan();
+
+  /**
+   * Send one speaker's contribution to hardware channel `ch`.
+   *
+   * While folding it goes into `foldOut` instead, so the limiter downstream
+   * sees the summed channel rather than one speaker's share. Defined here
+   * rather than inside `process` because a closure minted per quantum is an
+   * allocation on the audio path (docs/10-performance.md).
+   */
+  const emit = (ch: number, gain: number, s: Float32Array, n: number): void => {
+    if (folding && ch < FOLD_CH) {
+      const d = foldOut[ch];
+      for (let i = 0; i < n; i++) d[i] += s[i] * gain;
+      return;
+    }
+    for (let i = 0; i < n; i++) scratch[i] = s[i] * gain;
+    if (asio) sv.pushAsioOut(ch, scratch, n);
+    else sv.pushOutputCh(device, ch, scratch, n);
+  };
+
+  /** How many speakers did not get a hardware channel of their own. */
+  const foldedCount = (): number => {
+    if (!folding) return 0;
+    let k = 0;
+    for (let i = 0; i < count; i++) if (dropped[i] || foldA[i] !== chans[i] || foldB[i] >= 0) k++;
+    return k;
+  };
+
+  /** Per-speaker output level, smoothed like a meter (see `spatial-scope`). */
+  const lvl = new Float32Array(MAXCH);
 
   return {
     out: () => null,
     setParam: (id, v) => {
       if (id === 'level') level.set(num(v, 0.9));
       else if (id === RIG_PARAM) {
-        readRig(v);
+        rig = parseRig(v);
+        buildPlan();
         // A layout edit can change the channel span the device must open.
         sv.hardwareChanged();
       } else if (id === 'device') {
         device = str(v);
+        buildPlan();
         sv.hardwareChanged();
       } else if (id === 'api') {
         asio = str(v, 'ASIO') !== 'Windows';
+        buildPlan();
         sv.hardwareChanged();
+      } else if (id === 'fold') {
+        mode = str(v, 'Fold');
+        buildPlan();
       }
     },
+    /** Per-speaker level for the face meters. */
+    visualChans: () => Array.from(lvl.subarray(0, count)),
+    /** `folded` is the count of speakers that did not get their own hardware
+     *  channel, and `chans` what the device actually offers — the renderer
+     *  turns those into the "8 speakers → 2 channels" banner. */
+    liveParams: () => ({ __folded: foldedCount(), __chans: Math.max(0, planChans) }),
     process: (ins, ctx) => {
       const src = ins.in;
       if (!src || !count) return;
+      // The hardware may have opened (or reopened narrower) since the plan was
+      // built. Comparing a cached integer is free; rebuilding is not, so it
+      // only happens on an actual change.
+      const avail = sv.outChannels(device, asio);
+      if (avail !== planChans) buildPlan();
       const g = level.step(ctx);
       const n = ctx.n;
       const w = Math.min(count, src.length);
+      // When folding, everything that lands in the first FOLD_CH channels is
+      // accumulated first so the limiter can see the summed channel. When not
+      // folding (the common case) nothing is accumulated and the direct push
+      // below costs exactly what it always did.
+      if (folding) for (let c = 0; c < FOLD_CH; c++) foldOut[c].fill(0, 0, n);
       for (let c = 0; c < w; c++) {
         const s = src[c];
-        for (let i = 0; i < n; i++) scratch[i] = s[i] * g;
-        if (asio) sv.pushAsioOut(chans[c], scratch, n);
-        else sv.pushOutputCh(device, chans[c], scratch, n);
+        // Meter the speaker's own feed, before any fold — this is "what this
+        // speaker is being sent", which is what the face is asking about.
+        let sum = 0;
+        for (let i = 0; i < n; i += 4) sum += s[i] * s[i];
+        const rms = Math.sqrt(sum / (n / 4 || 1)) * g;
+        lvl[c] = rms > lvl[c] ? rms : lvl[c] * 0.85 + rms * 0.15;
+        if (dropped[c]) continue;
+        if (foldA[c] >= 0) emit(foldA[c], g * gainA[c], s, n);
+        if (foldB[c] >= 0) emit(foldB[c], g * gainB[c], s, n);
+      }
+      if (!folding) return;
+      /**
+       * Brick-wall the folded channels.
+       *
+       * The power normalisation above holds the level right for real material
+       * but bounds the fully-correlated worst case at √k, not 1 — measured at
+       * **2.36** for eight full-scale identical feeds on a stereo endpoint.
+       * That still overloads, and the device's `clip()` turns an overload into
+       * exactly the popping this whole change is about. Normalising by k
+       * instead would guarantee the bound but cost ~7 dB on ordinary
+       * (uncorrelated) surround content, which is the wrong trade for the
+       * common case.
+       *
+       * So: instant attack, slow release. The gain drops to precisely what
+       * this sample needs — no overshoot is possible, which is the entire
+       * point — and recovers over ~120 ms, slowly enough that the recovery
+       * itself is not modulation you can hear. Real material never engages it
+       * at all, so folding stays as loud as it should be.
+       */
+      const relK = Math.exp(-1 / (ctx.sr * 0.12));
+      const CEIL = 0.995;
+      const span = Math.min(FOLD_CH, Math.max(2, planChans));
+      for (let c = 0; c < span; c++) {
+        const d = foldOut[c];
+        let gl = limG[c];
+        for (let i = 0; i < n; i++) {
+          const a = Math.abs(d[i]);
+          // Gain this sample must not exceed, to stay under the ceiling.
+          const need = a > CEIL ? CEIL / a : 1;
+          gl = need < gl ? need : gl + (1 - gl) * (1 - relK);
+          d[i] *= gl;
+        }
+        limG[c] = gl;
+        if (asio) sv.pushAsioOut(c, d, n);
+        else sv.pushOutputCh(device, c, d, n);
+      }
+    },
+  };
+});
+
+/**
+ * Channel Pick — two chosen channels of a wide bus as a stereo pair.
+ *
+ * A stereo sink on a wide net silently gets channels 0 and 1; this is how you
+ * take any other pair. Channel numbers are 1-based (they match the Rig tab's
+ * speaker list and the wire's channel legend). A channel the bus does not
+ * carry reads as silence rather than wrapping — inventing content on a
+ * monitoring path defeats the point of the block.
+ */
+registerKernel('chan-pick', (params) => {
+  const buf = stereo();
+  const p: Record<string, ParamValue> = { ...params };
+  const gain = new Smooth(num(params.gain, 1));
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'gain') gain.set(num(v, 1));
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const src = ins.in;
+      const [oL, oR] = buf;
+      if (!src) {
+        oL.fill(0, 0, n);
+        oR.fill(0, 0, n);
+        return;
+      }
+      const li = Math.max(0, Math.round(num(p.left, 1)) - 1);
+      const ri = on(p.mono) ? li : Math.max(0, Math.round(num(p.right, 2)) - 1);
+      const L = li < src.length ? src[li] : null;
+      const R = ri < src.length ? src[ri] : null;
+      const g = gain.step(ctx);
+      if (L) for (let i = 0; i < n; i++) oL[i] = L[i] * g;
+      else oL.fill(0, 0, n);
+      if (R) for (let i = 0; i < n; i++) oR[i] = R[i] * g;
+      else oR.fill(0, 0, n);
+    },
+  };
+});
+
+/**
+ * Speaker Monitor — per-speaker mute/solo and metering, in line with the bus.
+ *
+ * Wide in, the same bus out, with a smoothed per-channel level published for
+ * the face meters. `solo` is 1-based (0 = no solo) because solo is exclusive
+ * by definition; `mute` is one '0'/'1' per speaker, index-aligned with the rig.
+ *
+ * Mute/solo gains **ramp across the quantum** rather than switching. A hard
+ * gate on a running signal is a step discontinuity — precisely the click this
+ * block would otherwise be blamed for while you were using it to hunt clicks.
+ */
+registerKernel('speaker-monitor', (params) => {
+  let buf = allocBuf(8);
+  const p: Record<string, ParamValue> = { ...params };
+  const level = new Smooth(num(params.level, 1));
+  const curG = new Float32Array(MAXCH);
+  const tgtG = new Float32Array(MAXCH);
+  const lvl = new Float32Array(MAXCH);
+  let width = 2;
+
+  const recompute = (): void => {
+    const solo = Math.round(num(p.solo, 0));
+    const mute = str(p.mute, '');
+    for (let c = 0; c < MAXCH; c++) {
+      const muted = mute.charCodeAt(c) === 49; // '1'
+      tgtG[c] = solo > 0 ? (c === solo - 1 ? 1 : 0) : muted ? 0 : 1;
+    }
+  };
+  recompute();
+  curG.set(tgtG);
+
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'level') level.set(num(v, 1));
+      else recompute();
+    },
+    setWidth: (_port, w) => {
+      width = Math.max(2, w);
+      if (w > buf.length) buf = allocBuf(w);
+    },
+    visualChans: () => Array.from(lvl.subarray(0, width)),
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      for (let c = 0; c < buf.length; c++) buf[c].fill(0, 0, n);
+      const src = ins.in;
+      if (!src) return;
+      const g = level.step(ctx);
+      const w = Math.min(buf.length, src.length);
+      const inv = 1 / n;
+      for (let c = 0; c < w; c++) {
+        const s = src[c];
+        const dst = buf[c];
+        const g0 = curG[c];
+        const step = (tgtG[c] - g0) * inv;
+        let sum = 0;
+        for (let i = 0; i < n; i++) {
+          const y = s[i] * g * (g0 + step * i);
+          dst[i] = y;
+          if ((i & 3) === 0) sum += y * y;
+        }
+        curG[c] = tgtG[c];
+        // Post-gate level: the meter shows what is leaving, so a muted speaker
+        // reads zero and the picture matches the room.
+        const rms = Math.sqrt(sum / (n / 4 || 1));
+        lvl[c] = rms > lvl[c] ? rms : lvl[c] * 0.85 + rms * 0.15;
       }
     },
   };
@@ -1867,7 +2950,12 @@ registerKernel('asio-in', (params, sv) => {
     process: (_ins, ctx) => {
       sv.pullAsioIn(ch - 1, buf[0], ctx.n);
       if (st) sv.pullAsioIn(ch, buf[1], ctx.n);
-      else buf[1].set(buf[0].subarray(0, ctx.n));
+      // Longhand mono→stereo: `subarray` would allocate a view per quantum.
+      else {
+        const l = buf[0];
+        const r = buf[1];
+        for (let i = 0; i < ctx.n; i++) r[i] = l[i];
+      }
     },
   };
 });
@@ -2143,6 +3231,130 @@ registerKernel('delay', (params, _sv) => {
         l[i] = x0 * dry + d0 * m;
         r[i] = x1 * dry + d1 * m;
       }
+    },
+  };
+});
+
+/**
+ * Feedback — the safety element in a user-made cycle. Def in `blocks/defs.ts`.
+ *
+ * The one-quantum delay that makes the loop stable at all comes from the
+ * executor (cycle leftovers are appended to the topo order, so one node in the
+ * ring reads last quantum's buffer — see `graph.ts`). This kernel adds the
+ * parts that make such a loop *playable*: optional extra delay, a damping
+ * one-pole, a DC blocker, and a soft ceiling.
+ *
+ * The DC blocker is not optional-in-spirit: a loop integrates any offset, so
+ * without it a patch that sounds fine for ten seconds walks its whole line to
+ * the rail and the limiter is all you hear.
+ *
+ * Width-transparent (`setWidth`) — a loop around a surround bus must stay one.
+ */
+registerKernel('feedback', (params) => {
+  const MAXD = 2; // seconds; matches the `time` param's max
+  let width = 2;
+  let buf = allocBuf(width);
+  let ring: Float32Array[] | null = null;
+  let sr = 0;
+  let widx = 0;
+  const amount = new Smooth(num(params.amount, 0.85));
+  const time = new Smooth(num(params.time, 0), 0.05);
+  let damp = num(params.damp, 8000);
+  let ceiling = Math.max(0.05, num(params.ceiling, 0.9));
+  let limit = params.limit !== false;
+  let dcb = params.dcblock !== false;
+  // Per-channel filter state, sized once at MAXCH so setWidth never reallocates
+  // these — they are 32 floats each, not worth the branch.
+  const lpS = new Float32Array(MAXCH);
+  const dcX = new Float32Array(MAXCH);
+  const dcY = new Float32Array(MAXCH);
+
+  /** Padé approximation of tanh: saturates smoothly, no libm call per sample.
+   *  Clamped at ±3 where the rational form stops behaving. */
+  const soft = (x: number): number => {
+    const a = x < -3 ? -3 : x > 3 ? 3 : x;
+    const a2 = a * a;
+    return (a * (27 + a2)) / (27 + 9 * a2);
+  };
+
+  /** Ring reallocation — construction/reconfigure only, never from process
+   *  steady state (the first-call allocation mirrors the `delay` kernel). */
+  const allocRing = (): void => {
+    const len = Math.round(MAXD * sr) + 8;
+    const r: Float32Array[] = new Array(width);
+    for (let c = 0; c < width; c++) r[c] = new Float32Array(len);
+    ring = r;
+    widx = 0;
+    lpS.fill(0);
+    dcX.fill(0);
+    dcY.fill(0);
+  };
+
+  return {
+    out: () => buf,
+    setWidth: (_port, w) => {
+      const nw = Math.max(2, Math.min(MAXCH, w));
+      if (nw === width) return;
+      width = nw;
+      buf = allocBuf(width);
+      if (sr > 0) allocRing();
+      else ring = null;
+    },
+    setParam: (id, v) => {
+      if (id === 'amount') amount.set(Math.max(0, Math.min(1.2, num(v, 0.85))));
+      else if (id === 'time') time.set(Math.max(0, Math.min(MAXD, num(v, 0))));
+      else if (id === 'damp') damp = Math.max(20, num(v, 8000));
+      else if (id === 'ceiling') ceiling = Math.max(0.05, num(v, 0.9));
+      else if (id === 'limit') limit = on(v);
+      else if (id === 'dcblock') dcb = on(v);
+    },
+    process: (ins, ctx) => {
+      if (!ring || sr !== ctx.sr) {
+        sr = ctx.sr;
+        allocRing();
+      }
+      const rg = ring as Float32Array[];
+      const len = rg[0].length;
+      const dSamp = Math.max(0, Math.min(len - 2, time.step(ctx) * sr));
+      const amt = amount.step(ctx);
+      // One-pole damping coefficient, and a 20 Hz DC blocker.
+      const g = Math.exp((-2 * Math.PI * Math.min(damp, sr * 0.45)) / sr);
+      const R = 1 - (2 * Math.PI * 20) / sr;
+      const src = ins.in;
+      let w = widx;
+      for (let c = 0; c < width; c++) {
+        w = widx;
+        const rc = rg[c];
+        const sc = src && c < src.length ? src[c] : null;
+        const dst = buf[c];
+        let lp = lpS[c];
+        let px = dcX[c];
+        let py = dcY[c];
+        for (let i = 0; i < ctx.n; i++) {
+          const x = sc ? sc[i] : 0;
+          rc[w] = x;
+          let ri = w - dSamp;
+          if (ri < 0) ri += len;
+          const i0 = ri | 0;
+          const frac = ri - i0;
+          const i1 = i0 + 1 >= len ? 0 : i0 + 1;
+          let d = rc[i0] * (1 - frac) + rc[i1] * frac;
+          if (dcb) {
+            const y = d - px + R * py;
+            px = d;
+            py = y;
+            d = y;
+          }
+          lp = d + (lp - d) * g;
+          d = lp * amt;
+          dst[i] = limit ? ceiling * soft(d / ceiling) : d;
+          w = w + 1 >= len ? 0 : w + 1;
+        }
+        lpS[c] = lp;
+        dcX[c] = px;
+        dcY[c] = py;
+      }
+      widx = w;
     },
   };
 });
@@ -4420,7 +5632,18 @@ registerKernel('midi-player', (params) => {
     v: number;
   }
   let notes: RNote[] = parseNotes(str(params.notes));
-  let beats = spanOf(notes);
+  /**
+   * The roll's playable length, in beats — **authored, not derived**.
+   *
+   * `regStart`/`regEnd` and the reported playhead are all fractions of this, so
+   * it has to be the same number the piano roll draws (`rollPlayEnd`, which
+   * floors at the roll's declared `beats` so trailing silence counts). Deriving
+   * it here from the notes instead gave a shorter roll than the one on screen
+   * whenever there was trailing silence — the playhead ran fast and the loop
+   * cut before the repeat bar. `syncRolls` pushes it with the notes.
+   */
+  let declared = num(params.beats, 0);
+  let beats = rollEnd();
   let bpm = num(params.bpm, 120);
   let loop = params.loop !== false;
   let transpose = Math.round(num(params.transpose, 0));
@@ -4447,7 +5670,11 @@ registerKernel('midi-player', (params) => {
       const pressed = v === 1 || v === true;
       if (id === 'notes') {
         notes = parseNotes(str(v));
-        beats = spanOf(notes);
+        beats = rollEnd();
+        if (pos > beats) pos = 0;
+      } else if (id === 'beats') {
+        declared = num(v, 0);
+        beats = rollEnd();
         if (pos > beats) pos = 0;
       } else if (id === 'regStart') regStart = num(v, 0);
       else if (id === 'regEnd') regEnd = num(v, 1);
@@ -4545,10 +5772,18 @@ registerKernel('midi-player', (params) => {
       return [];
     }
   }
-  function spanOf(ns: RNote[]): number {
-    let b = 0;
-    for (const q of ns) b = Math.max(b, q.t + q.d);
-    return Math.max(1, b);
+  /**
+   * The roll's end, in beats. **Mirrors `rollPlayEnd` in `src/core/rolls.ts`
+   * exactly — change one, change both**, or the playhead and the repeat bars
+   * drift apart from what the piano roll draws.
+   *
+   * The last sounding beat, floored at the authored length so a roll with
+   * trailing silence still plays (and loops over) all of it.
+   */
+  function rollEnd(): number {
+    let end = 0;
+    for (const q of notes) end = Math.max(end, q.t + q.d);
+    return Math.max(1, end, declared);
   }
   return k;
 });

@@ -13,6 +13,11 @@ const knob = (id: string, name: string, min: number, max: number, def: number, o
   id, name, type: 'float' as const, min, max, def, widget: 'knob' as const, ...opts,
 });
 
+/** Note Space axis sources. Mirrored as string literals in the `note-space`
+ *  kernel (`engine/src/dsp.ts`) — the engine cannot import renderer code, so
+ *  adding an option here means adding the same case there. */
+const NOTE_SPACE_SRC = ['Pitch', 'Velocity', 'Channel', 'Random', 'Round-robin', 'Off'];
+
 // ---------- I/O & Hardware ----------
 // `device` picks the Windows endpoint on the native engine (dropdown in
 // Properties, populated live from the engine's device list). Add several
@@ -216,6 +221,46 @@ registerBlock({
   style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
 });
 
+// Note Space — notes become positions.
+//
+// The spatial counterpart to Midi → CV: where that turns a note into pitch and
+// gate, this turns it into *where the note is*. Each axis is assigned
+// independently to a property of the note, so a scale can walk left-to-right
+// while hard hits jump forward and each MPE finger lands on its own spot.
+//
+// Monophonic, last-note priority, exactly like `midi-cv` — one instance drives
+// one voice's Panner 3D. Polyphonic spread is N of these behind N synths,
+// which is also the only honest way to do it: one CV line cannot carry two
+// positions at once. The `midi` output passes events through unchanged so the
+// block drops into an existing MIDI chain instead of branching it.
+registerBlock({
+  type: 'note-space',
+  title: 'Note Space',
+  category: 'Surround',
+  group: 'Spatial',
+  desc: 'Maps note pitch / velocity / channel to X/Y/Z — every note lands somewhere different',
+  inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
+  outputs: [
+    { id: 'out', name: 'midi', kind: 'midi', dir: 'out' },
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'out' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'out' },
+    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    { id: 'xsrc', name: 'X from', type: 'enum', def: 'Pitch', widget: 'select', options: NOTE_SPACE_SRC },
+    { id: 'ysrc', name: 'Y from', type: 'enum', def: 'Velocity', widget: 'select', options: NOTE_SPACE_SRC },
+    { id: 'zsrc', name: 'Z from', type: 'enum', def: 'Off', widget: 'select', options: NOTE_SPACE_SRC },
+    knob('spread', 'Spread', 0, 1, 0.9),
+    knob('slew', 'Slew', 0, 2, 0.05, { unit: 's' }),
+    { id: 'low', name: 'Low note', type: 'int', min: 0, max: 127, def: 36, step: 1, widget: 'knob', face: false },
+    { id: 'high', name: 'High note', type: 'int', min: 0, max: 127, def: 96, step: 1, widget: 'knob', face: false },
+    { id: 'voices', name: 'Round-robin', type: 'int', min: 2, max: 16, def: 4, step: 1, widget: 'knob', face: false },
+    { id: 'seed', name: 'Seed', type: 'int', min: 0, max: 9999, def: 1, step: 1, widget: 'knob', face: false },
+  ],
+  minW: 120,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
 // Panner 3D — place a source anywhere in the rig and move it.
 //
 // A mono/stereo source in, one channel per speaker out. Position is X/Y/Z in
@@ -252,6 +297,51 @@ registerBlock({
   style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
 });
 
+// Spectral Scatter — one source, taken apart by frequency and thrown around
+// the room.
+//
+// A filterbank splits the input into N bands and each band is panned to its
+// own position in the rig, so a single mono source stops being *somewhere* and
+// becomes a shape: bass anchored in front, air overhead, a sweep of midrange
+// around the ring. Spin rotates the whole pattern; with Spin at 0 the shape
+// holds still and the source's own spectrum animates it.
+//
+// It is a **crossover filterbank, not an STFT**. Linkwitz-Riley crossovers sum
+// flat, cost no latency, and smear nothing — where a phase-vocoder would add a
+// window of delay and pre-echo to every transient, for a block whose whole
+// point is placing transients in space. The trade is that band edges are fixed
+// frequencies rather than per-bin tracking, which is also what makes the
+// result *steerable* instead of chattering.
+registerBlock({
+  type: 'spectral-scatter',
+  title: 'Spectral Scatter',
+  category: 'Surround',
+  group: 'Spatial',
+  desc: 'Splits a source into frequency bands and places each one somewhere different in the rig',
+  inputs: [
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
+    { id: 'rot', name: 'rot', kind: 'audio', role: 'cv', dir: 'in' },
+  ],
+  outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
+  params: [
+    { id: 'bands', name: 'Bands', type: 'int', min: 2, max: 16, def: 8, step: 1, widget: 'knob' },
+    { id: 'mode', name: 'Pattern', type: 'enum', def: 'Rising', widget: 'select',
+      options: ['Rising', 'Falling', 'Alternate', 'Random'] },
+    knob('spin', 'Spin', -2, 2, 0, { unit: 'Hz' }),
+    knob('width', 'Width', 0, 1, 0.85),
+    knob('elev', 'Elevation', -1, 1, 0),
+    knob('low', 'Low', 40, 800, 120, { curve: 'log', unit: 'Hz', face: false }),
+    knob('high', 'High', 1000, 16000, 9000, { curve: 'log', unit: 'Hz', face: false }),
+    knob('spread', 'Spread', 0, 1, 0.2, { face: false }),
+    knob('gain', 'Gain', 0, 1.5, 1, { face: false }),
+    { id: 'seed', name: 'Seed', type: 'int', min: 0, max: 9999, def: 1, step: 1, widget: 'knob', face: false },
+  ],
+  needsRig: true,
+  stubbed: true,
+  minW: 140,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
 // Spatial Scope — a top-down radar of the rig, each speaker lit by its live
 // level at its real angle. The thing that makes a surround patch legible: you
 // see where the sound actually is. Feed it the bus going to the Speaker Rig.
@@ -273,16 +363,34 @@ registerBlock({
 });
 
 // ---------- Ambisonics ----------
-// First-order ambisonics (FOA): the sound field carried as 4 channels
-// (W, X, Y, Z; SN3D/ACN) on one wide wire. The distinctive layer — you can
-// rotate, mirror or zoom the *whole field* with a matrix, then decode once to
-// any layout or to headphones. Encode places a source; decode renders it.
+//
+// **What this whole group is for**, because "ambisonic" on its own tells you
+// nothing: instead of deciding which speaker each sound comes out of, you
+// record the sound *field* — what arrives at the listening position, from
+// every direction at once — as four channels on one wire (W, X, Y, Z; SN3D).
+// W is everything summed, and X/Y/Z say how much came from front, left and up.
+//
+// The payoff is that four channels describe the whole scene independently of
+// any speaker layout. So you can:
+//
+//   • turn the entire scene with one knob (`Ambi Rotate`) — every source and
+//     the space around them rotate together, which no amount of per-source
+//     panning gives you;
+//   • squash, stretch or push it around (`Ambi Transform`);
+//   • decide only at the very end whether it comes out of your rig
+//     (`Ambi Decode`) or your headphones (`Ambi Binaural`) — the same field,
+//     rendered two ways, no re-authoring.
+//
+// The pipeline is always: **Encode → (Rotate / Transform) → Decode**. A
+// B-format wire is not listenable on its own and is not a speaker feed; it has
+// to be decoded. Wiring one straight to a Speaker Rig sends W/X/Y/Z to the
+// first four speakers, which sounds like a broken mix because it is one.
 registerBlock({
   type: 'amb-encode',
   title: 'Ambi Encode',
   category: 'Surround',
   group: 'Ambisonics',
-  desc: 'Encode a mono/stereo source to a first-order ambisonic (B-format) field at an X/Y/Z direction',
+  desc: 'Put a source INTO an ambisonic field. Start of every ambisonic chain — feed its output to Rotate/Transform, then Decode. On the pad, the ANGLE is the direction and the DISTANCE FROM CENTRE is how focused it is: at the rim it points somewhere, at the centre it comes from everywhere. Not distance — use Distance for that.',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
     { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in' },
@@ -305,7 +413,7 @@ registerBlock({
   title: 'Ambi Rotate',
   category: 'Surround',
   group: 'Ambisonics',
-  desc: 'Rotate the whole ambisonic field — yaw / pitch / roll — as a single matrix',
+  desc: 'Turn the whole scene at once — every source and the space with them. Yaw spins it left/right, Pitch tips it, Roll banks it; Spin free-runs in Hz. The move ambisonics exists for.',
   inputs: [
     { id: 'in', name: 'B-format', kind: 'audio', dir: 'in', chans: 4 },
     { id: 'yaw', name: 'yaw', kind: 'audio', role: 'cv', dir: 'in' },
@@ -325,13 +433,13 @@ registerBlock({
   title: 'Ambi Transform',
   category: 'Surround',
   group: 'Ambisonics',
-  desc: 'Warp the field: widen/focus (zoom), push toward a direction, or mirror an axis',
+  desc: 'Reshape the field. Width 0 = every source from everywhere, 1 = as recorded, 2 = over-focused. Focus slides the whole scene toward (or away from) one direction. A global trim keeps either from clipping, so they re-shape rather than get louder.',
   inputs: [{ id: 'in', name: 'B-format', kind: 'audio', dir: 'in', chans: 4 }],
   outputs: [{ id: 'out', name: 'B-format', kind: 'audio', dir: 'out', chans: 4 }],
   params: [
     knob('focus', 'Focus', -1, 1, 0),
     { id: 'axis', name: 'Focus axis', type: 'enum', def: 'Front', widget: 'select', options: ['Front', 'Up', 'Left'], face: false },
-    knob('width', 'Width', 0, 2, 1),
+    knob('width', 'Directivity', 0, 2, 1),
     { id: 'mirror', name: 'Mirror L/R', type: 'bool', def: false, widget: 'toggle', face: false },
   ],
   stubbed: true,
@@ -342,7 +450,7 @@ registerBlock({
   title: 'Ambi Decode',
   category: 'Surround',
   group: 'Ambisonics',
-  desc: 'Decode an ambisonic field to the scene’s speaker layout (one channel per speaker)',
+  desc: 'Render an ambisonic field onto the scene’s speaker layout — one channel per speaker. The END of an ambisonic chain: a B-format wire must pass through here (or Ambi Binaural) before it reaches a Speaker Rig.',
   inputs: [{ id: 'in', name: 'B-format', kind: 'audio', dir: 'in', chans: 4 }],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [knob('gain', 'Gain', 0, 1.5, 1)],
@@ -356,13 +464,43 @@ registerBlock({
   title: 'Ambi Binaural',
   category: 'Surround',
   group: 'Ambisonics',
-  desc: 'Decode an ambisonic field to headphones (virtual speakers + head model)',
+  desc: 'Render an ambisonic field to headphones — six virtual speakers through a head model. The other END of an ambisonic chain: same field as Ambi Decode, judged without the rig powered on.',
   inputs: [{ id: 'in', name: 'B-format', kind: 'audio', dir: 'in', chans: 4 }],
   outputs: [{ id: 'out', name: 'L/R', kind: 'audio', dir: 'out' }],
   params: [knob('level', 'Level', 0, 1.5, 1)],
   stubbed: true,
   minW: 120,
   style: { shape: 'chamfer', fill: '#3b2c3a', stroke: '#e07fb0' },
+});
+
+// Channel Pick — take two named channels off a wide bus as a stereo pair.
+//
+// The other half of "what happens when a wide bus meets a narrow port". A
+// stereo sink silently takes channels 1 and 2 (docs/02 truncation rules); this
+// is how you take 7 and 8 instead. Which is most of what per-speaker
+// monitoring actually needs: solo a height pair into headphones, feed one
+// speaker to a scope, check what the sub is really getting.
+registerBlock({
+  type: 'chan-pick',
+  title: 'Channel Pick',
+  category: 'Surround',
+  group: 'Monitor',
+  desc: 'Take any two channels off a wide bus as a stereo pair — choose WHICH speakers survive the narrowing instead of always getting 1 and 2',
+  inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
+  outputs: [{ id: 'out', name: 'L/R', kind: 'audio', dir: 'out' }],
+  params: [
+    { id: 'left', name: 'Left ← ch', type: 'int', min: 1, max: 32, def: 1, step: 1, widget: 'knob' },
+    { id: 'right', name: 'Right ← ch', type: 'int', min: 1, max: 32, def: 2, step: 1, widget: 'knob' },
+    // Mono is the honest default for "listen to one speaker": picking the same
+    // channel twice would otherwise put it dead-centre anyway, but this makes
+    // the intent explicit and keeps the level right.
+    { id: 'mono', name: 'Mono (L only, both ears)', type: 'bool', def: false, widget: 'toggle', face: false },
+    knob('gain', 'Gain', 0, 2, 1, { face: false }),
+  ],
+  needsRig: true,
+  stubbed: true,
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#22272f', stroke: '#4fd0c0' },
 });
 
 // Binaural — fold the whole rig down to headphones.
@@ -421,7 +559,7 @@ registerBlock({
   title: 'Speaker Rig',
   category: 'I/O & Hardware',
   group: 'Playback',
-  desc: 'Multichannel output to the scene’s speaker layout — one channel per speaker (native engine)',
+  desc: 'Multichannel output to the scene’s speaker layout — one channel per speaker, with per-speaker meters (native engine)',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [],
   params: [
@@ -435,12 +573,58 @@ registerBlock({
       options: ['ASIO', 'Windows'],
       face: false,
     },
+    // What happens when the rig is wider than the device. This used to be an
+    // unwritten rule (surplus channels wrapped onto ch % 2 and clipped); it is
+    // now a choice, and the face says which one is in force.
+    {
+      id: 'fold',
+      name: 'If device is narrower',
+      type: 'enum',
+      def: 'Fold',
+      widget: 'select',
+      options: ['Fold', 'Drop', 'Wrap'],
+      face: false,
+    },
     { id: 'device', name: 'Device', type: 'string', def: '', widget: 'select', face: false },
   ],
+  visual: 'speakers',
   needsRig: true,
   stubbed: true,
-  minW: 120,
+  minW: 150,
+  minH: 120,
   style: { shape: 'chamfer', fill: '#2c3b2e', stroke: '#e8a13d' },
+});
+
+// Speaker Monitor — audition the rig one speaker at a time.
+//
+// A wide bus in, the same bus out, plus per-speaker mute and solo and a
+// labelled bar meter for every channel. Two things a surround patch needs
+// constantly and neither of which a stereo tool has any use for: "is anything
+// actually reaching the height layer", and "let me hear ONLY the rear-left".
+// Click a bar to mute it, shift-click to solo it.
+registerBlock({
+  type: 'speaker-monitor',
+  title: 'Speaker Monitor',
+  category: 'Surround',
+  group: 'Monitor',
+  desc: 'Per-speaker bar meters with click-to-mute and shift-click-to-solo — hear and see one speaker at a time',
+  inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
+  outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
+  params: [
+    // 0 = no solo; otherwise the 1-based speaker being soloed. An int rather
+    // than a per-speaker flag because solo is exclusive by definition.
+    { id: 'solo', name: 'Solo speaker', type: 'int', min: 0, max: 32, def: 0, step: 1, widget: 'select', face: false },
+    // One '0'/'1' per speaker, index-aligned with the rig — the same compact
+    // string form the sequencer uses for its steps.
+    { id: 'mute', name: 'Muted', type: 'string', def: '', widget: 'select', face: false },
+    knob('level', 'Level', 0, 1.5, 1),
+  ],
+  visual: 'speakers',
+  needsRig: true,
+  stubbed: true,
+  minW: 150,
+  minH: 120,
+  style: { shape: 'chamfer', fill: '#22272f', stroke: '#e8a13d' },
 });
 
 // ASIO blocks address interface channels directly: Channel = first channel
@@ -716,6 +900,38 @@ registerBlock({
     knob('feedback', 'F/B', 0, 0.95, 0.35),
     knob('mix', 'Mix', 0, 1, 0.3),
   ],
+});
+// Feedback — the block that makes a loop a patchable thing.
+//
+// Cycles already *work*: the executor's topological sort appends whatever the
+// sort could not order, so a node in a cycle reads the previous quantum's
+// buffer (`engine/src/graph.ts`). What was missing was any reason to trust
+// one. Wire `out` back around to anything upstream of `in` and this supplies
+// the four things a loop needs to be playable instead of terrifying:
+// extra delay, damping, a DC blocker (loops integrate offset until the whole
+// line rails), and a soft ceiling so runaway saturates instead of exploding.
+//
+// Width-transparent, so a loop around a surround bus stays a surround bus.
+// It is not a delay *effect* — there is no wet/dry, because the block is the
+// return path, not an insert.
+registerBlock({
+  type: 'feedback',
+  title: 'Feedback',
+  category: 'Effects',
+  group: 'Time',
+  desc: 'Closes a loop safely — extra delay, damping, DC block and a soft ceiling',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  params: [
+    knob('amount', 'Amount', 0, 1.2, 0.85),
+    knob('time', 'Time', 0, 2, 0, { unit: 's' }),
+    knob('damp', 'Damp', 200, 18000, 8000, { curve: 'log', unit: 'Hz' }),
+    knob('ceiling', 'Ceiling', 0.1, 1, 0.9, { face: false }),
+    { id: 'limit', name: 'Limiter', type: 'bool', def: true, widget: 'toggle', face: false },
+    { id: 'dcblock', name: 'DC block', type: 'bool', def: true, widget: 'toggle', face: false },
+  ],
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#3b3326', stroke: '#e0b24f' },
 });
 registerBlock({
   type: 'reverb',
@@ -1389,6 +1605,11 @@ registerBlock({
     knob('velScale', 'Vel', 0, 2, 1),
     // Note data, serialized (see core/rolls.ts). Derived from the asset.
     { id: 'notes', name: 'Notes', type: 'string', def: '', widget: 'select', face: false },
+    // The roll's playable length in beats, pushed alongside `notes` by
+    // `syncRolls`. Both engines must use THIS and not re-derive it from the
+    // notes: `regStart`/`regEnd` and the reported playhead are fractions of it,
+    // so a disagreement desyncs the playhead and moves the repeat bars.
+    { id: 'beats', name: 'Length', type: 'float', min: 0, max: 100000, def: 1, widget: 'select', face: false },
     { id: 'seek', name: 'Seek', type: 'float', min: 0, max: 1, def: 0, widget: 'select', face: false, cv: true },
     // Play region, as 0..1 of the roll — the piano roll's start/end bars, the
     // same idea as a File Player's regStart/regEnd. ▶ starts at regStart and a
@@ -1463,6 +1684,32 @@ registerBlock({
   isSubgraph: true,
   minW: 120,
   minH: 56,
+});
+// Comment — a note to whoever opens this patch next, including you.
+//
+// Blocks can already carry face text (block-edit mode → Add text…), but that
+// is decoration *on* something. An infinite canvas full of chamfered boxes
+// needs a way to say why, and that wants to be a first-class object you can
+// drop, resize and colour — with no ports, no title bar and no node in either
+// engine (`noCompile`). The text word-wraps to the block, so resizing reflows
+// it instead of clipping.
+registerBlock({
+  type: 'comment',
+  title: 'Comment',
+  category: 'Structure & Custom',
+  desc: 'A text note on the canvas — no ports, no sound, just what the patch is doing',
+  inputs: [],
+  outputs: [],
+  params: [
+    { id: 'text', name: 'Text', type: 'string', def: '', widget: 'select', face: false, multiline: true },
+    { id: 'size', name: 'Size', type: 'int', min: 8, max: 48, def: 13, step: 1, widget: 'knob', face: false },
+    { id: 'align', name: 'Align', type: 'enum', def: 'Left', widget: 'select', options: ['Left', 'Centre'], face: false },
+  ],
+  customFace: 'comment',
+  noCompile: true,
+  minW: 160,
+  minH: 64,
+  style: { shape: 'rect', fill: '#1a1e26', stroke: '#4b5568' },
 });
 registerBlock({
   type: 'portal-in',

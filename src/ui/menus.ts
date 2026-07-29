@@ -130,6 +130,46 @@ export function buildModal(title: string): { modal: HTMLElement; body: HTMLEleme
   };
 }
 
+/**
+ * Multi-line sibling of `promptModal`, for prose (a Comment's text).
+ *
+ * Two deliberate differences: Enter inserts a newline instead of accepting
+ * (Ctrl+Enter accepts), and an empty result resolves to `''` rather than
+ * `null` — `promptModal` folds empty to null so a cancelled rename can't blank
+ * a block name, but a comment you have just emptied on purpose must stay
+ * empty.
+ */
+export function promptTextModal(title: string, initial = ''): Promise<string | null> {
+  return new Promise((resolve) => {
+    const { body, footer, close } = buildModal(title);
+    const input = document.createElement('textarea');
+    input.rows = 8;
+    input.value = initial;
+    body.appendChild(input);
+    const cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    const ok = document.createElement('button');
+    ok.textContent = 'OK';
+    ok.className = 'primary';
+    footer.append(cancel, ok);
+    const done = (v: string | null): void => {
+      close();
+      resolve(v);
+    };
+    cancel.onclick = () => done(null);
+    ok.onclick = () => done(input.value);
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) ok.click();
+      if (e.key === 'Escape') cancel.click();
+    };
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    });
+  });
+}
+
 export function promptModal(title: string, initial = '', placeholder = ''): Promise<string | null> {
   return new Promise((resolve) => {
     const { body, footer, close } = buildModal(title);

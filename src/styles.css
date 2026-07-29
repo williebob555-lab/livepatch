@@ -178,6 +178,19 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 .lib-grid.list .lib-thumb { width: 40px; height: 24px; flex: 0 0 auto; }
 .lib-grid.list .lib-label { flex: 1; text-align: left; }
 
+/* Touch drag-out of a Library tile (panels.ts `beginTouchDrag`). HTML5 DnD is
+   mouse-only, so touch gets a chip that follows the finger; `.over` says the
+   release point is on the workspace and a block will land there. Offset up and
+   left of the finger so it isn't hidden under it. */
+.lib-drag-ghost {
+  position: fixed; z-index: 9999; pointer-events: none;
+  transform: translate(-50%, -170%);
+  padding: 4px 9px; border-radius: 6px; font-size: 11px; white-space: nowrap;
+  background: var(--panel2); color: var(--text-dim);
+  border: 1px solid var(--border); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+.lib-drag-ghost.over { border-color: var(--accent); color: var(--text); }
+
 .lib-star {
   position: absolute; top: 2px; left: 2px; background: transparent; border: none;
   color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 1px 3px; opacity: 0.5;
@@ -220,6 +233,15 @@ body { background: var(--bg); color: var(--text); user-select: none; }
   flex: 1 1 auto; min-width: 0; background: var(--bg); color: var(--text);
   border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font: inherit;
 }
+/* Multi-line string params (a Comment's text). Aligned to the top of the row
+   rather than centred, because a 4-row box next to a centred label reads as
+   misaligned once it grows. */
+.form-row > textarea {
+  flex: 1 1 auto; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font: inherit;
+  resize: vertical;
+}
+.form-row:has(> textarea) { align-items: flex-start; }
 .form-row > input[type='range'] { padding: 0; accent-color: var(--accent); }
 .form-row > input[type='checkbox'] { flex: 0 0 auto; accent-color: var(--accent); }
 .form-row > input[type='color'] { padding: 0 2px; height: 22px; flex: 0 0 52px; }
@@ -314,10 +336,11 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 }
 .modal-header { padding: 10px 14px; font-weight: 700; border-bottom: 1px solid var(--border); }
 .modal-body { padding: 14px; overflow-y: auto; }
-.modal-body input[type='text'] {
+.modal-body input[type='text'], .modal-body textarea {
   width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
   border-radius: 4px; padding: 6px 8px; font: inherit;
 }
+.modal-body textarea { resize: vertical; min-height: 120px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
 .modal-footer button {
   background: var(--panel2); border: 1px solid var(--border); color: var(--text);

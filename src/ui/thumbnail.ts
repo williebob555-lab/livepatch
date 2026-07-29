@@ -60,6 +60,18 @@ function drawBlockBody(g: CanvasRenderingContext2D, b: Block, def: BlockDef, the
     drawCassetteShell(g, 0, 0, w, h, theme, null);
   } else if (def.customFace === 'roll') {
     drawRollShell(g, 0, 0, w, h, theme, null, null);
+  } else if (def.customFace === 'comment') {
+    // Ruled lines, not real text: the tile is ~40 px tall and any legible
+    // sample string would be a lie about what the block contains.
+    g.strokeStyle = theme.blockText + '66';
+    g.lineWidth = 1.5;
+    for (let i = 0; i < 3; i++) {
+      const ly = h * 0.3 + i * (h * 0.2);
+      g.beginPath();
+      g.moveTo(w * 0.18, ly);
+      g.lineTo(w * (i === 2 ? 0.6 : 0.82), ly);
+      g.stroke();
+    }
   } else {
     const o = contentOrigin(b, theme);
     for (const it of faceItems(b)) {
@@ -134,6 +146,14 @@ function drawVisualGlyph(g: CanvasRenderingContext2D, r: { x: number; y: number;
     for (let i = 0; i < 6; i++) {
       const bh = (Math.sin(i) * 0.4 + 0.5) * r.h * 0.7;
       g.fillRect(r.x + 3 + i * ((r.w - 6) / 6), r.y + r.h - 2 - bh, (r.w - 6) / 6 - 1, bh);
+    }
+  } else if (kind === 'speakers') {
+    // Per-speaker bars: more, thinner columns than the stereo meter glyph.
+    const n = 6;
+    const bw = Math.max(1, (r.w - 6) / n - 1);
+    for (let i = 0; i < n; i++) {
+      const bh = (0.25 + 0.6 * Math.abs(Math.sin(i * 1.3))) * (r.h - 6);
+      g.fillRect(r.x + 3 + i * ((r.w - 6) / n), r.y + r.h - 3 - bh, bw, bh);
     }
   } else if (kind === 'midimon') {
     // Text-log glyph: a few left-aligned bars of varying length.

@@ -754,6 +754,10 @@ function build(body: HTMLElement): DockTabHandle {
 
   canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    // Never over a live drag — touch press-and-hold and touchpad tap-and-hold
+    // both synthesize this event with loose movement slop, so a careful knob
+    // turn would be interrupted by its own menu (see editor.ts).
+    if (drag.kind !== 'none') return;
     const p = toSurface(e);
     const L = hit(p);
     menuAt = { x: e.clientX, y: e.clientY };
