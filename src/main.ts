@@ -22,6 +22,7 @@ import { dock } from './ui/dock';
 import './ui/clipview';
 import './ui/advanced';
 import './ui/adveq';
+import './ui/advpath';
 import './ui/rigview';
 import { dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
 import { initWidgetDock } from './ui/widgetdock';

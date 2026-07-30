@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-07-28._
+_Last verified: 2026-07-29._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -623,6 +623,60 @@ Two independent measurements, because either alone misleads:
 **If you add to this script, hoist everything out of the drive loop.** A
 harness that allocates per quantum costs ~40 B/quantum, the same order as the
 bug being hunted.
+
+## Convolution probe (reusable)
+
+```
+npm run build:engine && node --expose-gc scripts/conv-kernel-test.cjs
+```
+
+The native `conv` kernel is uniformly-partitioned overlap-save FFT convolution
+(its own complex FFT, `ConvFFT`; `fft.ts` is magnitude-only and no use here).
+Convolution is subtle — an off-by-one in overlap-save, a missing IFFT scale, a
+wrong partition-delay index all still produce plausible smeared audio — so the
+probe asserts against a **direct time-domain convolution** (the definition),
+not "reverb came out": impulse in reproduces the IR, a random input matches
+naive O(NM) convolution sample-for-sample after aligning the fixed one-hop
+latency, a stereo IR convolves each channel with its own IR, normalize keeps a
+long hot IR bounded, and `process` is allocation-free (the IR is resampled,
+normalized and partitioned at load time). Current: all within ~1e-7 of ground
+truth. The kernel loads its IR from the cassette store; the probe hands it a
+fake `sv.assets` that resolves an in-memory IR. Web parity is intentionally the
+browser `ConvolverNode` (a sanctioned divergence, like Reverb).
+
+## Room (early reflections) probe (reusable)
+
+```
+npm run build:engine && node --expose-gc scripts/room-kernel-test.cjs
+```
+
+Room is silent-failure prone the usual surround way — wrong geometry still
+makes reflection-like sound — so the probe asserts on **physics**, from an
+impulse response: the direct arrival comes first and reflections strictly
+later (never before), a bigger room delays the first reflection, more
+absorption lowers reflected energy, the LFE is never fed (reflections aren't
+pannable onto a sub), silence in gives silence out, and `process` is
+allocation-free (the pop guard, applied to Room's ring + per-tap DBAP). The
+image-source math reuses the shared `dbapInto`, so a panning regression shows
+up in `spatial-kernel-test.cjs` too.
+
+## Trajectory path probe (reusable)
+
+```
+npm run build:engine && node scripts/trajectory-kernel-test.cjs
+```
+
+The `path` (Trajectory) block samples a waypoint curve into X/Y/Z CV. The
+load-bearing check is the **mirror**: the kernel's `samplePathInto`
+(`engine/src/dsp.ts`) is a hand-copy of `samplePath` in `src/core/trajectory.ts`
+(the engine can't import renderer code, same as the rig math). The face preview
+and the deep editor draw from the `core` copy; the sound comes from the kernel
+copy. The probe bundles the real `core/trajectory.ts` with esbuild and asserts
+the kernel matches it sample-for-sample across the loop, for both interps —
+because a drift there means the playhead you see and the source you hear
+disagree, which is unfindable from the listening position. Also covers Once
+(holds the endpoint), Ping-pong (reverses), empty path (silence), and that
+`liveParams` tracks the output (the editor's playhead telemetry).
 
 ## Spatial / utility kernel probe (reusable)
 

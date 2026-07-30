@@ -1011,6 +1011,150 @@ registerKernel('chaos', (params) => {
  *
  * `height` offsets z, `phase` offsets the start. Output is CV in −1..1.
  */
+// ---- Trajectory path sampling — MIRROR of src/core/trajectory.ts ----------
+// The engine cannot import renderer code (docs/02, same as the rig math). If
+// `samplePathInto` here and `samplePath` there drift, the playhead on screen
+// and the source in the room disagree. Kept allocation-free: caller owns the
+// point arrays and the three out-refs.
+const MAX_PATH_POINTS = 64;
+const catmullAxis = (p0: number, p1: number, p2: number, p3: number, t: number): number => {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+};
+/** Fills `out` = [x,y,z]. `px/py/pz` are the waypoint arrays, `n` their count. */
+const samplePathInto = (
+  px: Float32Array, py: Float32Array, pz: Float32Array, n: number,
+  u: number, smooth: boolean, closed: boolean, out: Float32Array,
+): void => {
+  if (n === 0) { out[0] = out[1] = out[2] = 0; return; }
+  if (n === 1) { out[0] = px[0]; out[1] = py[0]; out[2] = pz[0]; return; }
+  const segs = closed ? n : n - 1;
+  const uu = u <= 0 ? 0 : u >= 1 ? (closed ? u - Math.floor(u) : 1) : u;
+  const f = uu * segs;
+  let i = Math.floor(f);
+  if (i >= segs) i = segs - 1;
+  const t = f - i;
+  const idx = (k: number): number => (closed ? ((k % n) + n) % n : k < 0 ? 0 : k > n - 1 ? n - 1 : k);
+  const i1 = idx(i);
+  const i2 = idx(i + 1);
+  if (!smooth) {
+    out[0] = px[i1] + (px[i2] - px[i1]) * t;
+    out[1] = py[i1] + (py[i2] - py[i1]) * t;
+    out[2] = pz[i1] + (pz[i2] - pz[i1]) * t;
+    return;
+  }
+  const i0 = idx(i - 1);
+  const i3 = idx(i + 2);
+  out[0] = catmullAxis(px[i0], px[i1], px[i2], px[i3], t);
+  out[1] = catmullAxis(py[i0], py[i1], py[i2], py[i3], t);
+  out[2] = catmullAxis(pz[i0], pz[i1], pz[i2], pz[i3], t);
+};
+
+/**
+ * Trajectory — plays a hand-drawn waypoint path as X/Y/Z CV. Def in
+ * `src/blocks/defs.ts`; sampling math mirrored from `core/trajectory.ts` above.
+ *
+ * Loop/Ping-pong treat the path as **closed** (last waypoint connects to the
+ * first); Once treats it as **open** and holds the final point. Phase advances
+ * per sample so fast motion stays smooth, exactly like Orbit, and syncs to a
+ * wired clock the same way (one full traversal per measured clock period).
+ */
+registerKernel('path', (params) => {
+  const bx = stereo();
+  const by = stereo();
+  const bz = stereo();
+  const px = new Float32Array(MAX_PATH_POINTS);
+  const py = new Float32Array(MAX_PATH_POINTS);
+  const pz = new Float32Array(MAX_PATH_POINTS);
+  let np = 0;
+  const pos = new Float32Array(3);
+  const p: Record<string, ParamValue> = { ...params };
+  let phase = num(params.phase, 0);
+  let dir = 1; // ping-pong direction
+  let liveX = 0;
+  let liveY = 0;
+  let liveZ = 0;
+  // Clock tracking — same rising-edge period measurement as orbit/clock-tempo.
+  let prevClk = 0;
+  let sinceEdge = 0;
+  let clockHz = 0;
+
+  const clamp1 = (v: number): number => (v < -1 ? -1 : v > 1 ? 1 : v);
+  const loadPoints = (s: ParamValue): void => {
+    np = 0;
+    if (typeof s !== 'string' || !s) return;
+    try {
+      const a = JSON.parse(s);
+      if (!Array.isArray(a)) return;
+      for (const q of a) {
+        if (np >= MAX_PATH_POINTS) break;
+        px[np] = clamp1(Number(q?.x) || 0);
+        py[np] = clamp1(Number(q?.y) || 0);
+        pz[np] = clamp1(Number(q?.z) || 0);
+        np++;
+      }
+    } catch {
+      np = 0;
+    }
+  };
+  loadPoints(params.points);
+
+  const write = (b: StereoBuf, i: number, v: number): void => {
+    b[0][i] = v;
+    b[1][i] = v;
+  };
+
+  return {
+    out: (port) => (port === 'x' ? bx : port === 'y' ? by : port === 'z' ? bz : null),
+    liveParams: () => ({ x: liveX, y: liveY, z: liveZ }),
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'points') loadPoints(v);
+      else if (id === 'phase') phase = num(v, 0);
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const mode = str(p.mode, 'Loop');
+      const smooth = str(p.interp, 'Smooth') === 'Smooth';
+      const closed = mode !== 'Once';
+      const rateParam = num(p.rate, 0.2);
+      const clk = ins['clock']?.[0];
+      for (let i = 0; i < n; i++) {
+        if (clk) {
+          const s = clk[i];
+          sinceEdge++;
+          if (prevClk <= 0.5 && s > 0.5 && sinceEdge > ctx.sr * 0.01) {
+            clockHz = ctx.sr / sinceEdge;
+            sinceEdge = 0;
+          }
+          prevClk = s;
+          if (sinceEdge > ctx.sr * 3) clockHz = 0; // clock stopped → free-run
+        }
+        const rateHz = clk && clockHz > 0 ? clockHz : rateParam;
+        phase += (dir * rateHz) / ctx.sr;
+        if (mode === 'Once') {
+          if (phase >= 1) phase = 1; // hold at the end
+          if (phase < 0) phase = 0;
+        } else if (mode === 'Ping-pong') {
+          if (phase >= 1) { phase = 1; dir = -1; }
+          else if (phase <= 0) { phase = 0; dir = 1; }
+        } else {
+          if (phase >= 1) phase -= Math.floor(phase);
+          else if (phase < 0) phase += Math.ceil(-phase) + 1;
+        }
+        samplePathInto(px, py, pz, np, phase, smooth, closed, pos);
+        write(bx, i, pos[0]);
+        write(by, i, pos[1]);
+        write(bz, i, pos[2]);
+      }
+      liveX = pos[0];
+      liveY = pos[1];
+      liveZ = pos[2];
+    },
+  };
+});
+
 registerKernel('orbit', (params) => {
   const bx = stereo();
   const by = stereo();
@@ -1346,6 +1490,268 @@ registerKernel('spectral-scatter', (params) => {
           }
           curG[base + j] = g1;
         }
+      }
+    },
+    visualChans: () => {
+      const outv: number[] = [];
+      for (let c = 0; c < count; c++) {
+        let s = 0;
+        const ch = buf[c];
+        for (let i = 0; i < 128; i++) s += ch[i] * ch[i];
+        outv.push(Math.sqrt(s / 128));
+      }
+      return outv;
+    },
+  };
+});
+
+/**
+ * Room — geometric early reflections via the image-source method, panned onto
+ * the rig. Def in `src/blocks/defs.ts`.
+ *
+ * Shoebox model: the source is mirrored across the six walls (Allen-Berkley
+ * image enumeration). Each image is a discrete tap with its own delay
+ * (distance / speed of sound), level (wall reflectivity^order / distance), and
+ * direction, panned onto the speakers with the shared `dbapInto` — so the
+ * reflections image exactly where the geometry says they should.
+ *
+ * Two deliberate bounds on cost: at most `MAX_TAPS` reflections are kept (the
+ * strongest by level — the quiet high-order ones are inaudible under the
+ * early field anyway), and the geometry is recomputed once per quantum from a
+ * **smoothed** source position. Smoothing keeps the per-quantum change in each
+ * tap's delay sub-sample, so reading the delay line at a per-quantum-constant
+ * offset doesn't click — and a moving source still gets real Doppler on its
+ * reflections, which is the whole reason to do this geometrically.
+ */
+registerKernel('room', (params) => {
+  const MAX_TAPS = 16;
+  const SPEED = 343; // m/s
+  let rig = parseRig(params[RIG_PARAM]);
+  let buf = allocBuf(8);
+  const p: Record<string, ParamValue> = { ...params };
+  const gain = new Smooth(num(params.gain, 1));
+
+  // Mono source ring (delay line). Allocated on first process at the real sr.
+  let ring: Float32Array | null = null;
+  let rlen = 0;
+  let w = 0;
+  let sr = 0;
+
+  // Pannable speakers + bus-channel map (subs excluded — same as the panners).
+  const spk: PanSpeaker[] = [];
+  let idx: number[] = [];
+  let count = 0;
+  let R = 1;
+
+  // Per-tap state. Delays in fractional samples; gains laid out tap-major
+  // (tap t, speaker j at t*MAXCH + j), ramped per sample from cur→tgt.
+  const tapDelay = new Float32Array(MAX_TAPS);
+  let ntaps = 0;
+  const curG = new Float32Array(MAX_TAPS * MAXCH);
+  const tgtG = new Float32Array(MAX_TAPS * MAXCH);
+  // Smoothed source position (room metres), so geometry moves without clicks.
+  let ssx = 0;
+  let ssy = 0;
+  let ssz = 0;
+  let primed = false;
+  let reprime = true;
+
+  const rebuildRig = (): void => {
+    spk.length = 0;
+    idx = [];
+    count = rig ? rig.speakers.length : 0;
+    if (count > buf.length) buf = allocBuf(count);
+    if (!rig) return;
+    let maxd = 0.5;
+    for (let i = 0; i < rig.speakers.length; i++) {
+      const s = rig.speakers[i];
+      if (s.lfe) continue;
+      const v = speakerVec(s);
+      const d = Math.max(0.01, s.dist);
+      spk.push({ x: v.x * d, y: v.y * d, z: v.z * d, ux: v.x, uy: v.y, uz: v.z });
+      idx.push(i);
+      if (d > maxd) maxd = d;
+    }
+    R = maxd;
+    curG.fill(0);
+    reprime = true;
+  };
+  rebuildRig();
+
+  /**
+   * Recompute reflection taps for the current (smoothed) source position.
+   * Fills `tapDelay` and `tgtG`; sets `ntaps`. Allocation-free — writes into
+   * the preallocated arrays and keeps only the MAX_TAPS strongest images.
+   */
+  const buildTaps = (sx: number, sy: number, sz: number): void => {
+    const Lx = Math.max(1, num(p.width, 7));
+    const Ly = Math.max(1, num(p.depth, 9));
+    const Lz = Math.max(1, num(p.height, 3.2));
+    const beta = Math.max(0, Math.min(0.999, 1 - num(p.absorb, 0.4)));
+    const maxOrder = Math.max(1, Math.min(2, Math.round(num(p.order, 2))));
+    const direct = num(p.direct, 0.8);
+    const reflect = num(p.reflect, 0.6);
+    // Listener at room centre; source offset from there (already in metres).
+    const lx = Lx / 2;
+    const ly = Ly / 2;
+    const lz = Lz / 2;
+    const Sx = lx + sx;
+    const Sy = ly + sy;
+    const Sz = lz + sz;
+    ntaps = 0;
+    for (let mx = 0; mx <= 1; mx++)
+      for (let nx = -maxOrder; nx <= maxOrder; nx++) {
+        const ox = Math.abs(2 * nx - mx);
+        if (ox > maxOrder) continue;
+        const ix = (1 - 2 * mx) * Sx + 2 * nx * Lx;
+        for (let my = 0; my <= 1; my++)
+          for (let ny = -maxOrder; ny <= maxOrder; ny++) {
+            const oy = Math.abs(2 * ny - my);
+            if (ox + oy > maxOrder) continue;
+            const iy = (1 - 2 * my) * Sy + 2 * ny * Ly;
+            for (let mz = 0; mz <= 1; mz++)
+              for (let nz = -maxOrder; nz <= maxOrder; nz++) {
+                const order = ox + oy + Math.abs(2 * nz - mz);
+                if (order > maxOrder) continue;
+                const iz = (1 - 2 * mz) * Sz + 2 * nz * Lz;
+                const dx = ix - lx;
+                const dy = iy - ly;
+                const dz = iz - lz;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < 0.05) {
+                  // The direct sound (order 0) — level by `direct`.
+                  addTap(0, 0, 0, 0.05, direct, order);
+                } else {
+                  const lvl = (order === 0 ? direct : reflect) * Math.pow(beta, order) / dist;
+                  addTap(dx / dist, dy / dist, dz / dist, dist, lvl, order);
+                }
+              }
+          }
+      }
+    // Turn each kept tap's direction into DBAP speaker gains, scaled by its
+    // level. `addTap` left the unit direction in the tapDir arrays.
+    for (let t = 0; t < ntaps; t++) {
+      const base = t * MAXCH;
+      dbapInto(spk, tapDirX[t] * R, tapDirY[t] * R, tapDirZ[t] * R, 0.15 * R, 2, tgtG, base);
+      const lvl = tapLvl[t];
+      for (let j = 0; j < spk.length; j++) tgtG[base + j] *= lvl;
+    }
+  };
+
+  // Candidate scratch for the strongest-tap selection.
+  const tapDirX = new Float32Array(MAX_TAPS);
+  const tapDirY = new Float32Array(MAX_TAPS);
+  const tapDirZ = new Float32Array(MAX_TAPS);
+  const tapLvl = new Float32Array(MAX_TAPS);
+  const addTap = (ux: number, uy: number, uz: number, dist: number, lvl: number, _order: number): void => {
+    if (lvl <= 1e-6) return;
+    const delay = (dist / SPEED) * sr;
+    if (ntaps < MAX_TAPS) {
+      const t = ntaps++;
+      tapDelay[t] = delay;
+      tapDirX[t] = ux; tapDirY[t] = uy; tapDirZ[t] = uz;
+      tapLvl[t] = lvl;
+      return;
+    }
+    // Full: replace the weakest tap if this one is louder (keep the strongest).
+    let wk = 0;
+    for (let t = 1; t < MAX_TAPS; t++) if (tapLvl[t] < tapLvl[wk]) wk = t;
+    if (lvl > tapLvl[wk]) {
+      tapDelay[wk] = delay;
+      tapDirX[wk] = ux; tapDirY[wk] = uy; tapDirZ[wk] = uz;
+      tapLvl[wk] = lvl;
+    }
+  };
+
+  const srcPos = (ins: Ins, n: number): void => {
+    const Lx = Math.max(1, num(p.width, 7));
+    const Ly = Math.max(1, num(p.depth, 9));
+    const Lz = Math.max(1, num(p.height, 3.2));
+    // Normalized −1..1 → within ~90% of each half-extent, so the source never
+    // sits exactly on a wall. CV adds to the knob position.
+    const cvx = ins['x']?.[0]?.[n - 1] ?? 0;
+    const cvy = ins['y']?.[0]?.[n - 1] ?? 0;
+    const nx = Math.max(-1, Math.min(1, num(p.srcx, 0) + cvx));
+    const ny = Math.max(-1, Math.min(1, num(p.srcy, -0.3) + cvy));
+    const nz = Math.max(-1, Math.min(1, num(p.srcz, 0)));
+    const tx = nx * Lx * 0.45;
+    const ty = ny * Ly * 0.45;
+    const tz = nz * Lz * 0.45;
+    if (!primed) {
+      ssx = tx; ssy = ty; ssz = tz;
+      primed = true;
+      return;
+    }
+    // One-pole toward the target, ~40 ms — bounds per-quantum delay change.
+    const a = Math.exp(-1 / (0.04 * (sr / n)));
+    ssx = tx + (ssx - tx) * a;
+    ssy = ty + (ssy - ty) * a;
+    ssz = tz + (ssz - tz) * a;
+  };
+
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === RIG_PARAM) {
+        rig = parseRig(v);
+        rebuildRig();
+      } else if (id === 'gain') gain.set(num(v, 1));
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      for (let c = 0; c < buf.length; c++) buf[c].fill(0, 0, n);
+      if (!spk.length) return;
+      if (!ring || sr !== ctx.sr) {
+        sr = ctx.sr;
+        rlen = Math.round(0.6 * sr) + 8; // 0.6 s covers order-2 in a 30 m room
+        ring = new Float32Array(rlen);
+        w = 0;
+        primed = false;
+      }
+      const rg = ring as Float32Array;
+
+      srcPos(ins, n);
+      buildTaps(ssx, ssy, ssz);
+      if (reprime) {
+        curG.set(tgtG);
+        reprime = false;
+      }
+
+      const src = ins.in;
+      const gv = gain.step(ctx);
+      const inv = 1 / n;
+      // Fold input to mono into the ring, and read every tap out of it.
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        if (src) {
+          const wch = Math.min(src.length, 2);
+          for (let c = 0; c < wch; c++) m += src[c][i];
+          m /= wch;
+        }
+        rg[w] = m;
+        for (let t = 0; t < ntaps; t++) {
+          const d = tapDelay[t];
+          let ri = w - d;
+          if (ri < 0) ri += rlen;
+          const i0 = ri | 0;
+          const frac = ri - i0;
+          const i1 = i0 + 1 >= rlen ? 0 : i0 + 1;
+          const sample = rg[i0] * (1 - frac) + rg[i1] * frac;
+          const base = t * MAXCH;
+          for (let j = 0; j < spk.length; j++) {
+            const g0 = curG[base + j];
+            const g1 = tgtG[base + j] * gv;
+            if (g0 === 0 && g1 === 0) continue;
+            buf[idx[j]][i] += sample * (g0 + (g1 - g0) * (i * inv));
+          }
+        }
+        w = w + 1 >= rlen ? 0 : w + 1;
+      }
+      // Land cur on the (gain-scaled) targets for next quantum's ramp start.
+      for (let t = 0; t < ntaps; t++) {
+        const base = t * MAXCH;
+        for (let j = 0; j < spk.length; j++) curG[base + j] = tgtG[base + j] * gv;
       }
     },
     visualChans: () => {
@@ -3431,6 +3837,338 @@ registerKernel('gate', (params) => {
       level = [Math.sqrt(sum / ctx.n), peak];
     },
     visualLevel: () => level,
+  };
+});
+
+// ---- Partitioned FFT convolution (the Convolution block) ------------------
+//
+// A general complex FFT plus uniformly-partitioned overlap-save. Purpose-built
+// here rather than reusing `fft.ts`, which is a windowed magnitude-only FFT for
+// the spectrum visuals and gives no complex spectrum to convolve with.
+//
+// Everything is allocation-free in `process`: the twiddles, bit-reversal table,
+// IR partition spectra, the input-spectrum delay line, and the accumulator are
+// all sized and filled when the IR is loaded (`ConvChannel.setIR`), never on
+// the audio thread (docs/10, rule 1).
+
+/** In-place radix-2 complex FFT/IFFT of a fixed power-of-two size. */
+class ConvFFT {
+  readonly n: number;
+  private readonly cos: Float32Array;
+  private readonly sin: Float32Array;
+  private readonly rev: Int32Array;
+  constructor(n: number) {
+    this.n = n;
+    const half = n >> 1;
+    this.cos = new Float32Array(half);
+    this.sin = new Float32Array(half);
+    for (let i = 0; i < half; i++) {
+      this.cos[i] = Math.cos((-2 * Math.PI * i) / n);
+      this.sin[i] = Math.sin((-2 * Math.PI * i) / n);
+    }
+    this.rev = new Int32Array(n);
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      this.rev[i] = j;
+    }
+  }
+  /** Forward (inverse=false) or inverse (true) transform, in place. */
+  transform(re: Float32Array, im: Float32Array, inverse: boolean): void {
+    const n = this.n;
+    const rev = this.rev;
+    for (let i = 1; i < n; i++) {
+      const j = rev[i];
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    const sgn = inverse ? -1 : 1;
+    for (let len = 2; len <= n; len <<= 1) {
+      const step = n / len;
+      const half = len >> 1;
+      for (let i = 0; i < n; i += len) {
+        for (let k = 0; k < half; k++) {
+          const ti = k * step;
+          const c = this.cos[ti];
+          const s = sgn * this.sin[ti];
+          const a = i + k;
+          const b = a + half;
+          const tr = re[b] * c - im[b] * s;
+          const tii = re[b] * s + im[b] * c;
+          re[b] = re[a] - tr;
+          im[b] = im[a] - tii;
+          re[a] += tr;
+          im[a] += tii;
+        }
+      }
+    }
+    if (inverse) {
+      const inv = 1 / n;
+      for (let i = 0; i < n; i++) { re[i] *= inv; im[i] *= inv; }
+    }
+  }
+}
+
+/**
+ * One channel of partitioned overlap-save convolution. Hop `H`, FFT size
+ * `K = 2H`; the IR is split into `P` partitions of `H` samples. Latency is one
+ * hop. `process` bridges the variable quantum to the fixed hop with input/output
+ * ring FIFOs and never allocates.
+ */
+class ConvChannel {
+  private readonly H: number;
+  private readonly K: number;
+  private readonly fft: ConvFFT;
+  // IR partition spectra (filled by setIR).
+  private irRe: Float32Array[] = [];
+  private irIm: Float32Array[] = [];
+  private P = 0;
+  // Input-spectrum delay line (circular, P entries of K).
+  private xRe: Float32Array[] = [];
+  private xIm: Float32Array[] = [];
+  private xHead = 0;
+  // Scratch / accumulator.
+  private blk: Float32Array;
+  private blkIm: Float32Array;
+  private accRe: Float32Array;
+  private accIm: Float32Array;
+  private prevTail: Float32Array; // last H input samples (overlap-save history)
+  // FIFOs. Both are linear and compacted to index 0 each call, so there is no
+  // modular wrap to get wrong; the sizes bound how far a single call can grow
+  // them before the compaction at the end.
+  private inFifo: Float32Array;
+  private inFill = 0;
+  private outFifo: Float32Array;
+  private outFill = 0; // valid samples at outFifo[0 .. outFill)
+
+  constructor(fft: ConvFFT, maxQuantum: number) {
+    this.fft = fft;
+    this.K = fft.n;
+    this.H = this.K >> 1;
+    this.blk = new Float32Array(this.K);
+    this.blkIm = new Float32Array(this.K);
+    this.accRe = new Float32Array(this.K);
+    this.accIm = new Float32Array(this.K);
+    this.prevTail = new Float32Array(this.H);
+    this.inFifo = new Float32Array(2 * this.H + maxQuantum);
+    this.outFifo = new Float32Array(4 * this.H + maxQuantum);
+  }
+
+  /** (Re)partition an IR channel. Allocation happens here, never in process. */
+  setIR(ir: Float32Array | null): void {
+    const H = this.H;
+    this.P = ir && ir.length ? Math.ceil(ir.length / H) : 0;
+    this.irRe = [];
+    this.irIm = [];
+    this.xRe = [];
+    this.xIm = [];
+    for (let p = 0; p < this.P; p++) {
+      const re = new Float32Array(this.K);
+      const im = new Float32Array(this.K);
+      for (let i = 0; i < H; i++) {
+        const idx = p * H + i;
+        re[i] = idx < ir!.length ? ir![idx] : 0;
+      }
+      this.fft.transform(re, im, false);
+      this.irRe.push(re);
+      this.irIm.push(im);
+      this.xRe.push(new Float32Array(this.K));
+      this.xIm.push(new Float32Array(this.K));
+    }
+    this.xHead = 0;
+    this.inFill = 0;
+    this.outFill = 0;
+    this.prevTail.fill(0);
+  }
+
+  get latency(): number { return this.H; }
+  get active(): boolean { return this.P > 0; }
+
+  /** One overlap-save hop: consumes H input samples, produces H output samples. */
+  private hop(input: Float32Array, off: number, out: Float32Array, outOff: number): void {
+    const H = this.H;
+    const K = this.K;
+    const re = this.blk;
+    const im = this.blkIm;
+    // Block = [prev H tail | new H samples]; zero the imaginary part.
+    re.set(this.prevTail, 0);
+    for (let i = 0; i < H; i++) re[H + i] = input[off + i];
+    im.fill(0);
+    // Save this block's tail for next hop's history.
+    for (let i = 0; i < H; i++) this.prevTail[i] = input[off + i];
+    this.fft.transform(re, im, false);
+    // Store into the circular input-spectrum delay line.
+    this.xRe[this.xHead].set(re);
+    this.xIm[this.xHead].set(im);
+    // Accumulate Y = sum_p X[head-p] * IR[p].
+    this.accRe.fill(0);
+    this.accIm.fill(0);
+    for (let p = 0; p < this.P; p++) {
+      let xi = this.xHead - p;
+      if (xi < 0) xi += this.P;
+      const xr = this.xRe[xi];
+      const xm = this.xIm[xi];
+      const hr = this.irRe[p];
+      const hm = this.irIm[p];
+      const ar = this.accRe;
+      const am = this.accIm;
+      for (let k = 0; k < K; k++) {
+        ar[k] += xr[k] * hr[k] - xm[k] * hm[k];
+        am[k] += xr[k] * hm[k] + xm[k] * hr[k];
+      }
+    }
+    this.xHead = this.xHead + 1 >= this.P ? 0 : this.xHead + 1;
+    this.fft.transform(this.accRe, this.accIm, true);
+    // Overlap-save: the valid linear-convolution output is the last H samples.
+    for (let i = 0; i < H; i++) out[outOff + i] = this.accRe[H + i];
+  }
+
+  /** Convolve `n` input samples → `dst` (dry not mixed here). */
+  process(input: Float32Array, dst: Float32Array, n: number): void {
+    if (!this.active) { for (let i = 0; i < n; i++) dst[i] = 0; return; }
+    const H = this.H;
+    // Push input into the FIFO.
+    for (let i = 0; i < n; i++) this.inFifo[this.inFill++] = input[i];
+    // Drain whole hops, each appending H samples to the (linear) output FIFO.
+    let read = 0;
+    while (this.inFill - read >= H) {
+      this.hop(this.inFifo, read, this.outFifo, this.outFill);
+      this.outFill += H;
+      read += H;
+    }
+    if (read > 0) {
+      this.inFifo.copyWithin(0, read, this.inFill);
+      this.inFill -= read;
+    }
+    // Emit n samples from the front of the output FIFO; zero-fill while the
+    // first hop hasn't produced output yet (the one-hop latency).
+    const take = Math.min(n, this.outFill);
+    for (let i = 0; i < take; i++) dst[i] = this.outFifo[i];
+    for (let i = take; i < n; i++) dst[i] = 0;
+    if (take > 0) {
+      this.outFifo.copyWithin(0, take, this.outFill);
+      this.outFill -= take;
+    }
+  }
+}
+
+/**
+ * Convolution — convolve the input with an impulse response loaded from a
+ * cassette (a reverb IR, a speaker cabinet, any recorded space). Def in
+ * `src/blocks/defs.ts`. The web engine uses the browser's native
+ * `ConvolverNode` (a sanctioned divergence, like Reverb); this is the native
+ * partitioned-FFT implementation.
+ *
+ * The IR is resampled to the engine rate and normalized at load time, then
+ * partitioned — all off the steady-state path. Building the partitions is a
+ * one-time allocation on IR change, the same shape as the delay line's
+ * first-process allocation; nothing allocates once audio is flowing.
+ */
+registerKernel('conv', (params, sv) => {
+  const buf = stereo();
+  const FFT_K = 512;
+  const MAX_IR_SEC = 4;
+  const fft = new ConvFFT(FFT_K);
+  const chans = [new ConvChannel(fft, MAXQ), new ConvChannel(fft, MAXQ)];
+  const wet = [new Float32Array(MAXQ), new Float32Array(MAXQ)];
+  const mix = new Smooth(num(params.mix, 0.5));
+  const gain = new Smooth(num(params.gain, 1));
+  let normalize = params.normalize !== false;
+
+  let assetId = str(params.asset, '');
+  let pendingIR: DecodedAudio | null = null;
+  let irDirty = false;
+  let sr = 0;
+
+  /** Resample one IR channel to the engine rate (linear). Allocates — load path
+   *  only. Returns null for an empty channel. */
+  const resample = (src: Float32Array, from: number, to: number): Float32Array => {
+    if (from === to) return src.slice(0, Math.min(src.length, Math.floor(MAX_IR_SEC * to)));
+    const ratio = from / to;
+    const outLen = Math.min(Math.floor(src.length / ratio), Math.floor(MAX_IR_SEC * to));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const p = i * ratio;
+      const i0 = p | 0;
+      const frac = p - i0;
+      const a = src[i0] ?? 0;
+      const b = src[i0 + 1] ?? a;
+      out[i] = a + (b - a) * frac;
+    }
+    return out;
+  };
+
+  /** (Re)build the per-channel convolvers from the pending IR at the current
+   *  engine rate. One-time allocation on IR/sr change, never steady state. */
+  const buildIR = (): void => {
+    const ir = pendingIR;
+    if (!ir || sr <= 0) {
+      chans[0].setIR(null);
+      chans[1].setIR(null);
+      return;
+    }
+    const irCh = ir.channels.map((c) => resample(c, ir.sampleRate, sr));
+    // Energy normalization: keep the wet output near unity regardless of IR
+    // length/level. Sum of squares across the (resampled) IR, one scalar.
+    let scale = 1;
+    if (normalize) {
+      let energy = 0;
+      for (const c of irCh) for (let i = 0; i < c.length; i++) energy += c[i] * c[i];
+      scale = energy > 1e-9 ? 1 / Math.sqrt(energy) : 1;
+    }
+    if (scale !== 1) for (const c of irCh) for (let i = 0; i < c.length; i++) c[i] *= scale;
+    // Mono IR → both output channels share it; stereo+ → channel-wise.
+    for (let c = 0; c < 2; c++) chans[c].setIR(irCh[Math.min(c, irCh.length - 1)] ?? null);
+  };
+
+  const hydrate = (id: string): void => {
+    assetId = id;
+    pendingIR = null;
+    if (!id) { irDirty = true; return; }
+    sv.assets.wait(id, (a) => {
+      if (assetId !== id) return;
+      pendingIR = a;
+      // Build now if the rate is known (off the audio thread); otherwise defer
+      // to the next process, which is where the delay line allocates too.
+      if (sr > 0) buildIR();
+      else irDirty = true;
+    });
+  };
+  hydrate(assetId);
+
+  return {
+    out: () => buf,
+    assetChanged: (id) => { if (id === assetId) hydrate(id); },
+    setParam: (id, v) => {
+      if (id === 'asset') { if (str(v, '') !== assetId) hydrate(str(v, '')); }
+      else if (id === 'mix') mix.set(Math.max(0, Math.min(1, num(v, 0.5))));
+      else if (id === 'gain') gain.set(num(v, 1));
+      else if (id === 'normalize') { normalize = v === true || v === 1; irDirty = true; }
+    },
+    process: (ins, ctx) => {
+      if (sr !== ctx.sr) { sr = ctx.sr; irDirty = true; }
+      if (irDirty && sr > 0) { buildIR(); irDirty = false; }
+      const n = ctx.n;
+      const src = ins.in;
+      const [l, r] = buf;
+      // Convolve each channel (mono source → both taps see the same input).
+      const inL = src ? src[0] : null;
+      const inR = src ? (src.length > 1 ? src[1] : src[0]) : null;
+      if (inL) chans[0].process(inL, wet[0], n); else wet[0].fill(0, 0, n);
+      if (inR) chans[1].process(inR, wet[1], n); else wet[1].fill(0, 0, n);
+      const m = mix.step(ctx);
+      const gv = gain.step(ctx);
+      const dry = 1 - m;
+      for (let i = 0; i < n; i++) {
+        const dl = inL ? inL[i] : 0;
+        const dr = inR ? inR[i] : 0;
+        l[i] = (dl * dry + wet[0][i] * m) * gv;
+        r[i] = (dr * dry + wet[1][i] * m) * gv;
+      }
+    },
   };
 });
 

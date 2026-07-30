@@ -545,6 +545,24 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 .adveq-del:hover { border-color: #ff8a8a; }
 .adveq-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
 
+/* Trajectory deep editor (advpath.ts). Same lifecycle contract as .adveq — the
+   dock owns show/hide via .adv-view.on, so the flex layout is scoped to
+   .adv-view.advpath.on or the editor won't hide on deselect (docs/08). */
+.advpath { gap: 6px; padding: 6px; box-sizing: border-box; }
+.adv-view.advpath.on { display: flex; flex-direction: column; height: 100%; }
+.advpath-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.advpath-canvaswrap { position: relative; flex: 1 1 auto; min-height: 120px; }
+.advpath-canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0d0f13; touch-action: none; }
+.advpath-hint { color: var(--text-dim); font-size: 11px; min-height: 14px; }
+.advpath-field { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.advpath-cap { white-space: nowrap; }
+.advpath-num { width: 58px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.advpath-select { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.advpath-btn { background: var(--panel); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 3px 8px; cursor: pointer; }
+.advpath-btn:hover { border-color: var(--accent); }
+.advpath-btn.on { border-color: #ff6b6b; color: #ff6b6b; }
+.advpath-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

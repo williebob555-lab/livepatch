@@ -158,6 +158,19 @@ function drawVisualGlyph(g: CanvasRenderingContext2D, r: { x: number; y: number;
   } else if (kind === 'midimon') {
     // Text-log glyph: a few left-aligned bars of varying length.
     for (let i = 0; i < 4; i++) g.fillRect(r.x + 3, r.y + 3 + i * (r.h / 4), r.w * (0.4 + 0.4 * ((i * 7) % 3) / 2), 2);
+  } else if (kind === 'path') {
+    // Trajectory: a looping curve inside a ring, evoking the plan-view editor.
+    const cx = r.x + r.w / 2;
+    const rr = Math.min(r.w, r.h) / 2 - 2;
+    g.beginPath(); g.arc(cx, cy, rr, 0, Math.PI * 2); g.stroke();
+    g.beginPath();
+    for (let a = 0; a <= Math.PI * 2 + 0.1; a += 0.2) {
+      const rad = rr * (0.4 + 0.4 * Math.sin(a * 2));
+      const x = cx + Math.cos(a) * rad;
+      const y = cy + Math.sin(a) * rad;
+      a === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+    }
+    g.stroke();
   } else {
     // scope / eq: a sine
     g.beginPath();

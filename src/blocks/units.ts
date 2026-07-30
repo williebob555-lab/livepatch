@@ -2772,6 +2772,59 @@ registerUnit('gate', (params, env) => {
   };
 });
 
+// ---------- Convolution (IR from a cassette) ----------
+// Mirrors the native `conv` kernel, but leans on the browser's ConvolverNode —
+// convolution is a sanctioned divergence (docs/08), like Reverb. The IR is the
+// decoded cassette buffer; ConvolverNode does its own normalization.
+registerUnit('conv', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const dry = ctx.createGain();
+  const wet = ctx.createGain();
+  const outG = ctx.createGain();
+  const conv = ctx.createConvolver();
+  let normalize = params.normalize !== false;
+  conv.normalize = normalize;
+  inG.connect(dry); dry.connect(outG);
+  inG.connect(conv); conv.connect(wet); wet.connect(outG);
+  const setMix = (m: number): void => {
+    smooth(dry.gain, ctx, 1 - m);
+    smooth(wet.gain, ctx, m);
+  };
+  dry.gain.value = 1 - num(params.mix, 0.5);
+  wet.gain.value = num(params.mix, 0.5);
+  outG.gain.value = num(params.gain, 1);
+  let curAsset = '';
+  let irBuffer: AudioBuffer | null = null;
+  const loadIR = (id: string): void => {
+    curAsset = id;
+    if (!id) { conv.buffer = irBuffer = null; return; }
+    getCassetteBuffer(id).then((b) => {
+      if (curAsset !== id) return;
+      irBuffer = b;
+      conv.buffer = b; // normalize is read at assignment time
+    });
+  };
+  loadIR(str(params.asset, ''));
+  return {
+    inlet: () => inG,
+    outlet: () => outG,
+    setParam: (id, v) => {
+      if (id === 'asset') { if (str(v, '') !== curAsset) loadIR(str(v, '')); }
+      else if (id === 'mix') setMix(Math.max(0, Math.min(1, num(v, 0.5))));
+      else if (id === 'gain') smooth(outG.gain, ctx, num(v, 1));
+      else if (id === 'normalize') {
+        normalize = v === true || v === 1;
+        conv.normalize = normalize;
+        // ConvolverNode reads `normalize` only when the buffer is assigned, so
+        // re-assign to make the change take effect.
+        if (irBuffer) conv.buffer = irBuffer;
+      }
+    },
+    dispose: () => [inG, dry, wet, outG, conv].forEach((n) => n.disconnect()),
+  };
+});
+
 // ---------- Reverb (synthesized impulse) ----------
 registerUnit('reverb', (params, env) => {
   const inG = env.ctx.createGain();

@@ -189,6 +189,49 @@ registerBlock({
   style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
 });
 
+// Trajectory — a hand-drawn path through the rig, played as X/Y/Z CV.
+//
+// Orbit gives you clean geometry and Chaos gives you generative wandering; this
+// is the third kind of motion — the one you *author*. A curve of waypoints in
+// normalized rig space (−1..1), traversed at a rate (or synced to a wired
+// clock), interpolated straight (Linear) or as a Catmull-Rom spline (Smooth).
+// Patch X/Y/Z into a Panner 3D and a source follows exactly the path you drew.
+//
+// The waypoints live in the `points` param as JSON; the whole editing surface
+// is the Advanced-tab deep editor (`ui/advpath.ts`), including gesture capture
+// — arm Record and swing the source around the plan view, and the gesture
+// becomes a loopable path. The face shows a read-only plan of the curve with a
+// live playhead.
+registerBlock({
+  type: 'path',
+  title: 'Trajectory',
+  category: 'Surround',
+  group: 'Spatial',
+  desc: 'Play a hand-drawn 3D path as X/Y/Z control voltages — draw it in the Advanced tab',
+  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'in' }],
+  outputs: [
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'out' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'out' },
+    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    knob('rate', 'Rate', 0.01, 10, 0.2, { unit: 'Hz', curve: 'log' }),
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'Loop', widget: 'select', options: ['Loop', 'Once', 'Ping-pong'] },
+    { id: 'interp', name: 'Interp', type: 'enum', def: 'Smooth', widget: 'select', options: ['Linear', 'Smooth'], face: false },
+    // A gentle default so a freshly-dropped block already traces something: a
+    // unit square, corners at ±0.7, which reads as an orbit until you edit it.
+    { id: 'points', name: 'Points', type: 'string',
+      def: '[{"x":-0.7,"y":0.7,"z":0},{"x":0.7,"y":0.7,"z":0},{"x":0.7,"y":-0.7,"z":0},{"x":-0.7,"y":-0.7,"z":0}]',
+      widget: 'select', face: false },
+    { id: 'phase', name: 'Phase', type: 'float', min: 0, max: 1, def: 0, widget: 'knob', face: false },
+  ],
+  visual: 'path',
+  stubbed: true,
+  minW: 120,
+  minH: 96,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
 // Orbit — CV that moves a source through space on a path.
 //
 // Three CV outputs (X/Y/Z) tracing a circle, Lissajous or spiral. Patch them
@@ -290,6 +333,50 @@ registerBlock({
     knob('rolloff', 'Rolloff', 3, 12, 6, { unit: 'dB', face: false }),
     knob('gain', 'Gain', 0, 1.5, 1),
     { id: 'mode', name: 'Mode', type: 'enum', def: 'DBAP', widget: 'select', options: ['DBAP', 'VBAP'], face: false },
+  ],
+  needsRig: true,
+  stubbed: true,
+  minW: 130,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
+// Room — early reflections with real geometry, panned onto the rig.
+//
+// A shoebox room (image-source method): the source is mirrored across the six
+// walls to produce discrete reflections, each arriving from its own direction
+// with its own delay and level, panned onto the speaker layout by the same
+// DBAP the Panner uses. Where Reverb is a diffuse tail with no sense of place,
+// this is the *early* field — the part of a room that tells you where you are
+// and how big the space is. Feed the same source into a Reverb in parallel for
+// the late tail; Room deliberately does only the reflections it can place.
+//
+// The source position (X/Y in the room, height on Z) takes CV, so a Trajectory
+// or Panner can move the source and every reflection — direction, delay and
+// Doppler — tracks it. That is the whole point of doing it geometrically.
+registerBlock({
+  type: 'room',
+  title: 'Room',
+  category: 'Surround',
+  group: 'Spatial',
+  desc: 'Geometric early reflections (image-source), each panned onto the rig — pair with Reverb for the tail',
+  inputs: [
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in' },
+  ],
+  outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
+  params: [
+    knob('width', 'Width', 2, 30, 7, { unit: 'm' }),
+    knob('depth', 'Depth', 2, 30, 9, { unit: 'm' }),
+    knob('height', 'Height', 2, 12, 3.2, { unit: 'm', face: false }),
+    knob('absorb', 'Absorb', 0, 0.95, 0.4),
+    { id: 'order', name: 'Order', type: 'int', min: 1, max: 2, def: 2, step: 1, widget: 'knob' },
+    { id: 'srcx', name: 'Src X', type: 'float', min: -1, max: 1, def: 0, widget: 'xy', yParam: 'srcy' },
+    { id: 'srcy', name: 'Src Y', type: 'float', min: -1, max: 1, def: -0.3, widget: 'select' },
+    knob('srcz', 'Src Z', -1, 1, 0, { face: false }),
+    knob('direct', 'Direct', 0, 1, 0.8),
+    knob('reflect', 'Reflect', 0, 1, 0.6),
+    knob('gain', 'Gain', 0, 1.5, 1, { face: false }),
   ],
   needsRig: true,
   stubbed: true,
@@ -932,6 +1019,30 @@ registerBlock({
   ],
   minW: 110,
   style: { shape: 'chamfer', fill: '#3b3326', stroke: '#e0b24f' },
+});
+// Convolution — the input run through a recorded impulse response.
+//
+// Load an IR (a real room, a plate, a speaker cabinet, a mangled noise burst)
+// and the input takes on its character exactly. Where Reverb *synthesizes* a
+// decay, this *reproduces* a measured one — and because the IR is just a
+// cassette, anything you can record or generate becomes a space. Native uses
+// partitioned FFT convolution; the web preview uses the browser's ConvolverNode
+// (a sanctioned divergence, same as Reverb).
+registerBlock({
+  type: 'conv',
+  title: 'Convolution',
+  category: 'Effects',
+  group: 'Time',
+  desc: 'Convolve with an impulse response (reverb, cabinet, any recorded space) — Load an IR file',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  params: [
+    { id: 'load', name: 'Load IR…', type: 'action', def: 0, widget: 'button', dialogAction: true },
+    knob('mix', 'Mix', 0, 1, 0.5),
+    knob('gain', 'Gain', 0, 2, 1),
+    { id: 'normalize', name: 'Normalize', type: 'bool', def: true, widget: 'toggle', face: false },
+    { id: 'asset', name: 'IR', type: 'string', def: '', widget: 'select', face: false },
+  ],
 });
 registerBlock({
   type: 'reverb',

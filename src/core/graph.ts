@@ -710,7 +710,8 @@ export class GraphDoc {
           b.type === 'upmix' ||
           b.type === 'panner3d' ||
           b.type === 'amb-decode' ||
-          b.type === 'spectral-scatter'
+          b.type === 'spectral-scatter' ||
+          b.type === 'room'
         ) {
           // A narrow/B-format input and CV inputs stay as declared; only the
           // speaker output follows the rig.

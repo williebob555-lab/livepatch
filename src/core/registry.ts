@@ -89,7 +89,8 @@ export type VisualKind =
   | 'eq'
   | 'midimon'
   | 'spatial'
-  | 'speakers';
+  | 'speakers'
+  | 'path';
 
 export interface BlockDef {
   type: string;

@@ -6,7 +6,8 @@
 import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
 import { getDef, paramSpec } from '../core/registry';
-import { Block, Theme, Vec2, Wire } from '../core/types';
+import { Block, ParamValue, Theme, Vec2, Wire } from '../core/types';
+import { parsePoints, samplePath } from '../core/trajectory';
 import { runtime } from '../engine/runtime';
 import {
   WirePaths,
@@ -1371,6 +1372,76 @@ export class Renderer {
    * speaker is up. Channel `i` of `chans` is speaker `i` — same order the rig
    * and every wide bus use.
    */
+  /**
+   * Read-only plan of a Trajectory (`path` block) on its face: a top-down view
+   * (x right, y = front up) of the waypoint curve, with a live playhead when
+   * the native engine is running. Drawn from the `points` param via the same
+   * `samplePath` the kernel mirrors, so the face preview matches the motion.
+   * The full editing surface is the Advanced tab (`advpath.ts`).
+   */
+  private drawPathFace(
+    g: CanvasRenderingContext2D,
+    r: { x: number; y: number; w: number; h: number },
+    params: Record<string, ParamValue>,
+    nodeId: string,
+    theme: Theme,
+  ): void {
+    const pad = 8;
+    const cx = r.x + r.w / 2;
+    const cy = r.y + r.h / 2;
+    const rad = Math.min(r.w, r.h) / 2 - pad;
+    if (rad < 6) return;
+    // Normalized rig space (−1..1) → face pixels. +y is front, which is *up* on
+    // screen, so y flips sign — the same convention the Rig plan pane uses.
+    const px = (nx: number): number => cx + nx * rad;
+    const py = (ny: number): number => cy - ny * rad;
+
+    // Unit ring + crosshair for orientation.
+    g.strokeStyle = theme.gridColor;
+    g.lineWidth = 1;
+    g.beginPath();
+    g.arc(cx, cy, rad, 0, Math.PI * 2);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(cx - rad, cy); g.lineTo(cx + rad, cy);
+    g.moveTo(cx, cy - rad); g.lineTo(cx, cy + rad);
+    g.stroke();
+
+    const pts = parsePoints(params.points);
+    if (pts.length >= 2) {
+      const closed = params.mode !== 'Once';
+      const smooth = params.interp !== 'Linear';
+      const steps = Math.min(120, Math.max(24, pts.length * 16));
+      g.strokeStyle = theme.wireControlColor;
+      g.lineWidth = 1.5;
+      g.beginPath();
+      const scratch = { x: 0, y: 0, z: 0 };
+      for (let i = 0; i <= steps; i++) {
+        samplePath(pts, i / steps, smooth, closed, scratch);
+        const sx = px(scratch.x);
+        const sy = py(scratch.y);
+        i === 0 ? g.moveTo(sx, sy) : g.lineTo(sx, sy);
+      }
+      g.stroke();
+    }
+    // Waypoints.
+    g.fillStyle = theme.blockText;
+    for (const p of pts) {
+      g.beginPath();
+      g.arc(px(p.x), py(p.y), 2, 0, Math.PI * 2);
+      g.fill();
+    }
+    // Live playhead (native engine only — modValue is null on web/audio-off).
+    const lx = runtime.modValueFor(nodeId, 'x');
+    const ly = runtime.modValueFor(nodeId, 'y');
+    if (lx != null && ly != null) {
+      g.fillStyle = theme.wireGoodColor;
+      g.beginPath();
+      g.arc(px(lx), py(ly), 3.5, 0, Math.PI * 2);
+      g.fill();
+    }
+  }
+
   private drawSpatialScope(
     g: CanvasRenderingContext2D,
     r: { x: number; y: number; w: number; h: number },
@@ -1708,6 +1779,12 @@ export class Renderer {
     if (kind === 'eq') {
       // Interactive parametric curve — drawn from params, engine not required.
       this.drawEqCurve(g, _b, { x, y, w, h }, theme, overlay);
+      return;
+    }
+    if (kind === 'path') {
+      // Read-only plan of the trajectory, drawn from the `points` param; the
+      // engine is only needed for the live playhead dot (native only).
+      this.drawPathFace(g, { x, y, w, h }, params, nodeId, theme);
       return;
     }
     const feed = runtime.visualFor(nodeId);
