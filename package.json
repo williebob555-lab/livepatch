@@ -18,9 +18,9 @@
     "typecheck": "tsc --noEmit && tsc -p engine/tsconfig.json --noEmit",
     "start": "npm run build && electron .",
     "electron": "electron .",
-    "package": "npm run build && npm run bundle:node && electron-builder --win",
-    "package:dir": "npm run build && npm run bundle:node && electron-builder --win --dir",
-    "release": "npm run build && npm run bundle:node && electron-builder --win --publish always",
+    "package": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win",
+    "package:dir": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win --dir",
+    "release": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win --publish always",
     "ship": "npm version patch && git push --follow-tags && npm run release",
     "ship:minor": "npm version minor && git push --follow-tags && npm run release"
   },
