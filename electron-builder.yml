@@ -30,13 +30,18 @@ files:
 extraResources:
   - from: build/node.exe
     to: node.exe
-  # Optional VST3 host addon. Built by `node scripts/build-vsthost.mjs`; the
-  # `filter` copies it only when present, so a build that never compiled it
-  # still packages (the app then degrades to "VST3 hosting isn't available in
-  # this build"). findVstAddon() resolves it at resources/vsthost.node.
-  - from: native/vsthost/build/Release/
-    to: .
-    filter: ['vsthost.node']
+  # VST3 host addon — REQUIRED in every build. The packaging scripts
+  # (`package`, `package:dir`, `release`) run `npm run build:vsthost` first, so
+  # this file is freshly compiled before electron-builder runs. It is a direct
+  # file `from` (not a directory + filter) on purpose: if the addon is missing,
+  # electron-builder ERRORS here instead of silently shipping a build with VST3
+  # hosting disabled — the exact silent-loss trap this used to be. If you want
+  # to ship a build without VST hosting, remove `build:vsthost` from the script
+  # chain in package.json deliberately, don't rely on a missing file. Built by
+  # `node scripts/build-vsthost.mjs`; findVstAddon() resolves it at
+  # resources/vsthost.node.
+  - from: native/vsthost/build/Release/vsthost.node
+    to: vsthost.node
 
 win:
   target: [nsis]
