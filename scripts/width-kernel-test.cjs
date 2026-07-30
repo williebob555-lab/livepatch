@@ -204,6 +204,11 @@ const services = {
   pushAsioOut: () => {},
   hardwareChanged: () => {},
   sendMidi: () => {},
+  // How many output channels a route has. `speaker-rig`'s buildPlan asks so it
+  // can fold a rig wider than the hardware (docs/05). 0 = "nothing open yet",
+  // which is the honest answer for a headless harness with no device and the
+  // value that makes buildPlan take its no-fold path.
+  outChannels: () => 0,
 };
 
 const run = (graph, quanta = 2) => {

@@ -719,6 +719,12 @@ export class GraphDoc {
         } else if (b.type === 'multi-in') {
           const w = Math.max(2, Math.min(32, Number(b.params.channels) || 8));
           for (const p of b.ports) if (p.dir === 'out' && p.kind === 'audio') set(p, w);
+        } else if (b.type === 'vst') {
+          // A plugin's main buses are in-line, so BOTH audio ports carry the
+          // requested width. The kernel re-negotiates with the plugin and may
+          // end up narrower — the wire's channel chip is what tells you.
+          const w = Math.max(2, Math.min(32, Number(b.params.chans) || 2));
+          for (const p of b.ports) if (p.kind === 'audio') set(p, w);
         }
         if (b.graph) visit(b.graph);
       }

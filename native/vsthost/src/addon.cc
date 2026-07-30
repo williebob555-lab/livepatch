@@ -19,12 +19,13 @@ namespace {
 class CreateWorker : public Napi::AsyncWorker {
  public:
   CreateWorker(Napi::Function& cb, std::string path, std::string cid, double sr,
-               int32_t maxBlock)
+               int32_t maxBlock, int32_t chans)
       : Napi::AsyncWorker(cb),
         path_(std::move(path)),
         cid_(std::move(cid)),
         sr_(sr),
-        maxBlock_(maxBlock) {}
+        maxBlock_(maxBlock),
+        chans_(chans) {}
 
   void Execute() override {
     // Plugins (iZotope especially) use COM internally; init per pool thread.
@@ -44,6 +45,9 @@ class CreateWorker : public Napi::AsyncWorker {
       return;
     }
     std::string err;
+    // Width must be requested before setup — arrangements are only negotiable
+    // while the component is inactive.
+    inst_->requestChannels(chans_);
     if (!inst_->setup(sr_, maxBlock_, err)) {
       SetError(err.empty() ? "plugin setup failed" : err);
     }
@@ -55,6 +59,10 @@ class CreateWorker : public Napi::AsyncWorker {
     o.Set("latency", inst_->latencySamples());
     o.Set("hasAudioIn", inst_->hasAudioIn());
     o.Set("name", inst_->name());
+    // Negotiated widths, so the kernel can size its ports to what the plugin
+    // actually agreed to rather than what was asked for.
+    o.Set("inChannels", inst_->mainInChannels());
+    o.Set("outChannels", inst_->mainOutChannels());
     o.Set("handle", lp::instanceAdopt(std::move(inst_)));
     Callback().Call({env.Null(), o});
   }
@@ -64,6 +72,7 @@ class CreateWorker : public Napi::AsyncWorker {
   std::string cid_;
   double sr_;
   int32_t maxBlock_;
+  int32_t chans_;
   std::unique_ptr<lp::VstInstance> inst_;
 };
 
@@ -111,13 +120,18 @@ Napi::Value Create(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, h);
 }
 
-// createAsync(path, cid, sampleRate, maxBlock, cb(err, {handle, latency, hasAudioIn, name}))
+// createAsync(path, cid, sampleRate, maxBlock, cb(err, {handle, latency,
+//             hasAudioIn, name, inChannels, outChannels}), [chans])
+// `chans` (optional, 0/2 = stereo) is the REQUESTED main-bus width; the result's
+// inChannels/outChannels report what the plugin actually accepted.
 Napi::Value CreateAsync(const Napi::CallbackInfo& info) {
   Napi::Function cb = info[4].As<Napi::Function>();
+  const int32_t chans =
+      info.Length() > 5 && info[5].IsNumber() ? info[5].As<Napi::Number>().Int32Value() : 0;
   auto* w = new CreateWorker(cb, info[0].As<Napi::String>(),
                              info[1].As<Napi::String>(),
                              info[2].As<Napi::Number>().DoubleValue(),
-                             info[3].As<Napi::Number>().Int32Value());
+                             info[3].As<Napi::Number>().Int32Value(), chans);
   w->Queue();
   return info.Env().Undefined();
 }
@@ -126,12 +140,14 @@ lp::VstInstance* Inst(const Napi::CallbackInfo& info) {
   return lp::instanceGet(info[0].As<Napi::Number>().Int32Value());
 }
 
-// resetup(handle, sampleRate, maxBlock) -> latency (device reconfigure path)
+// resetup(handle, sampleRate, maxBlock, [chans]) -> latency (device reconfigure)
 Napi::Value Resetup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* v = Inst(info);
   if (!v) { ThrowJs(env, "bad handle"); return env.Null(); }
   std::string err;
+  if (info.Length() > 3 && info[3].IsNumber())
+    v->requestChannels(info[3].As<Napi::Number>().Int32Value());
   if (!v->resetup(info[1].As<Napi::Number>().DoubleValue(),
                   info[2].As<Napi::Number>().Int32Value(), err)) {
     ThrowJs(env, err);
@@ -228,6 +244,46 @@ Napi::Value Process(const Napi::CallbackInfo& info) {
   const int32_t n = info[5].As<Napi::Number>().Int32Value();
   v->process(inL.Data(), inR.Data(), outL.Data(), outR.Data(), n);
   return info.Env().Undefined();
+}
+
+// processMulti(handle, [inCh...], [outCh...], n) — multichannel hot path.
+//
+// The channel pointer arrays are gathered into fixed stack buffers per call so
+// nothing heap-allocates here; MAXCH mirrors the engine's own cap (dsp.ts).
+Napi::Value ProcessMulti(const Napi::CallbackInfo& info) {
+  auto* v = Inst(info);
+  if (!v) return info.Env().Undefined();
+  auto insArr = info[1].As<Napi::Array>();
+  auto outsArr = info[2].As<Napi::Array>();
+  const int32_t n = info[3].As<Napi::Number>().Int32Value();
+  constexpr int32_t MAXCH = 32;
+  const float* ins[MAXCH];
+  float* outs[MAXCH];
+  int32_t nIn = 0;
+  int32_t nOut = 0;
+  const uint32_t inLen = insArr.Length();
+  for (uint32_t i = 0; i < inLen && nIn < MAXCH; i++) {
+    Napi::Value e = insArr[i];
+    ins[nIn++] = e.IsTypedArray() ? e.As<Napi::Float32Array>().Data() : nullptr;
+  }
+  const uint32_t outLen = outsArr.Length();
+  for (uint32_t i = 0; i < outLen && nOut < MAXCH; i++) {
+    Napi::Value e = outsArr[i];
+    outs[nOut++] = e.IsTypedArray() ? e.As<Napi::Float32Array>().Data() : nullptr;
+  }
+  v->processMulti(ins, nIn, outs, nOut, n);
+  return info.Env().Undefined();
+}
+
+// channels(handle) -> { in, out } — what the plugin ACCEPTED, post-negotiation.
+Napi::Value Channels(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* v = Inst(info);
+  if (!v) return env.Null();
+  Napi::Object o = Napi::Object::New(env);
+  o.Set("in", Napi::Number::New(env, v->mainInChannels()));
+  o.Set("out", Napi::Number::New(env, v->mainOutChannels()));
+  return o;
 }
 
 // takeEdits(handle) -> null | [id0, v0, id1, v1, ...]
@@ -424,6 +480,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("paramsDirty", Napi::Function::New(env, ParamsDirty));
   exports.Set("midi", Napi::Function::New(env, Midi));
   exports.Set("process", Napi::Function::New(env, Process));
+  exports.Set("processMulti", Napi::Function::New(env, ProcessMulti));
+  exports.Set("channels", Napi::Function::New(env, Channels));
   exports.Set("takeEdits", Napi::Function::New(env, TakeEdits));
   exports.Set("getState", Napi::Function::New(env, GetState));
   exports.Set("setState", Napi::Function::New(env, SetState));

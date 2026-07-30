@@ -1,6 +1,6 @@
 # 13 — VST3 Hosting
 
-_Last verified: 2026-07-25. Files: `native/vsthost/*`, `engine/src/vst.ts`,
+_Last verified: 2026-07-29. Files: `native/vsthost/*`, `engine/src/vst.ts`,
 `engine/src/vstscan.ts`, `src/core/vstplugins.ts`, `src/core/compile.ts`,
 `src/ui/vstface.ts`, `src/engine/vstinfo.ts`, `electron/main.cjs` (vst:scan /
 vst:frame / parentHwnd injection), `scripts/build-vsthost.mjs`,
@@ -181,6 +181,46 @@ tagged `src:'midi'` (native), `midiLive` map (web) — CV wins when a param has
 both. Properties rows show the same dots (Parameters, Plugin params, MIDI
 Bindings).
 
+## Multichannel main buses (2026-07-29)
+
+The main in/out buses can be wider than stereo. `VstInstance::negotiateBuses`
+asks for an arrangement and then **reads back what the plugin agreed to**.
+
+- **`setBusArrangements` is a negotiation, not a setting.** A plugin may refuse
+  a width and stay stereo, and most stereo effects do. So the request
+  (`requestChannels`) and the result (`mainInChannels`/`mainOutChannels`, from
+  `BusInfo.channelCount`) are separate values and the *result* is the only one
+  the audio path may trust. Believing the request would write into buses that
+  don't exist — silently, which is the whole class of failure the width
+  contract exists to prevent (docs/02).
+- `negotiateBuses` is shared by `setup` **and** `resetup`. It must be: bus
+  arrangements are only changeable while the component is inactive, and having
+  only `setup` honour the request left `requestChannels` silently ineffective on
+  the device-reconfigure path.
+- `resetup` also re-sizes `silence_`/`scratch_`. Those are handed to the plugin
+  for channels the host isn't driving, so a grown `maxBlock` with stale buffers
+  is a straight overrun, not a subtle one.
+- `processMulti` maps host channels 1:1 onto the bus and **truncates, never
+  folds**. Plugin input channels the host lacks get `silence_`; plugin outputs
+  the host lacks go to `scratch_`; **host output channels the plugin didn't
+  write are zeroed**, because leaving them replays the previous quantum forever.
+- `beginProcess`/`endProcess` are shared by both process paths. Two
+  hand-maintained copies of the GUI-edit draining is how one path quietly stops
+  reporting edits, and rule 1 above depends on that drain happening.
+- JS side: the `vst` block has an explicit **Channels** param (like `multi-in`),
+  not an inferred width — because the width is negotiated, it has to be a
+  visible decision with a visible result. `VstKernel.setWidth` grows the output
+  buffer at set-graph time and flags a re-negotiation for the next quantum;
+  `processMulti`/`channels` are typed **optional** so a stale `vsthost.node`
+  from before this change falls back to stereo instead of crashing.
+
+Probe: `node scripts/vsthost-multichannel.mjs` (real plugins, several widths).
+It checks self-consistency, not that any given plugin supports surround —
+"asked for 8, got 2" is a pass. **Not yet verified end-to-end:** no plugin on
+the dev machine accepts a main bus wider than stereo, so the >2-channel data
+path *through* a plugin is unproven; the host-side truncation/zeroing is
+covered.
+
 ## Known limitations / future work
 
 - Face snapshot when the overlay is hidden (zoom ≠ 1): WGC pipeline exists
@@ -189,7 +229,10 @@ Bindings).
   covers wires crossing the block).
 - One shared UI thread hosts all editors — a wedged plugin GUI freezes other
   editors (never audio). Per-plugin UI threads would isolate this.
-- Multichannel/sidechain buses: main stereo in/out only (mono mains folded).
+- **Sidechain / aux buses**: only the *main* in/out buses are used. Multichannel
+  main buses are supported (above); secondary buses are still deactivated, so a
+  plugin's sidechain input and extra outputs (Kontakt's per-instrument outs) are
+  unreachable.
 
 ## Editor won't open (diagnostics)
 

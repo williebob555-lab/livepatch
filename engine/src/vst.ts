@@ -27,9 +27,15 @@ interface HostAddon {
   moduleClasses(path: string): Array<{ cid: string; name: string; vendor: string; version: string; subCategories: string }>;
   createAsync(
     path: string, cid: string, sampleRate: number, maxBlock: number,
-    cb: (err: Error | null, r?: { handle: number; latency: number; hasAudioIn: boolean; name: string }) => void,
+    cb: (err: Error | null, r?: {
+      handle: number; latency: number; hasAudioIn: boolean; name: string;
+      /** Widths the plugin ACCEPTED on its main buses (post-negotiation), not
+       *  what was requested — see `negotiateBuses` in native/vsthost/host.cc. */
+      inChannels?: number; outChannels?: number;
+    }) => void,
+    chans?: number,
   ): void;
-  resetup(handle: number, sampleRate: number, maxBlock: number): number;
+  resetup(handle: number, sampleRate: number, maxBlock: number, chans?: number): number;
   params(handle: number): Array<{ id: number; title: string; units: string; stepCount: number; def: number; canAutomate: boolean; readOnly: boolean; bypass: boolean; hidden: boolean }>;
   setParam(handle: number, pid: number, v: number): void;
   getParam(handle: number, pid: number): number;
@@ -37,6 +43,18 @@ interface HostAddon {
   paramsDirty(handle: number): boolean;
   midi(handle: number, status: number, d1: number, d2: number): void;
   process(handle: number, inL: Float32Array, inR: Float32Array, outL: Float32Array, outR: Float32Array, n: number): void;
+  /**
+   * Multichannel path: channel-pointer arrays mapped 1:1 onto the plugin's main
+   * buses. Truncates, never folds (docs/02).
+   *
+   * **Optional on purpose.** The addon is built separately from the JS (and is
+   * gitignored — see docs/11), so a stale `vsthost.node` from before
+   * multichannel support is a real situation. Typing these as required would
+   * make the runtime guards look redundant and invite someone to delete them,
+   * after which an old addon crashes instead of falling back to stereo.
+   */
+  processMulti?(handle: number, ins: Float32Array[], outs: Float32Array[], n: number): void;
+  channels?(handle: number): { in: number; out: number } | null;
   takeEdits(handle: number): number[] | null;
   getState(handle: number): Buffer | null;
   setState(handle: number, state: Buffer): boolean;
@@ -138,6 +156,19 @@ class VstKernel implements Kernel {
   /** Param values seen before the instance was ready. */
   private pend = new Map<number, number>();
   private outBuf: StereoBuf = [new Float32Array(MAXQ), new Float32Array(MAXQ)];
+  /**
+   * Host-side bus width. Grown by `setWidth` when a wider net connects, so a
+   * surround bus can pass through a plugin instead of collapsing to stereo.
+   * `pluginOut` is what the plugin actually accepted — they are not the same
+   * number, and the difference is what gets truncated.
+   */
+  private width = 2;
+  private pluginIn = 2;
+  private pluginOut = 2;
+  /** Reusable channel-pointer arrays for `processMulti`. Rebuilt only on width
+   *  change — building them per quantum would allocate in the audio path. */
+  private inPtrs: Float32Array[] = [];
+  private outPtrs: Float32Array[] = [];
   /** Coalesced plugin-initiated edits awaiting the flush timer. */
   private editAcc = new Map<number, number>();
   private stateDirtyAt = 0;
@@ -168,6 +199,7 @@ class VstKernel implements Kernel {
     if (!this.h || !this.plugin || this.creating || this.disposed) return;
     this.creating = true;
     const wantedPlugin = this.plugin;
+    // Request the host-side width; the plugin may refuse and stay narrower.
     this.h.createAsync(this.plugin, this.cid, rateProvider() || 48000, MAXQ, (err, r) => {
       this.creating = false;
       if (this.disposed || this.plugin !== wantedPlugin) {
@@ -184,6 +216,10 @@ class VstKernel implements Kernel {
       this.latency = r.latency;
       this.hasAudioIn = r.hasAudioIn;
       this.pluginName = r.name;
+      // What the plugin agreed to, defaulting to stereo for an addon build that
+      // predates the multichannel fields.
+      this.pluginIn = r.inChannels ?? 2;
+      this.pluginOut = r.outChannels ?? 2;
       if (this.state) {
         try {
           this.h!.setState(this.handle, Buffer.from(this.state, 'base64'));
@@ -224,6 +260,28 @@ class VstKernel implements Kernel {
 
   out(port: string): StereoBuf | null {
     return port === 'out' ? this.outBuf : null;
+  }
+
+  /**
+   * A wider net connected — grow the host-side bus so a surround signal can
+   * pass through the plugin instead of collapsing to stereo.
+   *
+   * Reallocates here (set-graph time), **never in `process`** (docs/08 rule 2).
+   * The plugin itself is re-negotiated lazily on the next `process` via
+   * `resetup`, because arrangements can only change while the component is
+   * inactive and doing that from here would stall the graph build.
+   */
+  setWidth(_port: string, w: number): void {
+    const nw = Math.max(2, Math.min(32, Math.round(w) || 2));
+    if (nw === this.width) return;
+    this.width = nw;
+    const next: Float32Array[] = new Array(nw);
+    for (let c = 0; c < nw; c++) next[c] = this.outBuf[c] ?? new Float32Array(MAXQ);
+    this.outBuf = next as StereoBuf;
+    this.inPtrs = new Array(nw);
+    this.outPtrs = new Array(nw);
+    // Force a re-negotiation at the requested width on the next quantum.
+    this.instRate = 0;
   }
 
   setParam(id: string, v: ParamValue): void {
@@ -340,29 +398,46 @@ class VstKernel implements Kernel {
 
   process(ins: Ins, ctx: { sr: number; n: number }): void {
     const src = ins['in'];
+    const n = ctx.n;
     if (this.handle < 0) {
-      // Pass-through while loading / unloaded / addon missing.
-      const [ol, or] = this.outBuf;
-      if (src) {
-        ol.set(src[0].subarray(0, ctx.n));
-        or.set(src[1].subarray(0, ctx.n));
-      } else {
-        ol.fill(0, 0, ctx.n);
-        or.fill(0, 0, ctx.n);
+      // Pass-through while loading / unloaded / addon missing. Copied longhand:
+      // `subarray` allocates a view per channel per quantum, which is the
+      // GC-pop trap documented on `copy` in dsp.ts.
+      for (let c = 0; c < this.outBuf.length; c++) {
+        const d = this.outBuf[c];
+        const s = src && c < src.length ? src[c] : null;
+        if (s) for (let i = 0; i < n; i++) d[i] = s[i];
+        else d.fill(0, 0, n);
       }
       return;
     }
     if (this.instRate !== ctx.sr) {
-      // Device rate differs from creation-time guess (or changed) — re-setup.
+      // Device rate differs from creation-time guess (or changed), or setWidth
+      // asked for a new bus width — re-setup and re-read what was negotiated.
       try {
-        this.latency = this.h!.resetup(this.handle, ctx.sr, MAXQ);
+        this.latency = this.h!.resetup(this.handle, ctx.sr, MAXQ, this.width);
+        const ch = this.h!.channels?.(this.handle);
+        if (ch) {
+          this.pluginIn = ch.in;
+          this.pluginOut = ch.out;
+        }
         this.instRate = ctx.sr;
       } catch {
         this.instRate = ctx.sr; // don't retry every quantum on a refusal
       }
     }
     const inBuf = src ?? SILENT;
-    this.h!.process(this.handle, inBuf[0], inBuf[1], this.outBuf[0], this.outBuf[1], ctx.n);
+    if (this.width > 2 && this.h!.processMulti) {
+      // Wide bus: hand over channel arrays. The pointer arrays are reused
+      // (rebuilt only in setWidth) so this allocates nothing.
+      for (let c = 0; c < this.width; c++) {
+        this.inPtrs[c] = c < inBuf.length ? inBuf[c] : SILENT[0];
+        this.outPtrs[c] = this.outBuf[c];
+      }
+      this.h!.processMulti(this.handle, this.inPtrs, this.outPtrs, n);
+    } else {
+      this.h!.process(this.handle, inBuf[0], inBuf[1], this.outBuf[0], this.outBuf[1], n);
+    }
     const edits = this.h!.takeEdits(this.handle);
     if (edits) {
       for (let i = 0; i + 1 < edits.length; i += 2) this.editAcc.set(edits[i], edits[i + 1]);

@@ -22,6 +22,34 @@ static bool tdTrace() {
 }
 #define TD_TRACE(...) do { if (tdTrace()) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 
+/**
+ * A standard SpeakerArrangement for a plain channel count.
+ *
+ * VST3 identifies a bus layout by a speaker *bitmask*, not a count, so a host
+ * asking for "12 channels" has to name a concrete arrangement. These are the
+ * conventional ones for each width; anything unrecognised falls back to stereo,
+ * which is the safe floor (every plugin supports it) rather than a guess a
+ * plugin would reject outright.
+ */
+static Vst::SpeakerArrangement arrangementFor(int32 chans) {
+  using namespace Vst::SpeakerArr;
+  switch (chans) {
+    case 1: return kMono;
+    case 2: return kStereo;
+    case 3: return k30Cine;      // L R C
+    case 4: return k40Music;     // quad: L R Ls Rs (k40Cine is L R C Cs)
+    case 5: return k50;          // L R C Ls Rs
+    case 6: return k51;          // 5.1
+    case 7: return k61Cine;
+    case 8: return k71Cine;      // 7.1
+    case 10: return k71_2;       // 7.1.2
+    case 12: return k71_4;       // 7.1.4
+    case 14: return k91_4;       // 9.1.4
+    case 16: return kAmbi3rdOrderACN;  // 3rd-order ambisonics (or 9.1.6-ish)
+    default: return kStereo;
+  }
+}
+
 // ---------------------------------------------------------------- host context
 
 static Vst::HostApplication* hostApp() {
@@ -161,33 +189,7 @@ bool VstInstance::setup(double sampleRate, int32_t maxBlock, std::string& err) {
     return false;
   }
 
-  // Find the main audio buses; ask for stereo everywhere.
-  const int32 nIn = component_->getBusCount(Vst::kAudio, Vst::kInput);
-  const int32 nOut = component_->getBusCount(Vst::kAudio, Vst::kOutput);
-  std::vector<Vst::SpeakerArrangement> inArr(nIn, Vst::SpeakerArr::kStereo);
-  std::vector<Vst::SpeakerArrangement> outArr(nOut, Vst::SpeakerArr::kStereo);
-  processor_->setBusArrangements(inArr.empty() ? nullptr : inArr.data(), nIn,
-                                 outArr.empty() ? nullptr : outArr.data(), nOut);
-
-  mainInBus_ = mainOutBus_ = -1;
-  for (int32 i = 0; i < nIn; i++) {
-    Vst::BusInfo bi{};
-    component_->getBusInfo(Vst::kAudio, Vst::kInput, i, bi);
-    const bool isMain = bi.busType == Vst::kMain && mainInBus_ < 0;
-    if (isMain) mainInBus_ = i;
-    component_->activateBus(Vst::kAudio, Vst::kInput, i, isMain);
-  }
-  for (int32 i = 0; i < nOut; i++) {
-    Vst::BusInfo bi{};
-    component_->getBusInfo(Vst::kAudio, Vst::kOutput, i, bi);
-    const bool isMain = bi.busType == Vst::kMain && mainOutBus_ < 0;
-    if (isMain) mainOutBus_ = i;
-    component_->activateBus(Vst::kAudio, Vst::kOutput, i, isMain);
-  }
-  if (mainOutBus_ < 0) {
-    err = "plugin has no main audio output";
-    return false;
-  }
+  if (!negotiateBuses(err)) return false;
   hasEventIn_ = component_->getBusCount(Vst::kEvent, Vst::kInput) > 0;
   if (hasEventIn_) component_->activateBus(Vst::kEvent, Vst::kInput, 0, true);
 
@@ -195,6 +197,12 @@ bool VstInstance::setup(double sampleRate, int32_t maxBlock, std::string& err) {
     err = "process buffer prepare failed";
     return false;
   }
+
+  // Filler buffers for plugin bus channels the host isn't driving. Allocated
+  // here (setup), never in process. `silence_` must stay all-zero: a plugin
+  // reading it should hear nothing, and nothing ever writes to it.
+  silence_.assign(static_cast<size_t>(maxBlock), 0.f);
+  scratch_.assign(static_cast<size_t>(maxBlock), 0.f);
 
   inChanges_.setMaxParameters(64);
   outChanges_.setMaxParameters(64);
@@ -224,6 +232,60 @@ bool VstInstance::setup(double sampleRate, int32_t maxBlock, std::string& err) {
   return true;
 }
 
+/**
+ * Negotiate main-bus widths and locate the main buses. Runs while the component
+ * is INACTIVE (both callers guarantee that) — VST3 only permits arrangement
+ * changes there.
+ *
+ * `wantChans_` (0/2 = stereo) is a REQUEST, not a setting: `setBusArrangements`
+ * is a negotiation and a plugin may refuse and keep its own layout. So we ask,
+ * then read back `BusInfo.channelCount` and store *that*. Trusting the request
+ * would feed channels into a bus that doesn't exist — silently, which is the
+ * failure mode the whole width contract exists to prevent (docs/02, docs/13).
+ */
+bool VstInstance::negotiateBuses(std::string& err) {
+  const int32 nIn = component_->getBusCount(Vst::kAudio, Vst::kInput);
+  const int32 nOut = component_->getBusCount(Vst::kAudio, Vst::kOutput);
+  const Vst::SpeakerArrangement want = arrangementFor(wantChans_);
+  std::vector<Vst::SpeakerArrangement> inArr(nIn, want);
+  std::vector<Vst::SpeakerArrangement> outArr(nOut, want);
+  processor_->setBusArrangements(inArr.empty() ? nullptr : inArr.data(), nIn,
+                                 outArr.empty() ? nullptr : outArr.data(), nOut);
+
+  mainInBus_ = mainOutBus_ = -1;
+  for (int32 i = 0; i < nIn; i++) {
+    Vst::BusInfo bi{};
+    component_->getBusInfo(Vst::kAudio, Vst::kInput, i, bi);
+    const bool isMain = bi.busType == Vst::kMain && mainInBus_ < 0;
+    if (isMain) mainInBus_ = i;
+    component_->activateBus(Vst::kAudio, Vst::kInput, i, isMain);
+  }
+  for (int32 i = 0; i < nOut; i++) {
+    Vst::BusInfo bi{};
+    component_->getBusInfo(Vst::kAudio, Vst::kOutput, i, bi);
+    const bool isMain = bi.busType == Vst::kMain && mainOutBus_ < 0;
+    if (isMain) mainOutBus_ = i;
+    component_->activateBus(Vst::kAudio, Vst::kOutput, i, isMain);
+  }
+  if (mainOutBus_ < 0) {
+    err = "plugin has no main audio output";
+    return false;
+  }
+  inChans_ = 0;
+  outChans_ = 0;
+  if (mainInBus_ >= 0) {
+    Vst::BusInfo bi{};
+    if (component_->getBusInfo(Vst::kAudio, Vst::kInput, mainInBus_, bi) == kResultTrue)
+      inChans_ = bi.channelCount;
+  }
+  {
+    Vst::BusInfo bi{};
+    if (component_->getBusInfo(Vst::kAudio, Vst::kOutput, mainOutBus_, bi) == kResultTrue)
+      outChans_ = bi.channelCount;
+  }
+  return true;
+}
+
 bool VstInstance::resetup(double sampleRate, int32_t maxBlock, std::string& err) {
   if (!processor_ || !component_) { err = "no processor"; return false; }
   if (active_) {
@@ -236,11 +298,21 @@ bool VstInstance::resetup(double sampleRate, int32_t maxBlock, std::string& err)
     err = "setupProcessing failed";
     return false;
   }
+  // Re-negotiate widths here too: the component is inactive right now (the only
+  // legal moment), and a device change may come with a different requested
+  // width. Skipping this left `requestChannels` silently ineffective on the
+  // reconfigure path while `setup` honoured it — the two paths must agree.
+  if (!negotiateBuses(err)) return false;
   data_.unprepare();
   if (!data_.prepare(*component_, maxBlock, Vst::kSample32)) {
     err = "process buffer prepare failed";
     return false;
   }
+  // Resize the filler buffers with the block size. `processMulti` hands these
+  // to the plugin for unconnected channels, so a grown maxBlock with stale
+  // buffers is a straight overrun — not a subtle one.
+  silence_.assign(static_cast<size_t>(maxBlock), 0.f);
+  scratch_.assign(static_cast<size_t>(maxBlock), 0.f);
   sampleRate_ = sampleRate;
   maxBlock_ = maxBlock;
   ctx_.sampleRate = sampleRate;
@@ -473,38 +545,25 @@ void VstInstance::midi(uint8_t status, uint8_t d1, uint8_t d2) {
   }
 }
 
-void VstInstance::process(const float* inL, const float* inR, float* outL,
-                          float* outR, int32_t n) {
-  if (!active_ || n > maxBlock_) {
-    if (outL != inL && inL) std::memcpy(outL, inL, n * sizeof(float));
-    if (outR != inR && inR) std::memcpy(outR, inR, n * sizeof(float));
-    return;
-  }
-
+// Shared pre/post plumbing for both process paths. Extracted rather than
+// copied: the stereo and multichannel entries differ ONLY in how they bind
+// channel buffers, and two hand-maintained copies of the edit-forwarding,
+// context and queue-clearing sequence is precisely how one path quietly stops
+// reporting GUI edits (docs/13 threading rules depend on this draining).
+void VstInstance::beginProcess(int32_t n) {
   // Forward plugin-GUI edits (lock-free ring; UI thread producer) to the
   // processor and to the JS edit report.
-  {
-    ParamRing::Entry e;
-    int budget = 512;
-    while (budget-- > 0 && editsFromUi_.pop(e)) {
-      queueParam(e.pid, e.value);
-      if (editIds_.size() < 512) {
-        editIds_.push_back(static_cast<float>(e.pid));
-        editValues_.push_back(static_cast<float>(e.value));
-      }
+  ParamRing::Entry e;
+  int budget = 512;
+  while (budget-- > 0 && editsFromUi_.pop(e)) {
+    queueParam(e.pid, e.value);
+    if (editIds_.size() < 512) {
+      editIds_.push_back(static_cast<float>(e.pid));
+      editValues_.push_back(static_cast<float>(e.value));
     }
   }
 
   data_.numSamples = n;
-  if (mainInBus_ >= 0) {
-    data_.setChannelBuffer(Vst::kInput, mainInBus_, 0, const_cast<float*>(inL));
-    if (data_.inputs[mainInBus_].numChannels > 1)
-      data_.setChannelBuffer(Vst::kInput, mainInBus_, 1, const_cast<float*>(inR));
-  }
-  data_.setChannelBuffer(Vst::kOutput, mainOutBus_, 0, outL);
-  const bool stereoOut = data_.outputs[mainOutBus_].numChannels > 1;
-  if (stereoOut) data_.setChannelBuffer(Vst::kOutput, mainOutBus_, 1, outR);
-
   data_.inputParameterChanges = &inChanges_;
   data_.outputParameterChanges = &outChanges_;
   data_.inputEvents = &inEvents_;
@@ -515,11 +574,10 @@ void VstInstance::process(const float* inL, const float* inR, float* outL,
   ctx_.continousTimeSamples = samplePos_;
   ctx_.projectTimeMusic =
       static_cast<double>(samplePos_) / sampleRate_ * (ctx_.tempo / 60.0);
+}
 
-  processor_->process(data_);
+void VstInstance::endProcess(int32_t n) {
   samplePos_ += n;
-
-  if (!stereoOut) std::memcpy(outR, outL, n * sizeof(float));
 
   // Some plugins report automation only via output parameter changes.
   const int32 nOutQ = outChanges_.getParameterCount();
@@ -539,6 +597,70 @@ void VstInstance::process(const float* inL, const float* inR, float* outL,
   outChanges_.clearQueue();
   inEvents_.clear();
   outEvents_.clear();
+}
+
+void VstInstance::process(const float* inL, const float* inR, float* outL,
+                          float* outR, int32_t n) {
+  if (!active_ || n > maxBlock_) {
+    if (outL != inL && inL) std::memcpy(outL, inL, n * sizeof(float));
+    if (outR != inR && inR) std::memcpy(outR, inR, n * sizeof(float));
+    return;
+  }
+  beginProcess(n);
+
+  if (mainInBus_ >= 0) {
+    data_.setChannelBuffer(Vst::kInput, mainInBus_, 0, const_cast<float*>(inL));
+    if (data_.inputs[mainInBus_].numChannels > 1)
+      data_.setChannelBuffer(Vst::kInput, mainInBus_, 1, const_cast<float*>(inR));
+  }
+  data_.setChannelBuffer(Vst::kOutput, mainOutBus_, 0, outL);
+  const bool stereoOut = data_.outputs[mainOutBus_].numChannels > 1;
+  if (stereoOut) data_.setChannelBuffer(Vst::kOutput, mainOutBus_, 1, outR);
+
+  processor_->process(data_);
+  // Mono-out plugin driving a stereo host path: duplicate so both sides sound.
+  if (!stereoOut) std::memcpy(outR, outL, n * sizeof(float));
+  endProcess(n);
+}
+
+void VstInstance::processMulti(const float* const* ins, int32_t nIn,
+                               float* const* outs, int32_t nOut, int32_t n) {
+  if (!active_ || n > maxBlock_) {
+    // Bypass: pass through channel-wise as far as both sides go, and silence
+    // any output channel with no matching input (leaving it would repeat the
+    // previous quantum forever — the frozen-buffer bug).
+    for (int32_t c = 0; c < nOut; c++) {
+      if (!outs[c]) continue;
+      if (c < nIn && ins[c]) {
+        if (outs[c] != ins[c]) std::memcpy(outs[c], ins[c], n * sizeof(float));
+      } else {
+        std::memset(outs[c], 0, n * sizeof(float));
+      }
+    }
+    return;
+  }
+  beginProcess(n);
+
+  // Bind as many channels as BOTH sides have. Extra host channels are dropped
+  // on input and zeroed on output; extra plugin channels are simply unused.
+  // Truncation, never an implicit fold (docs/02).
+  if (mainInBus_ >= 0) {
+    const int32 pc = data_.inputs[mainInBus_].numChannels;
+    for (int32 c = 0; c < pc; c++)
+      data_.setChannelBuffer(Vst::kInput, mainInBus_, c,
+                             (c < nIn && ins[c]) ? const_cast<float*>(ins[c]) : silence_.data());
+  }
+  const int32 pcOut = data_.outputs[mainOutBus_].numChannels;
+  for (int32 c = 0; c < pcOut; c++)
+    data_.setChannelBuffer(Vst::kOutput, mainOutBus_, c,
+                           (c < nOut && outs[c]) ? outs[c] : scratch_.data());
+
+  processor_->process(data_);
+
+  // Host channels the plugin didn't write must not keep last quantum's audio.
+  for (int32_t c = pcOut; c < nOut; c++)
+    if (outs[c]) std::memset(outs[c], 0, n * sizeof(float));
+  endProcess(n);
 }
 
 size_t VstInstance::takeGuiEdits(const float** ids, const float** values) {

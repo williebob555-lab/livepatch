@@ -478,7 +478,9 @@ export class Editor {
       return;
     }
     // Multi In's Channels knob sets the bus width, and width is topology.
-    if (target.type === 'multi-in' && spec.id === 'channels') {
+    // Same for a VST's Channels — it resizes both main buses and forces the
+    // kernel to renegotiate the arrangement with the plugin.
+    if ((target.type === 'multi-in' && spec.id === 'channels') || (target.type === 'vst' && spec.id === 'chans')) {
       if (doc.syncRigPorts()) doc.touch('structure');
       else doc.touch('param');
       return;

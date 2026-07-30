@@ -766,6 +766,13 @@ registerBlock({
     // key params as knobs for CV/MIDI. dialogAction: excluded from CV (it's
     // a window opener, not a modulatable control).
     { id: 'showUi', name: 'Open Editor', type: 'action', def: 0, widget: 'button', dialogAction: true },
+    // Main-bus width. Explicit rather than inferred from the connected net,
+    // for the same reason `multi-in` has a Channels knob: bus arrangements are
+    // *negotiated* with the plugin and it may refuse, so the width has to be a
+    // visible decision with a visible result (the port resizes, and the wire's
+    // channel chip shows what actually happened) instead of something that
+    // silently half-applies. 2 = the stereo default every plugin supports.
+    { id: 'chans', name: 'Channels', type: 'int', min: 2, max: 32, def: 2, step: 1, widget: 'select', face: false },
     { id: 'plugin', name: 'Plugin path', type: 'string', def: '', widget: 'select', face: false, filePick: 'vst3' },
   ],
   stubbed: true,
