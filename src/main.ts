@@ -11,6 +11,7 @@ import { applyStartupPrefs, initShell, updateStatus } from './ui/shell';
 import { syncBlockSize } from './ui/layout';
 import { SessionState, loadSession, saveSession, scheduleSessionSave } from './core/session';
 import { initCassettes, onCassettesChange } from './core/cassettes';
+import { onPrefsChange } from './core/prefs';
 import { installRollHistory, syncRolls } from './core/rolls';
 import { installTakeHistory } from './core/takehistory';
 import { showBanner } from './ui/menus';
@@ -22,6 +23,8 @@ import { dock } from './ui/dock';
 import './ui/clipview';
 import './ui/advanced';
 import './ui/adveq';
+import './ui/advpath';
+import './ui/advmatrix';
 import './ui/rigview';
 import { dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
 import { initWidgetDock } from './ui/widgetdock';
@@ -122,6 +125,16 @@ function boot(): void {
   ro.observe(canvas);
   renderer.resize();
 
+  // A blank `device` compiles to the installation's default (core/prefs.ts
+  // `resolveDevice`), so changing that default changes the compiled graph —
+  // 'structure', which is what makes the engine re-open the streams. Without
+  // this the setting only reached blocks created after it was changed, which is
+  // exactly the complaint: picking a default did nothing to the patch on screen.
+  onPrefsChange(() => {
+    doc.touch('structure');
+    refreshPanels('properties');
+  });
+
   // Scaling the chrome changes how much room the canvas gets.
   onUiScaleChange(() => {
     dock.rescale();
@@ -213,6 +226,16 @@ function boot(): void {
   // panel still bound to the old one would silently edit a dead theme.
   let panelTimer = 0;
   let panelAll = false;
+  // A scene that arrived with somebody else's speaker layout had it replaced by
+  // this installation's (core/rig.ts) — say so. The swap is the behaviour we
+  // want, but it changes channel counts and therefore how the patch sounds, and
+  // "your surround patch is playing in stereo" needs a cause on screen.
+  doc.onChange((kind) => {
+    if (kind !== 'meta' || !doc.rigOverride) return;
+    const o = doc.rigOverride;
+    doc.rigOverride = null;
+    showBanner(`Scene was built for “${o.was}” (${o.wasCount} ch) — using your rig “${o.now}” instead.`, { ttl: 7000 });
+  });
   doc.onChange((kind) => {
     if (kind === 'selection' || kind === 'param' || kind === 'structure' || kind === 'meta' || kind === 'theme') {
       panelAll = panelAll || kind === 'structure' || kind === 'meta' || kind === 'theme';
@@ -255,10 +278,37 @@ function boot(): void {
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
-  // Fallback so a backgrounded tab still paints (rAF is paused when hidden).
+  /**
+   * Control-rate pump for a window that is not compositing.
+   *
+   * rAF stops when the window is minimized (and, without the occlusion switch
+   * in `electron/main.cjs`, when another window fully covers it). **Audio does
+   * not stop with it.** `runtime.poll()` is where CV modulation is applied on
+   * both engines (docs/04) — every sweep, gate and sample-and-hold in the
+   * patch advances there — so a stalled loop does not pause the sound, it
+   * freezes the modulation *inside* it. That is most of what "garbled when
+   * minimized" was.
+   *
+   * So: poll at the control rate whenever audio is running and the window is
+   * hidden, and **do not draw**. The old version called the full `tick()`,
+   * which painted a canvas nobody could see, and did it at 200 ms — five CV
+   * updates a second against sixty.
+   *
+   * It also never actually ran: a hidden renderer's timers are clamped to
+   * about one a minute unless background-timer throttling is disabled, which
+   * is now done in `electron/main.cjs`. The two halves only work together.
+   *
+   * This is not a second animation loop (docs/10): it draws nothing, and it is
+   * inert whenever the rAF loop is alive.
+   */
   setInterval(() => {
-    if (document.hidden) tick();
-  }, 200);
+    if (!document.hidden || !runtime.audioOn) return;
+    try {
+      runtime.poll();
+    } catch {
+      /* a hidden-window poll must never break the loop it is standing in for */
+    }
+  }, 16);
 }
 
 boot();

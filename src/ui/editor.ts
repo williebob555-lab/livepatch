@@ -8,12 +8,12 @@
 // ============================================================================
 import { BlockClip, doc } from '../core/graph';
 import { ParamSpec, WidgetKind, getDef, paramSpec } from '../core/registry';
-import { Block, ControlStyle, FaceItem, Port, Vec2, Wire } from '../core/types';
+import { Block, ControlStyle, FaceItem, Port, Theme, Vec2, Wire } from '../core/types';
 import { runtime } from '../engine/runtime';
 import { CassetteMeta, getCassette, getCassetteBuffer, importAudioFiles, importAudioFolder, saveAudioFileAs } from '../core/cassettes';
 import { pickImage } from './imagepicker';
 import { pickVstPlugin } from '../core/vstplugins';
-import { getCustomBlock, saveCustomBlock, updateCustomBlock } from '../core/customblocks';
+import { getCustomBlock, isFactoryBlock, saveCustomBlock, updateCustomBlock } from '../core/customblocks';
 import { resolveAssetFor } from './tape';
 import {
   ResizeEdges,
@@ -62,6 +62,9 @@ import {
   eqXToFreq,
   eqYToGain,
   keyAt,
+  matrixCellAt,
+  matrixFaceRect,
+  matrixGeom,
   norm2val,
   parseSteps,
   parseWaveStr,
@@ -73,6 +76,8 @@ import {
   xyAxes,
 } from './widgets';
 import { toggleSpeakerMute } from '../core/rig';
+import { crossIndex, matrixPorts, parseMatrix, serializeMatrix } from '../core/matrix';
+import { LONGPRESS_SLOP, TwoPointerGesture, capture, grabSlop, wheelIntent } from './input';
 
 const BRANCH_DEADZONE = 28; // px of trunk arc kept clear near endpoints
 const BRANCH_DRAG_MIN = 8;
@@ -126,7 +131,12 @@ type DragState =
       group?: Map<string, Vec2>;
     }
   | { kind: 'editPort'; block: Block; port: Port }
-  | { kind: 'keys'; block: Block; rect: Rect; octave: number; note: number | null }
+  // `target` is the block that owns the keyboard — the block itself, or the
+  // child inside it when the keyboard is exposed on a custom block's face; the
+  // held notes and the engine node both belong to that one, never to the panel
+  // hosting it. `nodeId` is resolved at press: it cannot be re-derived on
+  // release, when the open subgraph may have changed under the drag.
+  | { kind: 'keys'; block: Block; target: Block; nodeId: string; rect: Rect; octave: number; variant?: string; note: number | null }
   | { kind: 'wavedraw'; block: Block; child: Block | null; spec: ParamSpec; rect: Rect; samples: number[]; lastIdx: number }
   | { kind: 'seqgrid'; block: Block; spec: ParamSpec; rect: Rect; steps: SeqStep[]; toggleCol: number | null }
   | { kind: 'eq'; block: Block; band: number; plot: Rect; mode: 'fg' | 'q'; startY: number; startQ: number }
@@ -175,6 +185,8 @@ const STYLE_BITS = [
   'noCollide',
   'bgImage',
   'bgFit',
+  'wireLayer',
+  'wireWidth',
 ] as const;
 
 /** Paint variants per widget kind — the same list Properties → Controls offers,
@@ -185,6 +197,12 @@ const VARIANTS: Record<string, string[]> = {
   hfader: ['track', 'slim', 'led'],
   toggle: ['switch', 'check', 'led', 'rocker', 'power'],
   button: ['rect', 'pill', 'round', 'flat'],
+  // The keyboard has had two layouts since the Mavis shipped (`keyLayout` in
+  // widgets.ts) and no way to pick between them: it is not a swappable kind, so
+  // `Control ▸` never offered it, and it had no entry here so `Style ▸` was
+  // hidden too. The layout was only reachable by hand-writing `controls` in
+  // factory code — which is how a feature ends up looking like it doesn't exist.
+  keys: ['piano', 'pad'],
 };
 
 /**
@@ -211,13 +229,13 @@ export class Editor {
   onModeChange: (() => void) | null = null;
 
   // ---- multi-touch / gesture / keyboard-nav state ----
-  /** Live pointers by id, in *client* px — drives two-finger pinch/pan. */
-  private pointers = new Map<number, Vec2>();
-  /** Non-null while a two-finger pinch/pan is in progress. A short, still
-   *  two-finger gesture that never `moved` is treated as a tap → context menu. */
-  private gesture:
-    | { prevMid: Vec2; prevDist: number; startMid: Vec2; startDist: number; startTime: number; moved: boolean }
-    | null = null;
+  /**
+   * Two-finger pan/zoom, in *canvas-local* px. Pan-first: zoom does not engage
+   * until the fingers' separation has changed past `ZOOM_DEADZONE`, so an
+   * ordinary two-finger drag moves the view without creeping the scale. See
+   * `src/ui/input.ts` and docs/14-input.md.
+   */
+  private gesture = new TwoPointerGesture();
   private longPressTimer = 0;
   private longPressAt: Vec2 | null = null;
   private longPressFired = false;
@@ -225,8 +243,6 @@ export class Editor {
   private suppressNativeCtxUntil = 0;
   /** When the last drag ended — see `dragIsLive`. */
   private dragEndedAt = 0;
-  /** Sticky "this wheel stream is a trackpad" hint (see isTrackpadPan). */
-  private trackpadUntil = 0;
   /** Directions currently held for WASD/arrow workspace panning. */
   private panKeys = new Set<'up' | 'down' | 'left' | 'right'>();
   private panRAF = 0;
@@ -276,6 +292,47 @@ export class Editor {
   }
 
   // ---------- helpers ----------
+
+  /**
+   * How close the pointer has to be to grab a wire, in world px.
+   *
+   * `theme.wireWidth` is only the FLOOR. A block carrying `style.wireWidth`
+   * draws its cables fatter, and a grab band narrower than the cable on screen
+   * is a wire you can see and cannot click — the same class of complaint as a
+   * wire hidden behind a block. The widest override in the graph therefore sets
+   * the band; the extra slop costs nothing, because a press that loses the
+   * marquee to a wire still falls back to `startMarquee` (see docs/07-ui.md,
+   * "No drag on the canvas may do nothing").
+   */
+  private wireTol(theme: Theme, grab = 1): number {
+    let w = theme.wireWidth;
+    for (const b of doc.graph.blocks) {
+      const bw = b.style.wireWidth;
+      if (bw != null && bw > w) w = bw;
+    }
+    return (WIRE_HIT_TOL / this.renderer.view.scale + w) * grab;
+  }
+
+  /**
+   * Does a wire under the pointer take the press away from the block under it?
+   *
+   * **Hit order follows paint order.** A block with `style.wireLayer: 'behind'`
+   * is drawn *before* the wires precisely so the cables read across its face —
+   * and the thing drawn on top is the thing the user is pointing at. Leaving
+   * hit-testing on the old block-first order made the cable the one part of the
+   * picture that could not be clicked, which is worse than not being able to see
+   * it: it looks like the wire is there and the app is ignoring you.
+   *
+   * Ports are deliberately still tested first (they are ~5 px targets, and you
+   * must be able to drag a new wire out of a panel that has cables crossing it).
+   * Everything else on a `behind` block loses to the wire, including its
+   * widgets — a knob that a cable is drawn over is a knob the cable is in front
+   * of, and one rule you can see beats two you have to remember.
+   */
+  private wireBeatsBlock(b: Block | null | undefined, wh: unknown): boolean {
+    return !!wh && b?.style.wireLayer === 'behind';
+  }
+
   private pt(e: MouseEvent): Vec2 {
     const r = this.renderer.canvas.getBoundingClientRect();
     return this.renderer.toCanvas({ x: e.clientX - r.left, y: e.clientY - r.top });
@@ -297,7 +354,14 @@ export class Editor {
   private tangibleItemAt(b: Block, p: Vec2): FaceItem | null {
     const item = faceItemAt(b, doc.scene.theme, p);
     if (!item) return null;
-    if (this.overlay.mode !== 'edit' && (item.alpha ?? 1) <= 0) return null;
+    if (this.overlay.mode === 'edit') return item;
+    if ((item.alpha ?? 1) <= 0) return null;
+    // Silkscreen (`FaceText.decor`) is printed on the panel, not placed on it:
+    // it never takes a click in patch mode. A section box is the size of half
+    // the panel, so without this every drag inside one grabs the box instead of
+    // the block and every double-click offers to edit its (empty) text instead
+    // of opening the custom block.
+    if (item.ref.startsWith('text:') && b.texts?.[item.ref.slice(5)]?.decor) return null;
     return item;
   }
 
@@ -478,7 +542,18 @@ export class Editor {
       return;
     }
     // Multi In's Channels knob sets the bus width, and width is topology.
-    if (target.type === 'multi-in' && spec.id === 'channels') {
+    // Same for a VST's Channels — it resizes both main buses and forces the
+    // kernel to renegotiate the arrangement with the plugin.
+    // A Matrix's Ins/Outs are a port COUNT, which is topology just as much as
+    // a width is — same handling, same place.
+    // Channel Split / Merge: Count is a port count and Unit (Channels/Pairs)
+    // changes the wide port's width — both topology, same handling.
+    if (
+      (target.type === 'multi-in' && spec.id === 'channels') ||
+      (target.type === 'vst' && spec.id === 'chans') ||
+      (target.type === 'matrix' && (spec.id === 'ins' || spec.id === 'outs')) ||
+      ((target.type === 'chan-split' || target.type === 'chan-merge') && (spec.id === 'count' || spec.id === 'mode'))
+    ) {
       if (doc.syncRigPorts()) doc.touch('structure');
       else doc.touch('param');
       return;
@@ -606,47 +681,30 @@ export class Editor {
     }
   }
 
-  // ---------- gesture (two-finger pinch + pan) ----------
-  /** Re-baseline the pinch from whatever pointers are currently down. */
-  private beginGesture(): void {
-    const pts = [...this.pointers.values()];
-    if (pts.length < 2) return;
+  // ---------- gesture (two-finger pan, then pinch) ----------
+  /** Canvas-local point for a pointer event — the gesture works in this space. */
+  private localPt(e: PointerEvent): Vec2 {
     const r = this.renderer.canvas.getBoundingClientRect();
-    const [a, b] = pts;
-    const mid = { x: (a.x + b.x) / 2 - r.left, y: (a.y + b.y) / 2 - r.top };
-    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
-    // Re-baseline (a finger added/removed mid-gesture) keeps the tap bookkeeping.
-    if (this.gesture) {
-      this.gesture.prevMid = mid;
-      this.gesture.prevDist = dist;
-    } else {
-      this.gesture = { prevMid: mid, prevDist: dist, startMid: mid, startDist: dist, startTime: performance.now(), moved: false };
-    }
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
   }
 
   /**
-   * Apply one frame of the pinch: zoom by the finger-distance ratio and pan by
-   * the midpoint travel, both anchored so the world point under the previous
-   * midpoint stays under the new one (Figma-style pinch — no drift).
+   * Apply one frame of the two-finger gesture.
+   *
+   * Pan is the midpoint travel and is always live; zoom is the finger-distance
+   * ratio and is exactly 1 until the pinch clears the deadzone (`input.ts`).
+   * Both are anchored so the world point under the previous midpoint stays
+   * under the new one — Figma-style, no drift.
    */
   private applyGesture(): void {
-    if (!this.gesture) return;
-    const pts = [...this.pointers.values()];
-    if (pts.length < 2) return;
-    const r = this.renderer.canvas.getBoundingClientRect();
-    const [a, b] = pts;
-    const mid = { x: (a.x + b.x) / 2 - r.left, y: (a.y + b.y) / 2 - r.top };
-    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    const f = this.gesture.frame();
+    if (!f) return;
     const v = this.renderer.view;
-    const worldAtPrevMid = this.renderer.toCanvas(this.gesture.prevMid);
-    v.scale = Math.max(0.15, Math.min(4, v.scale * (dist / this.gesture.prevDist)));
-    v.x = worldAtPrevMid.x - mid.x / v.scale;
-    v.y = worldAtPrevMid.y - mid.y / v.scale;
-    this.gesture.prevMid = mid;
-    this.gesture.prevDist = dist;
-    // Once the fingers have travelled or spread, it's a pan/zoom, not a tap.
-    if (Math.hypot(mid.x - this.gesture.startMid.x, mid.y - this.gesture.startMid.y) > 12 || Math.abs(dist - this.gesture.startDist) > 18)
-      this.gesture.moved = true;
+    const prevMid = { x: f.mid.x - f.dx, y: f.mid.y - f.dy };
+    const worldAtPrevMid = this.renderer.toCanvas(prevMid);
+    v.scale = Math.max(0.15, Math.min(4, v.scale * f.zoom));
+    v.x = worldAtPrevMid.x - f.mid.x / v.scale;
+    v.y = worldAtPrevMid.y - f.mid.y / v.scale;
     this.renderer.invalidate();
   }
 
@@ -685,9 +743,9 @@ export class Editor {
         if (b) b.pos = { ...orig };
       }
     } else if (d.kind === 'keys') {
-      const set = pressedKeys.get(d.block.id);
+      const set = pressedKeys.get(d.target.id);
       if (set) {
-        for (const n of set) runtime.sendParam(runtime.nodeId(d.block.id), 'noteoff', n - d.octave * 12);
+        for (const n of set) runtime.sendParam(d.nodeId, 'noteoff', n - d.octave * 12);
         set.clear();
       }
     } else if (d.kind === 'widget' && d.spec.widget === 'button' && d.pushed) {
@@ -708,7 +766,7 @@ export class Editor {
    * then getting a menu is the same bug one frame later.
    */
   private dragIsLive(): boolean {
-    if (this.drag.kind !== 'none' || this.gesture) return true;
+    if (this.drag.kind !== 'none' || this.gesture.active) return true;
     return performance.now() - this.dragEndedAt < 250;
   }
 
@@ -721,9 +779,8 @@ export class Editor {
   }
 
   private pointerCancel(e: PointerEvent): void {
-    this.pointers.delete(e.pointerId);
+    this.gesture.remove(e.pointerId);
     this.clearLongPress();
-    if (this.gesture && this.pointers.size < 2) this.gesture = null;
   }
 
   // ---------- pointer down ----------
@@ -735,20 +792,15 @@ export class Editor {
     // `pointerDown` before any hit test ran, so the press did nothing at all.
     // Every other canvas in the app already wraps this (clipview, widgetdock,
     // rigview); this one was the outlier.
-    try {
-      this.renderer.canvas.setPointerCapture(e.pointerId);
-    } catch {
-      /* the drag still tracks through the window-level move/up events */
-    }
-    this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    capture(this.renderer.canvas, e.pointerId);
+    this.gesture.add(e.pointerId, this.localPt(e));
     const p = this.pt(e);
 
-    // Two fingers down → pinch/pan gesture. Abort whatever the first finger had
+    // Two fingers down → pan/pinch gesture. Abort whatever the first finger had
     // started (a stray block drag or marquee) and switch to the gesture.
-    if (this.pointers.size >= 2) {
+    if (this.gesture.count >= 2) {
       this.clearLongPress();
       this.abortDrag();
-      this.beginGesture();
       return;
     }
 
@@ -779,7 +831,7 @@ export class Editor {
         }
         // The menu now owns this press; drop it so a missed pointerup can't
         // leave a phantom finger that fakes a two-finger gesture next time.
-        this.pointers.delete(e.pointerId);
+        this.gesture.remove(e.pointerId);
         this.contextMenu(e);
       }, 500);
     }
@@ -800,7 +852,7 @@ export class Editor {
     // fine for a cursor, hopeless for a fingertip that also covers what it is
     // aiming at. Every grab radius below this point widens for touch/pen, and
     // is unchanged for mouse.
-    const grab = e.pointerType === 'mouse' ? 1 : 2.6;
+    const grab = grabSlop(1, e);
 
     // 1. Ports: grab existing wire end (single-link unbind) or start a new wire.
     const ph = portAt(doc.graph, p, (theme.portRadius + 6) * grab);
@@ -824,9 +876,11 @@ export class Editor {
       return;
     }
 
-    // 2. Blocks: widgets, resize handle, then body.
+    // 2. Blocks: widgets, resize handle, then body — unless a wire is painted
+    //    in front of this one, in which case the wire is what was clicked.
+    const wh = this.renderer.paths.hit(p, this.wireTol(theme, grab));
     const b = blockAt(doc.graph, p);
-    if (b) {
+    if (b && !this.wireBeatsBlock(b, wh)) {
       const item = this.tangibleItemAt(b, p);
       if (item && item.ref !== 'title') {
         if (this.widgetDown(b, item, p, e.shiftKey)) return;
@@ -849,7 +903,6 @@ export class Editor {
     }
 
     // 3. Wires: endpoint grab / branch root / branch spawn / select.
-    const wh = this.renderer.paths.hit(p, (WIRE_HIT_TOL / this.renderer.view.scale + theme.wireWidth) * grab);
     if (wh) {
       const wire = doc.wire(wh.wireId)!;
       const path = this.renderer.paths.get(wh.wireId)!;
@@ -981,6 +1034,32 @@ export class Editor {
       doc.touch('param');
       return true;
     }
+    // Matrix router: click a crosspoint to open or close it. Shift-click sets
+    // it to half open, which is the one gain worth reaching without the deep
+    // editor. The grid IS the block's control — a router you can only rewrite
+    // from the Advanced tab is a router nobody rewires — so this is a click,
+    // like the speaker meters above: miss a cell and the block still drags by
+    // its own face. Finer gains, painting and per-cell percentages live in
+    // `advmatrix.ts`; the geometry is shared, so the two agree on every cell.
+    if (item.ref === 'visual' && getDef(b.type).visual === 'matrix') {
+      const o = contentOrigin(b, theme);
+      const ins = matrixPorts(b.params.ins, 4);
+      const outs = matrixPorts(b.params.outs, 4);
+      const gm = matrixGeom(matrixFaceRect({ x: o.x + item.x, y: o.y + item.y, w: item.w, h: item.h }), ins, outs);
+      const cell = matrixCellAt(gm, p.x, p.y);
+      if (!cell) return false;
+      doc.pushHistory();
+      const grid = parseMatrix(b.params.grid, ins, outs);
+      const k = crossIndex(ins, cell.i, cell.o);
+      grid[k] = shift ? (grid[k] > 0.49 && grid[k] < 0.51 ? 0 : 0.5) : grid[k] > 0.001 ? 0 : 1;
+      const next = serializeMatrix(grid, ins, outs);
+      b.params.grid = next;
+      runtime.sendParam(runtime.nodeId(b.id), 'grid', next);
+      doc.touch('param');
+      this.overlay.hotWidget = { blockId: b.id, ref: item.ref };
+      this.drag = { kind: 'none' };
+      return true;
+    }
     let spec: ParamSpec | undefined;
     let child: Block | null = null;
     if (item.ref.startsWith('param:')) spec = paramSpec(b, item.ref.slice(6));
@@ -998,7 +1077,6 @@ export class Editor {
     // Hot-swapped controls: drag as whatever widget the override renders.
     if (SWAPPABLE_WIDGETS.has(spec.widget))
       spec = { ...spec, widget: controlOf(b, item.ref, spec).kind };
-    if (spec.widget === 'keys' && child) return false; // keys don't mirror to parents
     const target = child ?? b;
     const o = contentOrigin(b, theme);
     const rect = { x: o.x + item.x, y: o.y + item.y, w: item.w, h: item.h };
@@ -1061,17 +1139,22 @@ export class Editor {
       return true;
     }
     if (spec.widget === 'keys') {
-      const octave = Number(b.params.octave ?? 4);
-      const note = keyAt(rect, octave, p.x, p.y);
-      const set = pressedKeys.get(b.id) ?? new Set<number>();
-      pressedKeys.set(b.id, set);
+      // Everything here reads `target`, not `b`: a keyboard exposed on a custom
+      // block's face is played through the child's node and highlights the
+      // child's held notes, exactly as the same widget does in the Dock.
+      const octave = Number(target.params.octave ?? 4);
+      const variant = b.controls?.[item.ref]?.variant;
+      const nodeId = child ? runtime.nodeId(b.id, child.id) : runtime.nodeId(b.id);
+      const note = keyAt(rect, octave, p.x, p.y, variant);
+      const set = pressedKeys.get(target.id) ?? new Set<number>();
+      pressedKeys.set(target.id, set);
       if (note != null) {
         set.add(note);
         // Octave-relative: the engine applies the (CV-modulatable) octave and
         // does the held-note bookkeeping. pressedKeys stays absolute (painting).
-        runtime.sendParam(runtime.nodeId(b.id), 'noteon', note - octave * 12);
+        runtime.sendParam(nodeId, 'noteon', note - octave * 12);
       }
-      this.drag = { kind: 'keys', block: b, rect, octave, note };
+      this.drag = { kind: 'keys', block: b, target, nodeId, rect, octave, variant, note };
       return true;
     }
     if (spec.widget === 'wavedraw') {
@@ -1509,11 +1592,11 @@ export class Editor {
 
   // ---------- pointer move ----------
   private pointerMove(e: PointerEvent): void {
-    if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    this.gesture.update(e.pointerId, this.localPt(e));
     // A moving finger is a pan/drag, not a long-press.
-    if (this.longPressAt && Math.hypot(e.clientX - this.longPressAt.x, e.clientY - this.longPressAt.y) > 10)
+    if (this.longPressAt && Math.hypot(e.clientX - this.longPressAt.x, e.clientY - this.longPressAt.y) > LONGPRESS_SLOP)
       this.clearLongPress();
-    if (this.gesture) {
+    if (this.gesture.active) {
       this.applyGesture();
       return;
     }
@@ -1530,8 +1613,13 @@ export class Editor {
       // Hover feedback only.
       const ph = portAt(doc.graph, p, theme.portRadius + 6);
       this.overlay.hoverPort = ph ? { blockId: ph.block.id, portId: ph.port.id } : null;
-      if (!ph && this.overlay.mode === 'patch' && !blockAt(doc.graph, p)) {
-        const wh = this.renderer.paths.hit(p, WIRE_HIT_TOL / this.renderer.view.scale + theme.wireWidth);
+      const hoverBlock = blockAt(doc.graph, p);
+      // The branch dot and the `copy` cursor have to appear over a block the
+      // wire is drawn in front of, or the press that follows would branch a
+      // wire the pointer never said it was on.
+      const overWire = this.renderer.paths.hit(p, this.wireTol(theme));
+      if (!ph && this.overlay.mode === 'patch' && (!hoverBlock || this.wireBeatsBlock(hoverBlock, overWire))) {
+        const wh = overWire;
         if (wh) {
           const path = this.renderer.paths.get(wh.wireId)!;
           const arc = wh.t * path.length;
@@ -1552,7 +1640,7 @@ export class Editor {
           ? 'crosshair'
           : this.overlay.hoverWire
             ? 'copy'
-            : blockAt(doc.graph, p)
+            : hoverBlock && !this.wireBeatsBlock(hoverBlock, overWire)
               ? 'move'
               : 'default';
       this.renderer.canvas.style.cursor = this.spaceDown ? 'grab' : cursor;
@@ -1660,16 +1748,16 @@ export class Editor {
     }
 
     if (d.kind === 'keys') {
-      const note = keyAt(d.rect, d.octave, p.x, p.y);
+      const note = keyAt(d.rect, d.octave, p.x, p.y, d.variant);
       if (note !== d.note) {
-        const set = pressedKeys.get(d.block.id)!;
+        const set = pressedKeys.get(d.target.id)!;
         if (d.note != null) {
           set.delete(d.note);
-          runtime.sendParam(runtime.nodeId(d.block.id), 'noteoff', d.note - d.octave * 12);
+          runtime.sendParam(d.nodeId, 'noteoff', d.note - d.octave * 12);
         }
         if (note != null) {
           set.add(note);
-          runtime.sendParam(runtime.nodeId(d.block.id), 'noteon', note - d.octave * 12);
+          runtime.sendParam(d.nodeId, 'noteon', note - d.octave * 12);
         }
         d.note = note;
         this.renderer.invalidate();
@@ -1807,27 +1895,26 @@ export class Editor {
 
   // ---------- pointer up ----------
   private pointerUp(e: PointerEvent): void {
-    this.pointers.delete(e.pointerId);
     this.clearLongPress();
-    if (this.drag.kind !== 'none' || this.gesture) this.dragEndedAt = performance.now();
-    // Finishing (or dropping below two fingers on) a gesture: don't fall through
-    // to the single-pointer release logic.
-    if (this.gesture) {
-      if (this.pointers.size >= 2) {
-        this.beginGesture();
-      } else {
-        const g = this.gesture;
-        this.gesture = null;
-        // A quick, still two-finger press = tap → context menu (works over
-        // widgets, where long-press is deliberately disabled).
-        if (!g.moved && performance.now() - g.startTime < 350) {
-          const r = this.renderer.canvas.getBoundingClientRect();
-          this.openCtxAt(g.startMid.x + r.left, g.startMid.y + r.top);
-        }
+    const wasGesture = this.gesture.active;
+    if (this.drag.kind !== 'none' || wasGesture) this.dragEndedAt = performance.now();
+    if (wasGesture) {
+      // A quick, still two-finger press = tap → context menu. This is touch's
+      // only right-click over a live widget, where long-press is deliberately
+      // disabled so holding a note button plays the note.
+      const tap = this.gesture.isTap();
+      const mid = this.gesture.startMid;
+      // Ends the gesture only when this was the second-to-last finger; going
+      // 3 → 2 re-baselines inside `remove` instead of jumping the view.
+      const ended = this.gesture.remove(e.pointerId);
+      if (ended && tap) {
+        const r = this.renderer.canvas.getBoundingClientRect();
+        this.openCtxAt(mid.x + r.left, mid.y + r.top);
       }
       this.drag = { kind: 'none' };
       return;
     }
+    this.gesture.remove(e.pointerId);
     // The long-press already opened a menu and aborted the drag — swallow the up.
     if (this.longPressFired) {
       this.longPressFired = false;
@@ -1847,9 +1934,9 @@ export class Editor {
 
     if (d.kind === 'keys') {
       // Release every note held by this keyboard (octave-relative, like press).
-      const set = pressedKeys.get(d.block.id);
+      const set = pressedKeys.get(d.target.id);
       if (set) {
-        for (const n of set) runtime.sendParam(runtime.nodeId(d.block.id), 'noteoff', n - d.octave * 12);
+        for (const n of set) runtime.sendParam(d.nodeId, 'noteoff', n - d.octave * 12);
         set.clear();
       }
       this.renderer.invalidate();
@@ -2100,51 +2187,41 @@ export class Editor {
 
   // ---------- wheel ----------
   /**
-   * A wheel event is a trackpad two-finger *scroll* (→ pan) rather than a mouse
-   * wheel (→ zoom) when it carries a horizontal component or fine/fractional
-   * pixel deltas. The hint is made sticky for a moment so mid-gesture frames
-   * that happen to land on a round number don't flip back to zoom.
+   * The workspace is a 1D (uniform) zoom surface, so it takes the standard
+   * mapping straight from `wheelIntent`: trackpad scroll pans, Ctrl/Shift
+   * scale, and a real mouse wheel keeps zooming because a wheel has no second
+   * axis to spare. `theme.wheelZoom` ("classic wheel") forces zoom for hi-res
+   * mice that the trackpad heuristic reads as a trackpad — see docs/14-input.md.
    */
-  private isTrackpadPan(e: WheelEvent): boolean {
-    const now = performance.now();
-    const fine = e.deltaMode === 0 && (e.deltaX !== 0 || !Number.isInteger(e.deltaY) || Math.abs(e.deltaY) < 40);
-    if (fine) this.trackpadUntil = now + 400;
-    return now < this.trackpadUntil;
-  }
-
   private wheel(e: WheelEvent): void {
     e.preventDefault();
     const r = this.renderer.canvas.getBoundingClientRect();
     const local = { x: e.clientX - r.left, y: e.clientY - r.top };
     const v = this.renderer.view;
-    // Pinch (trackpad sends ctrlKey) or Ctrl/⌘+wheel → zoom about the cursor.
-    // Trackpad two-finger scroll → pan. Plain mouse wheel keeps zooming.
-    // Classic mode: the wheel always zooms at the cursor (no trackpad-pan
-    // heuristic). For hi-res mouse wheels whose fine deltas otherwise pan.
-    const trackpad = !doc.scene.theme.wheelZoom && this.isTrackpadPan(e);
-    const zoom = doc.scene.theme.wheelZoom || e.ctrlKey || e.metaKey || (!trackpad && e.deltaX === 0);
-    if (zoom) {
+    const it = wheelIntent(e, { forceZoom: !!doc.scene.theme.wheelZoom });
+    if (it.kind === 'zoom') {
       const before = this.renderer.toCanvas(local);
-      const factor = Math.pow(1.0015, -e.deltaY);
-      v.scale = Math.max(0.15, Math.min(4, v.scale * factor));
+      v.scale = Math.max(0.15, Math.min(4, v.scale * it.factor));
       // Keep the point under the cursor fixed.
       v.x = before.x - local.x / v.scale;
       v.y = before.y - local.y / v.scale;
     } else {
-      // Shift+wheel on a mouse scrolls horizontally, matching browser convention.
-      const dx = e.shiftKey && e.deltaX === 0 ? e.deltaY : e.deltaX;
-      const dy = e.shiftKey && e.deltaX === 0 ? 0 : e.deltaY;
-      v.x += dx / v.scale;
-      v.y += dy / v.scale;
+      v.x += it.dx / v.scale;
+      v.y += it.dy / v.scale;
     }
+    this.renderer.invalidate();
   }
 
   // ---------- context menu ----------
   private contextMenu(e: MouseEvent): void {
     const p = this.pt(e);
     const theme = doc.scene.theme;
+    // Same rule as the press: a wire painted in front of a block is what the
+    // menu is about. A right-click that offered the block's menu where a left
+    // click selects the wire would be two answers to one question.
+    const wh = this.renderer.paths.hit(p, this.wireTol(theme));
     const b = blockAt(doc.graph, p);
-    if (b) {
+    if (b && !this.wireBeatsBlock(b, wh)) {
       if (!b.selected) {
         doc.clearSelection();
         b.selected = true;
@@ -2292,6 +2369,13 @@ export class Editor {
             action: () => patchCs({ showValue: cs.showValue === false ? undefined : false }),
           },
         ];
+        // Only offered where there is one to hide — a dead toggle on the 60-odd
+        // controls with no panel mark is worse than not having it.
+        if (w!.spec.mark)
+          out.push({
+            label: (cs.showMark === false ? '○ ' : '● ') + 'Show panel symbol',
+            action: () => patchCs({ showMark: cs.showMark === false ? undefined : false }),
+          });
         if (w!.spec.widget === 'toggle' || w!.spec.widget === 'button') {
           out.push({
             label: 'Caption when on…',
@@ -2680,6 +2764,18 @@ export class Editor {
             doc.touch('structure');
           },
         });
+        // Paint order against the wires. Here as well as in Properties because
+        // it is a per-block answer to "I can't see the cable that crosses this
+        // panel", which is a thought you have with the block already under the
+        // cursor. The width override stays in Properties — it wants a number.
+        items.push({
+          label: b.style.wireLayer === 'behind' ? 'Draw block in front of wires' : 'Draw block behind wires',
+          action: () => {
+            doc.pushHistory();
+            b.style.wireLayer = b.style.wireLayer === 'behind' ? undefined : 'behind';
+            doc.touch('theme');
+          },
+        });
         if (inSub && (def.isControl || def.visual))
           items.push({
             label: exposed ? 'Hide from parent block' : 'Show on parent block',
@@ -2697,8 +2793,11 @@ export class Editor {
             },
           });
         // Save overwrites the library entry this block came from; Save As
-        // always branches a new one.
-        if (def.isSubgraph && savedAs) {
+        // always branches a new one. A **factory preset is never overwritten** —
+        // it isn't in the user's storage, so the entry would silently come back
+        // on the next launch and the edit would be lost. Take one apart freely;
+        // keeping it means giving it a name of your own.
+        if (def.isSubgraph && savedAs && !isFactoryBlock(savedAs.key)) {
           items.push({ sep: true });
           items.push({
             label: `Save Custom Block "${savedAs.title}"`,
@@ -2751,7 +2850,6 @@ export class Editor {
       ]));
       return;
     }
-    const wh = this.renderer.paths.hit(p, WIRE_HIT_TOL / this.renderer.view.scale + theme.wireWidth);
     if (wh) {
       const w = doc.wire(wh.wireId)!;
       if (!w.selected) {

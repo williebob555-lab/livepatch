@@ -97,8 +97,31 @@ export const EQ_FMIN = 20;
 export const EQ_FMAX = 20000;
 /** Vertical plot range: ±24 dB. */
 export const EQ_GMAX = 24;
-/** Nominal sample rate for drawing the response (display only). */
-const EQ_FS = 48000;
+/**
+ * Sample rate used to draw the EQ response.
+ *
+ * **This tracks the running engine and is not a display detail.** A biquad's
+ * response is a function of `f/fs`, so drawing at 48 kHz while the audio runs
+ * at 96 kHz does not shift the curve uniformly — it misplaces exactly the part
+ * of the band where the bilinear transform's warping bites. A 16 kHz bell drawn
+ * at 48 kHz sits at 2/3 of Nyquist, where warping is severe; at 96 kHz the same
+ * bell is at 1/3 of Nyquist and is materially narrower and better centred than
+ * the picture claims. The docs' rule is that the drawn curve *is* the audio
+ * (docs/07-ui.md, EQ), and a fixed 48 000 quietly broke that for every user who
+ * changed sample rate.
+ *
+ * Set from whichever engine is live — `setEqDisplayRate` — and defaulted to
+ * 48 kHz only until one reports in.
+ */
+let EQ_FS = 48000;
+/** Point the EQ drawing model at the engine's real rate. Ignores nonsense so a
+ *  half-initialised status message can't blank every curve in the app. */
+export function setEqDisplayRate(sr: number | undefined): void {
+  if (typeof sr === 'number' && Number.isFinite(sr) && sr >= 8000 && sr <= 768000) EQ_FS = sr;
+}
+/** The rate the curves are currently being drawn at. Exposed so a view can say
+ *  so (and so a test can assert the plumbing actually reaches here). */
+export const eqDisplayRate = (): number => EQ_FS;
 
 export type EqType = 'bell' | 'lowshelf' | 'highshelf' | 'highpass' | 'lowpass' | 'notch' | 'bandpass' | 'allpass';
 export const EQ_TYPES: EqType[] = ['bell', 'lowshelf', 'highshelf', 'highpass', 'lowpass', 'notch', 'bandpass', 'allpass'];
@@ -306,18 +329,54 @@ export interface KeyLayout {
   blacks: KeyRect[];
   whiteH: number;
   blackH: number;
+  /**
+   * Top of each row. Identical on a piano, where the black keys overlay the
+   * white ones; separated in 'pad' mode, where the two rows are apart.
+   */
+  whiteY: number;
+  blackY: number;
+  /** 'pad': rounded buttons, one octave, no overlap. */
+  pads: boolean;
 }
 /** Notes currently held per keyboard-block id (transient; drives highlight). */
 export const pressedKeys = new Map<string, Set<number>>();
 
-export function keyLayout(r: Rect, octave: number): KeyLayout {
-  const whiteW = 15;
-  const n = Math.max(3, Math.floor(r.w / whiteW));
-  const ww = r.w / n;
+/**
+ * Key rectangles for a keyboard widget. **The painter and every hit-test go
+ * through this one function** — a second copy of the geometry is how a key
+ * lights up while its neighbour sounds.
+ *
+ * `variant` is the face item's `ControlStyle.variant`:
+ *   - default: a piano, as many ~15 px white keys as the box holds.
+ *   - 'pad': **one octave** of rounded buttons in two rows — the layout small
+ *     semi-modulars print instead of keys (the Moog Mavis's 13 buttons). The
+ *     count is fixed rather than derived from the width because these are
+ *     buttons, not keys: they are spaced across whatever room the panel gives
+ *     them, and a wide panel is meant to produce big buttons, not more of them.
+ */
+export function keyLayout(r: Rect, octave: number, variant?: string): KeyLayout {
   const whitePattern = [0, 2, 4, 5, 7, 9, 11];
   const base = 12 * (octave + 1); // MIDI: octave 4 → 60 (C4)
   const whites: KeyRect[] = [];
   const blacks: KeyRect[] = [];
+  if (variant === 'pad') {
+    // Eight buttons C…C on the bottom row, five on the top, each sitting in
+    // the gap between its neighbours exactly as the black keys do.
+    const n = 8;
+    const cell = r.w / n;
+    const pw = Math.min(cell * 0.66, r.h * 0.62);
+    const rowH = Math.min(r.h * 0.42, pw * 0.78);
+    for (let i = 0; i < n; i++) {
+      const idx = i % 7;
+      const note = base + Math.floor(i / 7) * 12 + whitePattern[idx];
+      whites.push({ note, x: r.x + i * cell + (cell - pw) / 2, w: pw });
+      if (i < n - 1 && idx !== 2 && idx !== 6) blacks.push({ note: note + 1, x: r.x + (i + 1) * cell - pw / 2, w: pw });
+    }
+    return { whites, blacks, whiteH: rowH, blackH: rowH, whiteY: r.y + r.h - rowH, blackY: r.y, pads: true };
+  }
+  const whiteW = 15;
+  const n = Math.max(3, Math.floor(r.w / whiteW));
+  const ww = r.w / n;
   for (let i = 0; i < n; i++) {
     const oct = Math.floor(i / 7);
     const idx = i % 7;
@@ -327,17 +386,17 @@ export function keyLayout(r: Rect, octave: number): KeyLayout {
       blacks.push({ note: note + 1, x: r.x + i * ww + ww * 0.62, w: ww * 0.72 });
     }
   }
-  return { whites, blacks, whiteH: r.h, blackH: r.h * 0.6 };
+  return { whites, blacks, whiteH: r.h, blackH: r.h * 0.6, whiteY: r.y, blackY: r.y, pads: false };
 }
 
 /** Note under a point, black keys taking precedence (they overlay). */
-export function keyAt(r: Rect, octave: number, px: number, py: number): number | null {
-  const lay = keyLayout(r, octave);
+export function keyAt(r: Rect, octave: number, px: number, py: number, variant?: string): number | null {
+  const lay = keyLayout(r, octave, variant);
   for (const k of lay.blacks) {
-    if (px >= k.x && px <= k.x + k.w && py >= r.y && py <= r.y + lay.blackH) return k.note;
+    if (px >= k.x && px <= k.x + k.w && py >= lay.blackY && py <= lay.blackY + lay.blackH) return k.note;
   }
   for (const k of lay.whites) {
-    if (px >= k.x && px <= k.x + k.w && py >= r.y && py <= r.y + lay.whiteH) return k.note;
+    if (px >= k.x && px <= k.x + k.w && py >= lay.whiteY && py <= lay.whiteY + lay.whiteH) return k.note;
   }
   return null;
 }
@@ -348,9 +407,28 @@ export function drawKeys(
   theme: Theme,
   octave: number,
   pressed: Set<number> | undefined,
+  variant?: string,
 ): void {
-  const lay = keyLayout(r, octave);
+  const lay = keyLayout(r, octave, variant);
   const accent = theme.selectionColor;
+  if (lay.pads) {
+    // Panel buttons: unlit they are the panel's own dark rubber, lit they take
+    // the accent, so a pressed note reads from across the room.
+    for (const row of [lay.blacks, lay.whites]) {
+      const y = row === lay.blacks ? lay.blackY : lay.whiteY;
+      const h = row === lay.blacks ? lay.blackH : lay.whiteH;
+      for (const k of row) {
+        g.beginPath();
+        (g as any).roundRect(k.x, y, k.w, h, Math.min(6, h * 0.28));
+        g.fillStyle = pressed?.has(k.note) ? accent : '#1b1d22';
+        g.fill();
+        g.strokeStyle = pressed?.has(k.note) ? accent : '#5c5f68';
+        g.lineWidth = 1;
+        g.stroke();
+      }
+    }
+    return;
+  }
   for (const k of lay.whites) {
     g.fillStyle = pressed?.has(k.note) ? accent : '#e8ebf0';
     g.fillRect(k.x + 0.5, r.y, k.w - 1, lay.whiteH);
@@ -1105,4 +1183,70 @@ export function paintWidget(
   const val = fmtVal(spec, value);
   const shown = showLabel ? `${label}: ${val}` : val;
   g.fillText(shown.slice(0, 22), r.x + 6, r.y + r.h / 2);
+}
+
+// ---------------------------------------------------------------------------
+// Matrix router grid geometry.
+//
+// Shared by the block face (`render.ts` `drawMatrixFace`), the face's own
+// click-to-toggle (`editor.ts`) and the Advanced-tab editor (`ui/advmatrix.ts`)
+// so a cell is in the same place on all three — the moment two painters derive
+// the same grid independently they start disagreeing about where the gutters
+// go, and every one of those surfaces hit-tests against exactly this.
+// ---------------------------------------------------------------------------
+
+export interface MatrixGeom {
+  /** Top-left of the crosspoint area (inside the labels). */
+  x: number;
+  y: number;
+  /** Cell pitch, including the 1 px seam. */
+  cw: number;
+  ch: number;
+  ins: number;
+  outs: number;
+}
+
+/**
+ * Lay a `ins × outs` grid into `r`, leaving `pad` px of gutter on the top and
+ * left for the labels. Cells are square when the box allows it — a matrix is
+ * read as a picture, and stretched cells make a diagonal look like a curve.
+ */
+export function matrixGeom(
+  r: { x: number; y: number; w: number; h: number },
+  ins: number,
+  outs: number,
+  pad = 0,
+): MatrixGeom {
+  const w = Math.max(1, r.w - pad);
+  const h = Math.max(1, r.h - pad);
+  const cell = Math.max(3, Math.min(w / Math.max(1, ins), h / Math.max(1, outs)));
+  return {
+    x: r.x + pad + Math.max(0, (w - cell * ins) / 2),
+    y: r.y + pad + Math.max(0, (h - cell * outs) / 2),
+    cw: cell,
+    ch: cell,
+    ins,
+    outs,
+  };
+}
+
+/**
+ * The grid box inside a matrix block's **face**, i.e. the visual rect minus its
+ * border inset. Both the painter and the face's hit-test go through this: a
+ * hand-copied `r.x + 3` in one of them is a click that lands one cell over
+ * (docs/07-ui.md — one painter, one geometry).
+ */
+export const matrixFaceRect = (r: Rect): Rect => ({ x: r.x + 3, y: r.y + 3, w: r.w - 6, h: r.h - 6 });
+
+/** The cell for crosspoint (input `i` → output `o`). */
+export function matrixCellRect(gm: MatrixGeom, i: number, o: number): { x: number; y: number; w: number; h: number } {
+  return { x: gm.x + i * gm.cw, y: gm.y + o * gm.ch, w: gm.cw, h: gm.ch };
+}
+
+/** The crosspoint under a point, or null. Painting and hit-testing share this
+ *  so a click always lands on the cell the pointer is over. */
+export function matrixCellAt(gm: MatrixGeom, px: number, py: number): { i: number; o: number } | null {
+  const i = Math.floor((px - gm.x) / gm.cw);
+  const o = Math.floor((py - gm.y) / gm.ch);
+  return i >= 0 && i < gm.ins && o >= 0 && o < gm.outs ? { i, o } : null;
 }

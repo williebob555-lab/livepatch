@@ -1,6 +1,6 @@
 # 01 — Architecture Overview
 
-_Last verified: 2026-07-23._
+_Last verified: 2026-07-31._
 
 ## What the app is
 
@@ -100,7 +100,14 @@ src/
     customblocks.ts       user-defined blocks (saved subgraphs)
     cassettes.ts          audio asset store (the tape system) + decode/peaks caches
     rolls.ts              MIDI rolls: note data, the derived `notes` param, MIDI import
-    sampler.ts            sampler slice points: parse/serialize, divide, transient detect
+    sampler.ts            sampler slices: parse/serialize, divide, transient + PITCH
+                            detect, and slice→key resolution (mirrored in the kernel)
+    matrix.ts             Matrix router: the crosspoint grid format + port-count clamp
+                            (MATRIX_MAX is mirrored in the kernel)
+    rig.ts                speaker geometry: presets, vector math, saved rigs, and
+                            when a calibration expires (mirrored in engine/src/rig.ts)
+    calibrate.ts          speaker calibration maths: the sweep, the deconvolution,
+                            mic-cal files, smoothing and the correction curve
     encode/               wav.ts (native) + index.ts (mp3/ogg/flac lazy) for the writer
   engine/
     engine.ts             EngineAdapter interface, LevelFrame, MidiEvent, TapeRef, NativeEngineStub
@@ -126,7 +133,12 @@ src/
     clipview.ts             Dock tab 1 — waveform/roll VIEWER + the block's own controls
     pianoroll.ts            the note editor the Clip tab swaps in for a roll
     widgetdock.ts           Dock tab 2 — mirrored widget field
-    advanced.ts             Dock tab 3 — deep-editor registry (foundation only)
+    advanced.ts             Dock tab 3 — deep-editor registry
+    adveq.ts                  …the EQ Curve editor (the reference implementation)
+    advpath.ts                …the Trajectory editor (waypoints + gesture capture)
+    advmatrix.ts              …the Matrix editor (the crosspoint grid)
+    rigview.ts            Dock tab 4 — the speaker layout (PLAN + DIRECTION)
+    rigcal.ts               …its Calibrate flow: measure, correct, write back
     uiscale.ts            whole-chrome zoom
     menus.ts              context menus + modal dialogs (no window.prompt in Electron)
     geometry.ts           block-shape tracing, wire paths, hit-testing

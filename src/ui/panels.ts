@@ -7,6 +7,8 @@ import { doc } from '../core/graph';
 import { BlockDef, ParamSpec, WidgetKind, allDefs, faceParams, getDef, paramSpec } from '../core/registry';
 import { Block, ControlStyle, Edge, Port, Theme, Vec2, defaultTheme } from '../core/types';
 import { deleteSceneByName, listScenes } from '../core/persist';
+import { factoryScenes } from '../core/factory';
+import { defaultDeviceFor } from '../core/prefs';
 import {
   deleteCustomBlock,
   getCustomBlock,
@@ -76,6 +78,7 @@ import {
   uiScale,
 } from './uiscale';
 import * as shell from './shell';
+import { capture, dragHandle, dragThreshold, isCoarse } from './input';
 
 let ed: Editor;
 /** Properties-panel filter text for the (possibly huge) plugin param list. */
@@ -261,6 +264,8 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
   let active = false;
   let dead = false;
 
+  const threshold = dragThreshold(down);
+
   const cleanup = (): void => {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
@@ -279,7 +284,7 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
     if (!active) {
-      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+      if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) return;
       // Vertical intent → this is a scroll, not a drag. Bow out entirely.
       if (Math.abs(dy) > Math.abs(dx)) {
         dead = true;
@@ -287,11 +292,7 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
         return;
       }
       active = true;
-      try {
-        tile.setPointerCapture(id);
-      } catch {
-        /* capture is best-effort; the window listeners still work */
-      }
+      capture(tile, id);
       ghost = document.createElement('div');
       ghost.className = 'lib-drag-ghost';
       ghost.textContent = entry.title;
@@ -334,7 +335,10 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
  * is still one hop away.
  */
 export function quickAddMenuItems(pos: Vec2): { items: MenuItem[]; source: 'pinned' | 'recent' | 'none' } {
-  const byKey = new Map(paletteEntries().map((e) => [e.key, e]));
+  // First wins: cross-filed copies share a key, and the home listing is the one
+  // whose title/category this menu should quote.
+  const byKey = new Map<string, LibEntry>();
+  for (const e of paletteEntries()) if (!byKey.has(e.key)) byKey.set(e.key, e);
   const mk = (keys: string[]): MenuItem[] =>
     keys
       .map((k) => byKey.get(k))
@@ -408,6 +412,16 @@ function pushRecent(key: string): void {
 type EntryKind = 'builtin' | 'builder' | 'custom' | 'cassette' | 'roll' | 'vstplugin';
 interface LibEntry {
   key: string; // block type, 'custom:...', 'cassette:<id>', or 'vst:<cid>'
+  /**
+   * Identity of this *tile*, as opposed to the block behind it. A cross-filed
+   * block (`BlockDef.alsoIn`) produces several entries sharing one `key` —
+   * everything about placing, pinning and dragging keys off `key`, but the
+   * keyboard cursor and `scrollIntoView` have to be able to tell two tiles
+   * apart or they both jump to the first copy.
+   */
+  uid: string;
+  /** A cross-filed copy: hidden from flat search results (see `alsoIn`). */
+  dup?: boolean;
   title: string;
   category: string;
   group?: string;
@@ -418,6 +432,8 @@ interface LibEntry {
   color?: string; // custom block fill
   meta?: CassetteMeta;
   plugin?: VstPluginRecord;
+  /** Custom entries only: a built-in preset, so it is read-only. */
+  factory?: boolean;
 }
 const BUILDERS = ['subgraph', 'portal-in', 'portal-out'];
 const CAT_ORDER = [
@@ -431,31 +447,55 @@ const ASSET_CATS = new Set(['Cassettes', 'Rolls', 'Plugins']);
 
 function paletteEntries(): LibEntry[] {
   const list: LibEntry[] = [];
-  for (const d of allDefs())
-    list.push({
+  for (const d of allDefs()) {
+    const base = {
       key: d.type,
       title: d.title,
-      category: d.category,
-      group: d.group,
       desc: d.desc,
-      kind: BUILDERS.includes(d.type) ? 'builder' : 'builtin',
+      kind: (BUILDERS.includes(d.type) ? 'builder' : 'builtin') as EntryKind,
       def: d,
       ports: [...d.inputs, ...d.outputs] as unknown as Port[], // kind/role only
-    });
-  for (const r of getCustomBlocks())
-    list.push({
+    };
+    list.push({ ...base, uid: d.type, category: d.category, group: d.group });
+    // Cross-filed copies (`BlockDef.alsoIn`): the same block, a second shelf.
+    for (const also of d.alsoIn ?? [])
+      list.push({
+        ...base,
+        uid: `${d.type}@${also.category}`,
+        dup: true,
+        category: also.category,
+        group: also.group,
+      });
+  }
+  for (const r of getCustomBlocks()) {
+    // A custom block gets to be filed where it belongs — a Mavis is an
+    // instrument, not a piece of structure. Its own category wins when it
+    // names a real one; anything else lands in Structure & Custom, which is
+    // where a block saved from a selection has always gone.
+    const home = CAT_ORDER.includes(r.category) ? r.category : 'Structure & Custom';
+    const base = {
       key: r.key,
       title: r.title,
-      category: 'Structure & Custom',
-      group: 'My Blocks',
+      group: r.factory ? 'Factory' : 'My Blocks',
       desc: r.desc || 'Custom block',
-      kind: 'custom',
+      kind: 'custom' as EntryKind,
       color: r.color,
+      factory: r.factory,
       ports: (r.template?.ports ?? []) as Port[],
-    });
+    };
+    list.push({ ...base, uid: r.key, category: home });
+    // **Every custom block is in the Custom tab, always.** Letting the factory
+    // presets be filed by subject was right — a Mavis belongs beside the
+    // instruments — but it also took them *out* of the one tab whose entire
+    // job is "the blocks that are not built in", so the Custom tab listed the
+    // user's own saves and claimed the shipped ones did not exist.
+    if (home !== 'Structure & Custom')
+      list.push({ ...base, uid: r.key + '@custom', dup: true, category: 'Structure & Custom' });
+  }
   for (const m of cassetteList())
     list.push({
       key: 'cassette:' + m.id,
+      uid: 'cassette:' + m.id,
       title: m.name,
       category: 'Cassettes',
       desc: `${m.name}.${m.ext}${m.durationSec ? ' · ' + fmtDuration(m.durationSec) : ''}`,
@@ -465,6 +505,7 @@ function paletteEntries(): LibEntry[] {
   for (const m of rollList())
     list.push({
       key: 'roll:' + m.id,
+      uid: 'roll:' + m.id,
       title: m.name,
       category: 'Rolls',
       desc: 'MIDI roll',
@@ -475,6 +516,7 @@ function paletteEntries(): LibEntry[] {
   for (const p of vstPluginList())
     list.push({
       key: 'vst:' + p.cid,
+      uid: 'vst:' + p.cid,
       title: p.name,
       category: 'Plugins',
       group: p.vendor || undefined,
@@ -628,7 +670,9 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
   body.tabIndex = 0;
   const thumbW = () => (libDensity === 'list' ? 40 : 96);
   const thumbH = () => (libDensity === 'list' ? 24 : 54);
-  let visibleKeys: string[] = [];
+  /** What is on screen right now, in tab order: the tile identity for the
+   *  keyboard cursor, and the block key Enter should actually place. */
+  let visible: Array<{ uid: string; key: string }> = [];
   let highlight = -1;
 
   // --- header (built once; results re-render in place so search keeps focus) ---
@@ -699,9 +743,11 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
   const setHighlight = (i: number): void => {
     const tiles = results.querySelectorAll<HTMLElement>('.lib-tile');
     tiles.forEach((t) => t.classList.remove('hot'));
-    highlight = i < 0 ? -1 : Math.max(0, Math.min(visibleKeys.length - 1, i));
+    highlight = i < 0 ? -1 : Math.max(0, Math.min(visible.length - 1, i));
     if (highlight >= 0) {
-      const t = results.querySelector<HTMLElement>(`.lib-tile[data-key="${CSS.escape(visibleKeys[highlight])}"]`);
+      // By `uid`, not `key`: a cross-filed block has two tiles with the same
+      // key, and selecting by key would scroll to the first one both times.
+      const t = results.querySelector<HTMLElement>(`.lib-tile[data-uid="${CSS.escape(visible[highlight].uid)}"]`);
       if (t) {
         t.classList.add('hot');
         t.scrollIntoView({ block: 'nearest' });
@@ -715,6 +761,7 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     tile.className = 'lib-tile';
     tile.draggable = true;
     tile.dataset.key = e.key;
+    tile.dataset.uid = e.uid;
     const cv = document.createElement('canvas');
     cv.width = thumbW();
     cv.height = thumbH();
@@ -737,8 +784,11 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     });
     tile.appendChild(star);
 
-    // Delete (custom / cassette / roll only).
-    if (e.kind === 'custom' || e.kind === 'cassette' || e.kind === 'roll') {
+    // Delete (custom / cassette / roll only) — but never on a factory preset:
+    // it isn't in the user's storage, so the tile would vanish and be back on
+    // the next launch. A button that lies about what it did is worse than no
+    // button.
+    if (!e.factory && (e.kind === 'custom' || e.kind === 'cassette' || e.kind === 'roll')) {
       const del = document.createElement('button');
       del.className = 'lib-del';
       del.textContent = '✕';
@@ -768,7 +818,7 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     // onto the canvas. Mouse pointers are left to the native DnD path above,
     // which already works and carries the OS drag cursor.
     tile.addEventListener('pointerdown', (ev) => {
-      if (ev.pointerType === 'mouse' || ev.button !== 0) return;
+      if (!isCoarse(ev) || ev.button !== 0) return;
       beginTouchDrag(e, tile, ev);
     });
     tile.addEventListener('dblclick', () => addAtCenter(e.key));
@@ -785,7 +835,7 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     const grid = document.createElement('div');
     grid.className = 'lib-grid' + (libDensity === 'list' ? ' list' : '');
     for (const e of list) {
-      visibleKeys.push(e.key);
+      visible.push({ uid: e.uid, key: e.key });
       grid.appendChild(makeTile(e));
     }
     parent.appendChild(grid);
@@ -918,21 +968,41 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     }
 
     if (cat === 'Structure & Custom') {
+      // Builders first (they are what the tab is *for*), then any other
+      // built-in filed here, then the user's saved blocks.
+      //
+      // This used to render `BUILDERS` and the customs and **nothing else**, so
+      // every other block in the category was reachable only by searching for
+      // it by name — which is no way to find a block you don't know exists.
+      // It hid Comment from the day it shipped and then Matrix. A tab that
+      // silently drops entries in its own category is a filter, not a layout.
       const builders = BUILDERS.map((t) => list.find((e) => e.key === t)).filter(Boolean) as LibEntry[];
       const customs = list.filter((e) => e.kind === 'custom');
+      const rest = list.filter((e) => e.kind === 'builtin' && !BUILDERS.includes(e.key));
       if (builders.length) addGrid(parent, builders);
-      if (customs.length) {
-        const div = document.createElement('div');
-        div.className = 'lib-divider';
-        parent.appendChild(div);
-        addGrid(parent, customs);
-      } else {
-        addHint(parent, 'Build a Custom Block, add Portals for its I/O, then right-click it → Save as Custom Block.');
+      if (rest.length) {
+        addDivider(parent);
+        addGrouped(parent, rest);
       }
+      addDivider(parent);
+      // Grouped, not a flat grid: factory presets and the user's own blocks are
+      // different things and a subheader is the cheapest way to say so.
+      if (customs.length) addGrouped(parent, customs);
+      else addHint(parent, 'Build a Custom Block, add Portals for its I/O, then right-click it → Save as Custom Block.');
       return;
     }
 
-    // Grouped by subgroup (declaration order), light dividers between.
+    addGrouped(parent, list);
+  };
+
+  const addDivider = (parent: HTMLElement): void => {
+    const div = document.createElement('div');
+    div.className = 'lib-divider';
+    parent.appendChild(div);
+  };
+
+  /** Grouped by subgroup in declaration order, light dividers between. */
+  const addGrouped = (parent: HTMLElement, list: LibEntry[]): void => {
     const groups: string[] = [];
     const byGroup = new Map<string, LibEntry[]>();
     for (const e of list) {
@@ -958,7 +1028,11 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
 
   function renderResults(): void {
     const entries = paletteEntries();
-    const byKey = new Map(entries.map((e) => [e.key, e]));
+    // Canonical entry per block key, FIRST wins — a cross-filed copy must never
+    // become what Recent and Pinned show, or a pinned block would be captioned
+    // and grouped by whichever shelf happened to be built last.
+    const byKey = new Map<string, LibEntry>();
+    for (const e of entries) if (!byKey.has(e.key)) byKey.set(e.key, e);
     // Asset categories always show (their action bars are how you add the first one).
     const cats = ['All', 'Pinned', ...CAT_ORDER.filter((c) => ASSET_CATS.has(c) || entries.some((e) => e.category === c))];
     if (!cats.includes(libCat)) libCat = 'All';
@@ -991,13 +1065,16 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     };
 
     results.innerHTML = '';
-    visibleKeys = [];
+    visible = [];
     const shown = entries.filter(matches);
 
     if (libSearch) {
       if (!shown.length) addHint(results, `No blocks match “${libSearch}”.`);
+      // Search is a flat find, not a browse: listing a cross-filed block once
+      // per shelf turns one query into several identical tiles with nothing on
+      // screen to tell them apart. Only the block's home listing appears.
       for (const cat of CAT_ORDER) {
-        const list = shown.filter((e) => e.category === cat);
+        const list = shown.filter((e) => e.category === cat && !e.dup);
         if (list.length) {
           addHeader(results, cat, list.length);
           addGrid(results, list);
@@ -1022,7 +1099,7 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     } else {
       renderCategory(results, libCat, shown.filter((e) => e.category === libCat));
     }
-    if (highlight >= visibleKeys.length) highlight = -1;
+    if (highlight >= visible.length) highlight = -1;
     // The tiles were just replaced; anything the hover card was anchored to is
     // detached and will never send a `mouseleave`.
     pruneHoverCard();
@@ -1039,12 +1116,16 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
       { label: isPinned(e.key) ? 'Unpin' : 'Pin', action: () => { togglePin(e.key); renderResults(); } },
     ];
     if (e.kind === 'custom') {
-      items.push({ sep: true });
-      items.push({
-        label: 'Rename…',
-        action: () => promptModal('Rename custom block', e.title).then((n) => { if (n) renameCustomBlock(e.key, n); }),
-      });
-      items.push({ label: 'Delete', action: () => deleteCustomBlock(e.key) });
+      // A factory preset offers neither: it is not in the user's storage, so
+      // "Delete" would appear to work and be back on the next launch.
+      if (!e.factory) {
+        items.push({ sep: true });
+        items.push({
+          label: 'Rename…',
+          action: () => promptModal('Rename custom block', e.title).then((n) => { if (n) renameCustomBlock(e.key, n); }),
+        });
+        items.push({ label: 'Delete', action: () => deleteCustomBlock(e.key) });
+      }
     } else if (e.kind === 'cassette' && e.meta) {
       const m = e.meta;
       items.push({ sep: true });
@@ -1076,8 +1157,8 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
       ev.preventDefault();
       setHighlight(0);
       body.focus();
-    } else if (ev.key === 'Enter' && visibleKeys.length) {
-      addAtCenter(visibleKeys[Math.max(0, highlight)]);
+    } else if (ev.key === 'Enter' && visible.length) {
+      addAtCenter(visible[Math.max(0, highlight)].key);
     } else if (ev.key === 'Escape') {
       search.value = '';
       libSearch = '';
@@ -1091,7 +1172,7 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     else if (ev.key === 'ArrowLeft') { ev.preventDefault(); setHighlight(highlight - 1); }
     else if (ev.key === 'ArrowDown') { ev.preventDefault(); setHighlight(highlight < 0 ? 0 : highlight + cols); }
     else if (ev.key === 'ArrowUp') { ev.preventDefault(); setHighlight(highlight - cols); }
-    else if (ev.key === 'Enter' && highlight >= 0) addAtCenter(visibleKeys[highlight]);
+    else if (ev.key === 'Enter' && highlight >= 0) addAtCenter(visible[highlight].key);
     else if (ev.key === 'Escape') setHighlight(-1);
     else if (ev.key === '/' || (ev.key.length === 1 && /[a-z0-9]/i.test(ev.key))) { search.focus(); }
   });
@@ -1244,7 +1325,14 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
               op.textContent = label;
               sel.appendChild(op);
             };
-            mk('', '(default device)');
+            // "(default device)" is a live reference to Options ▸ Default
+            // devices, not to whatever Windows happens to call default — so it
+            // names the device it will actually open. Leaving it unnamed was
+            // the whole confusion: two blocks both reading "(default device)"
+            // could open different cards, and there was nothing on screen to
+            // say which.
+            const fallback = defaultDeviceFor(b.type, String(b.params.api ?? ''));
+            mk('', fallback ? `(default device — ${fallback})` : '(default device)');
             const opts = deviceOptions(b.type, String(b.params.api ?? ''));
             for (const name of opts) mk(name, name);
             const cur = String(v ?? '');
@@ -1498,6 +1586,40 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
             if (!v) fitFaceLayout(b, theme);
           },
         );
+        // ---- How this block sits against the wires ----
+        {
+          const rw = row(s3, 'Wires');
+          const layer = document.createElement('select');
+          for (const [v, label] of [
+            ['front', 'block in front'],
+            ['behind', 'wires in front'],
+          ] as const) {
+            const op = document.createElement('option');
+            op.value = v;
+            op.textContent = label;
+            layer.appendChild(op);
+          }
+          layer.value = b.style.wireLayer ?? 'front';
+          layer.title =
+            'Whether cables run behind this block or across its face. A cable drawn in front is also what you click — its ports keep priority.';
+          layer.addEventListener('change', () => {
+            doc.pushHistory();
+            b.style.wireLayer = layer.value === 'behind' ? 'behind' : undefined;
+            doc.touch('theme');
+          });
+          rw.appendChild(layer);
+          const width = numInput(b.style.wireWidth ?? theme.wireWidth, (n) => {
+            doc.pushHistory();
+            // Back to the theme rather than pinning the theme's current value:
+            // a block that recorded 2.5 would stop following an appearance
+            // change, which is not what "no override" means.
+            b.style.wireWidth = Math.abs(n - theme.wireWidth) < 0.01 ? undefined : Math.max(0.5, Math.min(24, n));
+            doc.touch('theme');
+          });
+          width.style.width = '54px';
+          width.title = 'Thickness of wires touching this block (theme default when it matches the theme).';
+          rw.appendChild(width);
+        }
         // ---- Skin: an image masked to the block's silhouette ----
         {
           const r = row(s3, 'Skin');
@@ -1655,6 +1777,9 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
             r2.appendChild(check('name', cs.showLabel !== false, (v) => patchCs({ showLabel: v ? undefined : false })));
             if (it.spec.widget === 'knob')
               r2.appendChild(check('value', cs.showValue !== false, (v) => patchCs({ showValue: v ? undefined : false })));
+            // The printed panel symbol under the widget (ParamSpec.mark).
+            if (it.spec.mark)
+              r2.appendChild(check('symbol', cs.showMark !== false, (v) => patchCs({ showMark: v ? undefined : false })));
             // Toggles/buttons: captions for the on/off (pressed) states.
             if (it.spec.widget === 'toggle' || it.spec.widget === 'button') {
               const onIn = document.createElement('input');
@@ -2369,36 +2494,31 @@ function buildAppearance(body: HTMLElement): { refresh: () => void } {
        * Drive the drag from pointer *movement* instead: the value follows how
        * far the mouse travelled, which no amount of relayout can distort.
        */
-      range.addEventListener('pointerdown', (e) => {
-        if (e.button !== 0) return;
-        e.preventDefault(); // suppress the native position-based jump
-        range.focus();
-        const span = UI_SCALE_MAX - UI_SCALE_MIN;
-        // Sensitivity from the track width, but never twitchier than a full
-        // sweep over ~260px — the panel's track is short, and this control
-        // wants a steady hand more than most.
-        const perPx = span / Math.max(260, range.getBoundingClientRect().width);
-        let value = uiScale();
-        range.setPointerCapture(e.pointerId);
-        const move = (ev: PointerEvent) => {
-          value = Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, value + ev.movementX * perPx));
-          setUiScale(value);
-          value = uiScale(); // adopt the clamped/rounded value
+      /**
+       * Relative drag, via the shared `dragHandle`.
+       *
+       * This used to accumulate `ev.movementX`, which **is always 0 for touch
+       * and pen pointers in Chromium** — the slider simply did not move on a
+       * touchscreen, and because it also suppressed the native position-jump
+       * it did nothing at all. Total travel from the press is the honest
+       * measure for a relative control and works on every pointer type.
+       */
+      const span = UI_SCALE_MAX - UI_SCALE_MIN;
+      let startValue = 1;
+      let perPx = span / 260;
+      dragHandle(range, {
+        start: () => {
+          range.focus();
+          startValue = uiScale();
+          // Sensitivity from the track width, but never twitchier than a full
+          // sweep over ~260px — the panel's track is short, and this control
+          // wants a steady hand more than most.
+          perPx = span / Math.max(260, range.getBoundingClientRect().width);
+        },
+        move: (_ev, dx) => {
+          setUiScale(Math.min(UI_SCALE_MAX, Math.max(UI_SCALE_MIN, startValue + dx * perPx)));
           sync();
-        };
-        const up = (ev: PointerEvent) => {
-          range.removeEventListener('pointermove', move);
-          range.removeEventListener('pointerup', up);
-          range.removeEventListener('pointercancel', up);
-          try {
-            range.releasePointerCapture(ev.pointerId);
-          } catch {
-            /* already released */
-          }
-        };
-        range.addEventListener('pointermove', move);
-        range.addEventListener('pointerup', up);
-        range.addEventListener('pointercancel', up);
+        },
       });
       r.append(range, val);
       const hint = document.createElement('div');
@@ -2536,9 +2656,40 @@ function buildScenes(body: HTMLElement): { refresh: () => void } {
     mk('Export…', shell.doExport);
     body.appendChild(actions);
 
+    // Factory presets first: they are the answer to "what do I do with this",
+    // and on a fresh install the saved-scene list below is empty.
+    const presetHead = document.createElement('div');
+    presetHead.className = 'form-hint';
+    presetHead.style.marginTop = '10px';
+    presetHead.textContent = 'Factory presets';
+    body.appendChild(presetHead);
+    const presetEl = document.createElement('div');
+    presetEl.className = 'scene-list';
+    body.appendChild(presetEl);
+    for (const p of factoryScenes()) {
+      const it = document.createElement('div');
+      it.className = 'scene-item';
+      const nm = document.createElement('span');
+      nm.className = 'name';
+      nm.textContent = p.name;
+      const when = document.createElement('span');
+      when.className = 'when';
+      when.textContent = 'preset';
+      it.append(nm, when);
+      it.title = p.desc;
+      // Loads as an UNSAVED scene, so Save writes a copy under a new name and
+      // the preset itself can never be edited away.
+      it.addEventListener('click', () => shell.doLoadPreset(p.key));
+      presetEl.appendChild(it);
+    }
+
+    const savedHead = document.createElement('div');
+    savedHead.className = 'form-hint';
+    savedHead.style.marginTop = '14px';
+    savedHead.textContent = 'Saved scenes';
+    body.appendChild(savedHead);
     const listEl = document.createElement('div');
     listEl.className = 'scene-list';
-    listEl.style.marginTop = '10px';
     body.appendChild(listEl);
     const scenes = await listScenes();
     if (!scenes.length) {

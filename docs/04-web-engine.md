@@ -1,6 +1,6 @@
 # 04 — Web Audio Engine
 
-_Last verified: 2026-07-27. Files: `src/engine/webaudio.ts`,
+_Last verified: 2026-08-01. Files: `src/engine/webaudio.ts`,
 `src/blocks/units.ts`, `src/engine/engine.ts`._
 
 The in-app engine. Builds a live `AudioNode` graph from a `CompiledGraph` on the
@@ -42,6 +42,7 @@ interface Unit {
   setParam(id, v): void;
   midiIn?(ev); setMidiOut?(cb);                  // midi nets
   tapeIn?(ref); setTapeOut?(cb);                 // tape nets
+  assetChanged?(assetId);                        // same id, new samples
   visual?: VisualFeed;
   loadAsset?(name, buffer);
   tick?(dt);                                     // control-rate hook (per poll frame)
@@ -50,10 +51,25 @@ interface Unit {
 registerUnit(type, (params, env) => Unit);
 ```
 
-`UnitEnv` gives the unit `{ ctx: AudioContext, nodeId, assets: Map }`. Units are
+`UnitEnv` gives the unit
+`{ ctx: AudioContext, nodeId, assets: Map, emitAsset, assetChanged }`. Units are
 built by factories registered in `units.ts`. A type with no factory falls back
 to `passUnit` (a bare gain pass-through) — used by `vst`/`asio-*` and, unless
 you add a factory, any block you forget.
+
+### `assetChanged` — same id, new samples
+
+A unit takes its buffer once (`getCassetteBuffer`) and then holds it, so
+dropping the decode cache is only half the job: a punch-in, a destructive Clip
+tab edit, or a recorder's **live take** growing as it records all leave a deck
+playing audio that no longer exists. `WebAudioEngine.assetChanged(id)` sweeps
+every unit; implement the hook wherever `getCassetteBuffer` is called and kept.
+
+This engine had no equivalent until 2026-08-01 (only the native one did, via
+`GraphExec.assetReady`), which is why `runtime.assetChanged` now tells *both*
+adapters. Units that re-hydrate a *playing* deck must keep the playhead when the
+id and the material are the same thing that grew — restarting from the start bar
+several times a second is what a naive re-hydrate does to a live take.
 
 ## `applyGraph` — reconciliation (the key to no-glitch editing)
 
@@ -142,6 +158,22 @@ cassette store's caches (`src/core/cassettes.ts`). `loadAsset(nodeId, name,
 data)` decodes and hands the buffer to the unit. The tape system routes a
 cassette id over a `tape` net; the player/sampler unit resolves it to a buffer
 via `getCassetteBuffer`. See [`09-persistence-and-assets.md`](09-persistence-and-assets.md).
+
+### What the Sampler does and does not do here
+
+The mode semantics match the native kernel — region, fades, ADSR, the slice
+maps — with one deliberate gap and one thing worth knowing:
+
+- **`loopFade` is not honoured.** An `AudioBufferSourceNode` has loop points but
+  no seam crossfade, and faking one needs a second source node per lap. The web
+  engine is the preview path, so it loops without the crossfade rather than
+  growing a scheduler for it. That also means a lap here is the whole bracket,
+  where on native it is the bracket minus the fade (docs/05).
+- **A non-looping voice schedules its own release**, `R` before the material
+  runs out, at the level the attack/decay ramps have actually reached by that
+  point. Using the sustain level unconditionally jumps the gain on any slice
+  shorter than A+D — which is most of a fast drum kit — and the events must be
+  scheduled in increasing time order or Web Audio's behaviour is undefined.
 
 ## Adding a Web Audio unit
 

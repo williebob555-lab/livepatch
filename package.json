@@ -21,8 +21,9 @@
     "package": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win",
     "package:dir": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win --dir",
     "release": "npm run build:vsthost && npm run build && npm run bundle:node && electron-builder --win --publish always",
-    "ship": "npm version patch && git push --follow-tags && npm run release",
-    "ship:minor": "npm version minor && git push --follow-tags && npm run release"
+    "ship": "node scripts/ship.mjs",
+    "ship:minor": "node scripts/ship.mjs minor",
+    "ship:dry": "node scripts/ship.mjs --dry-run"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

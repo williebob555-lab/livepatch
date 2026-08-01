@@ -1,6 +1,6 @@
 # 08 — Extending: Adding Blocks, Widgets, Kernels, Visuals
 
-_Last verified: 2026-07-25._
+_Last verified: 2026-08-01._
 
 This is the how-to reference. Follow the checklists exactly — most of the steps
 prevent a specific silent failure (a block that does nothing on one engine, a
@@ -31,7 +31,27 @@ registerBlock({
 ```
 
 - Use the `knob(...)` helper for float knobs; it sets `type:'float',
-  widget:'knob'`.
+  widget:'knob'`. Its sixth argument is an opts bag — everything below rides
+  there (`knob('cutoff', 'Cutoff', 20, 20000, 1200, { mark: 'lowpass',
+  curve: 'log' })`).
+- **`alsoIn: [{ category, group }]`** files the block on a second Library shelf.
+  Use it whenever there is more than one honest answer to "where would I look
+  for this"; it is presentation only and never reaches the IR. See the Library
+  notes in [`07-ui.md`](07-ui.md).
+- **`mark: '<glyph>'`** prints a panel symbol under the control's widget
+  (names come from `src/ui/glyphs.ts`; anything else is printed as small text).
+  This is how an ordinary block gets the Mavis's front-panel vocabulary without
+  authoring a layout. **Write a new glyph rather than borrowing the nearest
+  one**, leave a plain Gain/Level knob unmarked (the name is the symbol), and
+  reuse a glyph only where two params genuinely ask the same question. The
+  library shipped for one revision with the same wedge under 37 knobs, which is
+  how a mark strip stops being read at all — see the rules in
+  [`07-ui.md`](07-ui.md).
+- **`affects: ['<paramId>', …]`** declares the params whose *meaning* this one
+  changes — a sync that takes over from a time knob, a mix that decides whether
+  a filter is audible at all. The face draws a tie, lit while this param is away
+  from its default. Pick relationships that answer "why is turning this doing
+  nothing?"; every arrow that *could* be drawn is not worth drawing.
 - `face: false` on a param hides its face widget (edited in Properties only) —
   use for hidden state like `asset`/`file`/`device`.
 - Port `role: 'cv'` colors a port purple; it's still an audio port.
@@ -134,6 +154,10 @@ invert/mult/logic/comparator) are per-sample kernels. If you add a CV block,
 2. Add a `widgetSize` entry in `src/ui/layout.ts` (else it defaults tiny).
 3. Paint it: a case in `paintWidget`, or a dedicated `drawX` painter in
    `src/ui/widgets.ts`. **Export the hit geometry** from `widgets.ts`.
+   If it has paint variants, add them to **both** `VARIANTS` (`editor.ts`) and
+   `variantsFor` (`widgetdock.ts`) — the two menus are deliberately separate
+   (invariant 13) and a variant missing from them is a variant the user cannot
+   reach, which is how `keys`' `pad` layout stayed invisible for a release.
 4. Handle interaction in `src/ui/editor.ts` (`widgetDown` + a `DragState`
    variant + `pointermove`/`pointerup`), using the *same* exported geometry so
    painting and hit-testing agree exactly. Write via `setParamLive`.
@@ -224,6 +248,38 @@ widest port on it (docs/02 "Channel width").
 
 ---
 
+## Add a block whose PORT COUNT is a parameter
+
+Width is one thing (above); a variable *number* of ports is another, and both
+are "a port list that is not a constant". The Matrix router is the worked
+example — `in1..inN` and `out1..outM`, the two sides independent.
+
+1. Declare a starting set in the def, and the counts as ordinary `int` params.
+   The def's ports are only what a freshly dropped block begins with.
+2. **Re-derive the real list in `GraphDoc.syncRigPorts`**, not at the edit
+   sites. It already runs on scene load, undo, `addBlock` and every param edit
+   that can move a port list, so putting it anywhere else means finding all of
+   those again. Add the type to `addBlock`'s sync list too.
+3. **A removed port takes its wires with it.** A wire to a port that no longer
+   exists compiles to a tap the engine cannot resolve and silently drops.
+   Collect the wire tree (branch children included) in the graph being visited
+   — `deleteWires` works on the *open* graph, and the sync walks nested ones.
+4. **Re-space `t` only when the count actually changed.** Port positions are
+   user-editable, so a sync that re-derives `t` unconditionally drags them back
+   on every scene load and undo — and raises `'structure'` each time, which
+   recompiles the graph.
+5. Teach `Editor.setParamLive` that this param is topology: `syncRigPorts()`
+   then `'structure'` if it returned true, else `'param'` (the `multi-in` /
+   `vst` branch).
+6. **Kernel: no string building in `process`.** `ins['in' + (i + 1)]` allocates
+   a string per port per quantum. Build the name array once at construction and
+   index it; do the same for `out(port)` with a `Map`, because `port.slice(3)`
+   is the same bug (docs/10).
+7. Any per-crosspoint or per-port state that a count change reshapes should be
+   **tolerant on parse** rather than migrated: the Matrix's grid is stored as
+   ragged rows and padded/truncated to the current counts on read, so there is
+   no migration step to get out of step with the ports.
+
 ## Add a hardware IO block (native only)
 
 1. Def with a `device` string param (`face:false`, rendered as a live dropdown
@@ -239,6 +295,91 @@ widest port on it (docs/02 "Channel width").
 
 Respect the IO invariants in [`06-audio-io-and-latency.md`](06-audio-io-and-latency.md)
 (delta-based reconfigure, self-tuning latency, no hardcoded buffer constants).
+
+---
+
+---
+
+## The modular voice (`vco` / `ladder` / `env-adsr` / `lfo` / `wavefold` / `sh` / `slew`)
+
+Seven analog primitives added 2026-07-31, because the library could *route*
+control voltage beautifully and had nothing to build an instrument out of
+(`synth` is a finished polysynth, not a module, and `osc` has no 1V/octave
+input so it cannot be played by a pitch CV).
+
+Read these before touching them:
+
+- **Their exponential CV inputs are 1 V/octave with 0 = the knob** (docs/02,
+  "Control-voltage conventions"). That is why they take real audio-rate input
+  ports rather than relying on the automatic `cv:<param>` path, which modulates
+  in normalized param space and would make a pitch CV mean something different
+  at every knob setting.
+- **One AudioWorklet covers all seven on the web engine** (`MODULAR_WORKLET` in
+  `src/blocks/units.ts`, `processorOptions.op` picks the loop), mirroring the
+  seven kernels in `engine/src/dsp.ts` sample-for-sample — same polyBLEP, same
+  ladder topology, same envelope coefficients. **Change one, change both.**
+  `parameterDescriptors` is static, so the k-rate list is the *union* of every
+  op's knobs; enums and bools ride the message port instead.
+- **`sh`'s noise source is a param, not "nothing is patched in".** An
+  AudioWorklet cannot reliably tell an unconnected input from a silent one, so
+  detection would have diverged between the engines. The hardware's normalled
+  jack becomes an explicit `source` enum.
+- `node --expose-gc scripts/modular-kernel-test.cjs` asserts the 1V/oct law, the
+  ladder's slope and self-oscillation, that the envelope reaches 1 and returns
+  to exactly 0, that the folder is a **unity pass-through at zero fold**, and
+  that none of them allocate. It caught a real per-quantum closure allocation on
+  the way in (a `trapNonFinite` reset written inline is a closure per quantum —
+  hoist it to construction).
+
+---
+
+## Add factory content (a preset scene or a built-in custom block)
+
+`src/core/factory/` holds the patches that ship with the app: preset scenes in
+the Scenes panel's **Factory presets** list, and built-in custom blocks in the
+Library (including the Mavis panel). Both are ordinary document data.
+
+1. **Write it with the builders in `src/core/factory/build.ts`**, not as JSON.
+   The three rules are documented at the top of that file and each of them is a
+   silent failure: ids must be unique across the *whole* build (one remap map
+   covers every nested graph), an input port takes exactly one wire tree
+   (docs/02), and a hand-written face layout may only reference `paramLink`s and
+   `exposed` entries that really exist — `faceItems` filters the rest out as
+   stale and the control simply is not on the block.
+2. A scene goes in `scenes.ts` + `FACTORY_SCENES`; a custom block goes in
+   `blocks.ts` + `OTHER_FACTORY_BLOCKS` (or its own file, like `mavis.ts`).
+3. **Give every preset scene a Comment block** saying what it demonstrates and
+   what to turn. A patch with no explanation is a puzzle.
+4. **Run `node scripts/factory-preset-test.mjs`.** It bundles the renderer with
+   esbuild and walks every template and scene: unknown types/params, wires to
+   missing ports, two nets into one input, duplicate ids across nesting, layout
+   refs that would be discarded, **layout items that do not fit the block**,
+   `nextId` too low to be safe, and whether the whole thing compiles to nets with
+   no unresolvable taps. It has already caught a missing `texts` assignment that
+   would have erased the Mavis's entire silkscreen.
+   - **A hand-written layout has to FIT, and nothing at runtime checks that.**
+     `faceItems` returns a stored layout verbatim; the clamping in
+     `clampFaceItem` only runs on the automatic flow, on a drag and on a resize.
+     A layout authored a few pixels too wide is therefore drawn a few pixels
+     outside the block, permanently, on every instance the user drags out of the
+     Library. Five of the six factory blocks shipped that way (2026-08-01):
+     their widths were written against the raw `size`, forgetting that `padOf`
+     also reserves room for the port labels. `checkLayoutFits` is the guard, and
+     it prints the size the block needs to be. `style.freeWidgets` waives the
+     padding and the outline, **not the block** — a panel is still a rectangle of
+     a stated size, and artwork printed past its edge is a mistake there too.
+5. Factory content is **merged on read, never seeded into the user's storage**
+   — see [`09-persistence-and-assets.md`](09-persistence-and-assets.md) for why,
+   and for what "read-only" means for Save/rename/delete.
+6. **Panels get printed artwork, not just captions.** Section boxes, boxed /
+   reverse-video jack labels, vertical section tabs and the little waveform and
+   envelope symbols beside a control are all `FaceText` fields (`bg`, `border`,
+   `rotate`, `glyph`) — see "Panel silkscreen" in
+   [`07-ui.md`](07-ui.md). Two rules: mark every one of them `decor` (printed
+   artwork must not be hit-tested in patch mode) and emit them **before** the
+   widgets, because layout order is paint order. New symbols go in
+   `src/ui/glyphs.ts` as unit-box polylines and are added to `PANEL_GLYPHS`,
+   which the factory test checks names against.
 
 ---
 
@@ -270,11 +411,17 @@ panel:
 5. If the tab draws on a canvas, size it from `clientWidth/clientHeight` and
    normalize pointer coords through the measured rect (the UI-scale trap,
    [`07-ui.md`](07-ui.md)).
+6. **Work the input checklist in [`14-input.md`](14-input.md).** A canvas tab
+   needs `touch-action: none`, guarded `capture()`, a `pointercancel` reset, a
+   `TwoPointerGesture` if it has a view to pan, and `wheelIntent()` rather than
+   raw `deltaY`. Every tab that skipped this shipped unusable on a touchscreen
+   and nobody noticed until a user tried.
 
 ## Add an Advanced (deep) editor
 
 Tab 3 is the registry; **`src/ui/adveq.ts` (the EQ Curve editor) is the worked
-example — copy it.**
+example — copy it.** `advpath.ts` (Trajectory) and `advmatrix.ts` (Matrix) are
+the two smaller ones to read next.
 
 1. `registerAdvancedView({ id, title, match, build })` (`src/ui/advanced.ts`),
    and `import './ui/adveq'` (or your file) in `src/main.ts` so it registers.
@@ -299,6 +446,12 @@ example — copy it.**
    visuals stream (below) rather than polling the document. (The EQ analyzer
    overlay reuses the spectrum path: the kernel exposes `visualTime` and
    `graph.ts` FFTs watched `eq-curve` nodes.)
+7. **Input goes through [`14-input.md`](14-input.md), and a wheel that edits a
+   value needs a touch equivalent.** Both existing deep editors put a parameter
+   on the wheel (Q, waypoint height) and both originally left that parameter
+   unreachable on a touchscreen — a tablet user could lay out a trajectory in
+   plan but never lift any of it off the floor. Two-finger vertical drag is the
+   pattern to copy; it is the same gesture a wheel makes.
 
 ## Add engine → renderer telemetry (the transport pattern)
 

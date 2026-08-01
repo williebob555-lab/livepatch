@@ -4,6 +4,7 @@
 // drop near an edge to re-attach). Layout persists to localStorage.
 // ============================================================================
 import { toUiPx } from './uiscale';
+import { dragHandle } from './input';
 
 export type Zone = 'left' | 'right' | 'bottom' | 'float';
 
@@ -35,6 +36,29 @@ interface PanelState {
 }
 
 const LS_KEY = 'livepatch.dock';
+
+/**
+ * A saved floating rect, or the default when it is missing or nonsense.
+ *
+ * Saved layouts written by an older build can carry a runaway width (see the
+ * ResizeObserver in `register`), and a NaN from a half-written record turns
+ * every later `Math.min` into NaN — which reads as a panel with no size at all.
+ * `applyFloat` clamps to the live window on top of this; the point here is that
+ * what comes out of storage is finite and positive before anything uses it.
+ */
+function sanitizeFloat(
+  v: { x: number; y: number; w: number; h: number } | undefined,
+  fallback: { x: number; y: number; w: number; h: number },
+): { x: number; y: number; w: number; h: number } {
+  if (!v) return fallback;
+  const num = (n: unknown, def: number): number => (typeof n === 'number' && Number.isFinite(n) ? n : def);
+  return {
+    x: num(v.x, fallback.x),
+    y: num(v.y, fallback.y),
+    w: Math.max(200, Math.min(4000, num(v.w, fallback.w))),
+    h: Math.max(140, Math.min(4000, num(v.h, fallback.h))),
+  };
+}
 
 export class Dock {
   private panels = new Map<string, PanelState>();
@@ -83,7 +107,7 @@ export class Dock {
       zone: def.pinned ? def.defaultZone : saved?.zone ?? def.defaultZone,
       visible: saved?.visible ?? def.defaultVisible,
       refresh: () => {},
-      float: saved?.float ?? { x: 120 + this.panels.size * 40, y: 100 + this.panels.size * 30, w: 320, h: 420 },
+      float: sanitizeFloat(saved?.float, { x: 120 + this.panels.size * 40, y: 100 + this.panels.size * 30, w: 320, h: 420 }),
     };
     st.refresh = def.build(body).refresh;
     this.panels.set(def.id, st);
@@ -94,35 +118,53 @@ export class Dock {
     });
     // One resize observer per panel (not per re-parenting) records the floating
     // size when the user drags the panel's resize corner.
+    //
+    // **`toUiPx` here is load-bearing, not tidiness.** `getBoundingClientRect`
+    // returns VIEWPORT px; `float.w` is written back as a CSS px style value,
+    // which the UI zoom then magnifies. Storing the raw rect made this a
+    // positive feedback loop with a gain of exactly `uiScale()`: applyFloat
+    // writes w → the observer reads w × scale → stores it → the next applyFloat
+    // (one per pointer-move of a tear-off drag) writes that. At scale 1.45 a
+    // single drag is dozens of multiplications, and the panel ends up
+    // kilopixels wide — "detached windows run off the right of the screen, no
+    // matter what" — and it *persists*, because the runaway number is saved.
+    // Same class of bug as the rig plan view's frozen span (docs/07-ui.md).
     new ResizeObserver(() => {
       if (st.zone !== 'float') return;
       const r = st.el.getBoundingClientRect();
       if (r.width > 50) {
-        st.float.w = r.width;
-        st.float.h = r.height;
+        st.float.w = toUiPx(r.width);
+        st.float.h = toUiPx(r.height);
       }
     }).observe(el);
-    if (!def.pinned) this.headerDrag(header, st);
+    if (!def.pinned) {
+      this.headerDrag(header, st);
+      this.addFloatGrip(st);
+    }
     this.place(st);
   }
 
   private headerDrag(header: HTMLElement, st: PanelState): void {
-    header.addEventListener('pointerdown', (e) => {
-      if ((e.target as HTMLElement).tagName === 'BUTTON') return;
-      e.preventDefault();
-      const startX = e.clientX;
-      const startY = e.clientY;
-      let detached = st.zone === 'float';
-      const rect = st.el.getBoundingClientRect();
-      // Client rects and pointer coords are viewport px; panel geometry is
-      // written back as CSS px, which the UI scale zooms — convert once here.
-      let offX = toUiPx(e.clientX - rect.left);
-      let offY = toUiPx(e.clientY - rect.top);
-      // Listen on window (not the header): the panel gets re-parented on
-      // detach, which would otherwise drop pointer capture and make the panel
-      // stutter or stick to the cursor.
-      const move = (ev: PointerEvent) => {
-        if (!detached && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 10) {
+    let detached = false;
+    let offX = 0;
+    let offY = 0;
+    let rect = new DOMRect();
+    dragHandle(header, {
+      // Header buttons keep their clicks; a press on one is not a tear-off.
+      start: (e) => {
+        if ((e.target as HTMLElement).tagName === 'BUTTON') return false;
+        detached = st.zone === 'float';
+        rect = st.el.getBoundingClientRect();
+        // Client rects and pointer coords are viewport px; panel geometry is
+        // written back as CSS px, which the UI scale zooms — convert once here.
+        offX = toUiPx(e.clientX - rect.left);
+        offY = toUiPx(e.clientY - rect.top);
+      },
+      move: (ev, dx, dy) => {
+        // Tear-off threshold is the touch drag threshold, not 10 px flat: a
+        // fingertip rolls several px during a deliberate press, and a panel
+        // that detaches from a tap is worse than one that needs a firm pull.
+        if (!detached && Math.hypot(dx, dy) > (ev.pointerType === 'mouse' ? 10 : 16)) {
           detached = true;
           st.float.w = Math.min(toUiPx(rect.width), 380);
           st.float.h = Math.min(toUiPx(rect.height), 460);
@@ -134,23 +176,51 @@ export class Dock {
           st.float.y = toUiPx(ev.clientY) - offY;
           this.applyFloat(st);
         }
-      };
-      const up = (ev: PointerEvent) => {
-        window.removeEventListener('pointermove', move);
-        window.removeEventListener('pointerup', up);
-        document.body.style.userSelect = '';
-        if (!detached) return;
+      },
+      end: (ev, cancelled) => {
+        if (!detached || cancelled) return;
         const W = window.innerWidth;
         const H = window.innerHeight;
         if (ev.clientX < 90) this.moveTo(st.def.id, 'left');
         else if (ev.clientX > W - 90) this.moveTo(st.def.id, 'right');
         else if (ev.clientY > H - 90) this.moveTo(st.def.id, 'bottom');
         else this.saveState();
-      };
-      document.body.style.userSelect = 'none';
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+      },
     });
+  }
+
+  /**
+   * Explicit resize grip for floating panels.
+   *
+   * The float layer used CSS `resize: both`, and **Chromium's native resizer is
+   * mouse-only** — it does not respond to touch or pen at all, so a floating
+   * panel could be moved but never resized on a touchscreen. There is no
+   * styling fix for that; the handle has to be a real element with real pointer
+   * handling. `.panel-grip` is sized from `--grip` in styles.css, which widens
+   * on a coarse pointer.
+   */
+  private addFloatGrip(st: PanelState): void {
+    const grip = document.createElement('div');
+    grip.className = 'panel-grip';
+    grip.title = 'Resize';
+    let w0 = 0;
+    let h0 = 0;
+    dragHandle(grip, {
+      start: () => {
+        const r = st.el.getBoundingClientRect();
+        w0 = toUiPx(r.width);
+        h0 = toUiPx(r.height);
+      },
+      move: (_ev, dx, dy) => {
+        if (st.zone !== 'float') return;
+        st.float.w = Math.max(200, Math.min(toUiPx(window.innerWidth), w0 + toUiPx(dx)));
+        st.float.h = Math.max(140, Math.min(toUiPx(window.innerHeight), h0 + toUiPx(dy)));
+        this.applyFloat(st);
+        this.onLayoutChange?.();
+      },
+      end: () => this.saveState(),
+    });
+    st.el.appendChild(grip);
   }
 
   /** Reparent a panel to the floating layer without a full (re-observing) place. */
@@ -169,10 +239,19 @@ export class Dock {
     // Keep the panel on screen: viewport bounds expressed in UI px.
     const W = toUiPx(window.innerWidth);
     const H = toUiPx(window.innerHeight);
-    st.el.style.left = Math.max(0, Math.min(W - 120, st.float.x)) + 'px';
-    st.el.style.top = Math.max(30, Math.min(H - 60, st.float.y)) + 'px';
-    st.el.style.width = st.float.w + 'px';
-    st.el.style.height = st.float.h + 'px';
+    // The SIZE is clamped as well as the position. Position-only clamping let a
+    // panel start at a legal x and still extend past the right edge, which is
+    // the whole complaint — and it left no way back, because the oversized
+    // width was what got saved. A panel is never allowed to be wider or taller
+    // than the window it lives in.
+    const w = Math.max(200, Math.min(W - 8, st.float.w));
+    const h = Math.max(140, Math.min(H - 40, st.float.h));
+    st.float.w = w;
+    st.float.h = h;
+    st.el.style.left = Math.max(0, Math.min(W - w, st.float.x)) + 'px';
+    st.el.style.top = Math.max(30, Math.min(Math.max(30, H - h), st.float.y)) + 'px';
+    st.el.style.width = w + 'px';
+    st.el.style.height = h + 'px';
   }
 
   private place(st: PanelState): void {
@@ -214,17 +293,34 @@ export class Dock {
     this.zones.bottom.style.height = this.zones.bottom.childElementCount ? bottom + 'px' : '';
   }
 
+  /**
+   * Zone splitters.
+   *
+   * These were the worst touch surface in the app and for three separate
+   * reasons, each on its own enough to make resizing feel broken:
+   *
+   * 1. **No `touch-action: none`.** The browser read the drag as a page scroll
+   *    and fired `pointercancel` a few px in, so the splitter tracked the
+   *    finger briefly and then froze. `dragHandle` sets it.
+   * 2. **Unguarded `setPointerCapture`.** It throws for a re-issued touch id,
+   *    and the throw aborted the handler *before the move/up listeners were
+   *    attached* — the splitter then did nothing at all until the next reload.
+   * 3. **Move/up were bound to the splitter itself and there was no
+   *    `pointercancel` path**, so any interruption left a half-live drag and a
+   *    stuck `.dragging` class.
+   *
+   * All three are `dragHandle`'s job now. The remaining local concern is that
+   * zone sizes are CSS px (which the UI zoom scales) while pointer coordinates
+   * are viewport px — hence `toUiPx` on every read.
+   */
   private makeZoneSplitters(): void {
     const mk = (zone: 'left' | 'right' | 'bottom') => {
       const sp = document.createElement('div');
       sp.className = 'dock-splitter' + (zone === 'bottom' ? '' : ' zone-splitter');
       if (zone === 'bottom') sp.id = 'dock-bottom-splitter';
-      sp.addEventListener('pointerdown', (e) => {
-        e.preventDefault();
-        sp.setPointerCapture(e.pointerId);
-        sp.classList.add('dragging');
-        const move = (ev: PointerEvent) => {
-          // Zone sizes are CSS px (scaled); the pointer is viewport px.
+      dragHandle(sp, {
+        activeClass: 'dragging',
+        move: (ev) => {
           const px = toUiPx(ev.clientX);
           const py = toUiPx(ev.clientY);
           if (zone === 'left') this.zoneSizes.left = Math.max(160, Math.min(560, px));
@@ -234,15 +330,8 @@ export class Dock {
           else this.zoneSizes.bottom = Math.max(100, Math.min(700, toUiPx(window.innerHeight) - py));
           this.applyZoneSizes();
           this.onLayoutChange?.();
-        };
-        const up = () => {
-          sp.classList.remove('dragging');
-          sp.removeEventListener('pointermove', move);
-          sp.removeEventListener('pointerup', up);
-          this.saveState();
-        };
-        sp.addEventListener('pointermove', move);
-        sp.addEventListener('pointerup', up);
+        },
+        end: () => this.saveState(),
       });
       return sp;
     };

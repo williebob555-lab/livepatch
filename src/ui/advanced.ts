@@ -83,7 +83,15 @@ export function advancedCandidates(): Array<{ r: ResolvedRef; def?: AdvancedView
 
 /** Widgets/visuals whose face rendering is a summary of something bigger. */
 function isDeepCandidate(r: ResolvedRef): boolean {
-  if (r.visual) return r.visual === 'eq' || r.visual === 'spectrogram' || r.visual === 'scope' || r.visual === 'spectrum';
+  if (r.visual)
+    return (
+      r.visual === 'eq' ||
+      r.visual === 'path' ||
+      r.visual === 'matrix' ||
+      r.visual === 'spectrogram' ||
+      r.visual === 'scope' ||
+      r.visual === 'spectrum'
+    );
   const w = r.spec?.widget;
   return w === 'seqgrid' || w === 'sampleview' || w === 'wavedraw' || w === 'xy' || w === 'keys';
 }

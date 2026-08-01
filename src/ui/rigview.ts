@@ -29,6 +29,7 @@
 import { doc } from '../core/graph';
 import { Speaker, Theme } from '../core/types';
 import {
+  calibratedCount,
   deleteRigPreset,
   maxDist,
   nextSpeakerId,
@@ -36,13 +37,17 @@ import {
   outChannel,
   posToAngles,
   rigPresets,
+  rigFollowsRoom,
   saveRigPreset,
   savedRigs,
+  setRigFollowsRoom,
   speakerPos,
 } from '../core/rig';
 import { DockTabHandle, registerDockTab } from './dockpanel';
 import { confirmModal, promptModal, showContextMenu } from './menus';
+import { clearSpeakerCal, openCalibrateDialog } from './rigcal';
 import { fitCanvasBacking, onUiScaleChange } from './uiscale';
+import { TwoPointerGesture, capture, isCoarse, release, wheelIntent } from './input';
 
 interface Vec {
   x: number;
@@ -92,6 +97,10 @@ function build(body: HTMLElement): DockTabHandle {
   presetSel.title = 'Replace the layout with a standard or saved one, then drag it to match your room';
   const SAVE_VALUE = '__save';
   const DELETE_VALUE = '__delete';
+  // The rig is the room's, so it normally overrides whatever a scene carries
+  // (core/rig.ts). This is the way back out — without it, turning the feature on
+  // by dragging one speaker would be a one-way door.
+  const FORGET_VALUE = '__forget';
   const fillPresets = (): void => {
     presetSel.innerHTML = '';
     const ph = document.createElement('option');
@@ -125,11 +134,16 @@ function build(body: HTMLElement): DockTabHandle {
     for (const [value, label] of [
       [SAVE_VALUE, '＋ Save current rig…'],
       [DELETE_VALUE, '✕ Delete a saved rig…'],
+      [FORGET_VALUE, (rigFollowsRoom() ? '● ' : '○ ') + 'Same rig in every scene'],
     ] as const) {
       const o = document.createElement('option');
       o.value = value;
       o.textContent = label;
       o.disabled = value === DELETE_VALUE && !mine.length;
+      o.title =
+        value === FORGET_VALUE
+          ? 'On: your speaker layout applies to every scene you open. Off: a scene loads with the layout it was saved with.'
+          : '';
       act.appendChild(o);
     }
     presetSel.value = '';
@@ -153,6 +167,16 @@ function build(body: HTMLElement): DockTabHandle {
   fitBtn.className = 'dock-btn';
   fitBtn.textContent = 'Fit';
   fitBtn.title = 'Fit the plan view to the rig (scroll over it to zoom)';
+
+  // Calibration is a property of the rig, so it lives in the rig's own toolbar
+  // rather than behind a menu somewhere else: the thing you measure is the
+  // thing drawn two inches below this button.
+  const calBtn = document.createElement('button');
+  calBtn.type = 'button';
+  calBtn.className = 'dock-btn';
+  calBtn.textContent = '◉ Calibrate…';
+  calBtn.title =
+    'Measure each speaker with a microphone and correct its frequency response, level and arrival time';
 
   const sep = document.createElement('div');
   sep.className = 'dock-sep';
@@ -200,7 +224,21 @@ function build(body: HTMLElement): DockTabHandle {
   const hintEl = document.createElement('span');
   hintEl.className = 'dock-hint';
 
-  bar.append(presetSel, addBtn, delBtn, fitBtn, sep, nameWrap, az.wrap, el.wrap, dist.wrap, out.wrap, lfeWrap, hintEl);
+  bar.append(
+    presetSel,
+    addBtn,
+    delBtn,
+    fitBtn,
+    calBtn,
+    sep,
+    nameWrap,
+    az.wrap,
+    el.wrap,
+    dist.wrap,
+    out.wrap,
+    lfeWrap,
+    hintEl,
+  );
 
   const wrap = document.createElement('div');
   wrap.className = 'dock-canvas-wrap clip-wrap';
@@ -471,9 +509,16 @@ function build(body: HTMLElement): DockTabHandle {
       const q = project(s, p);
       const isSel = s.id === selId;
       const isHot = s.id === hoverId;
-      g.lineWidth = isSel ? 2 : 1;
-      g.strokeStyle = isSel ? theme.selectionColor : theme.blockStroke;
-      g.fillStyle = s.lfe ? theme.wireTapeColor : isHot ? theme.wireGoodColor : theme.portAudioColor;
+      // **Calibrated is a fill colour; hover is a ring.** Both used to be the
+      // fill, which would have made a hovered speaker indistinguishable from a
+      // calibrated one — and "which of these have I measured" is a question you
+      // ask while the pointer is somewhere on the canvas, i.e. exactly when the
+      // two would collide. Green (`wireGoodColor`) is the app's "this is good"
+      // colour everywhere else, so it needs no legend.
+      const isCal = !!s.cal;
+      g.lineWidth = isSel ? 2 : isHot ? 2 : 1;
+      g.strokeStyle = isSel ? theme.selectionColor : isHot ? theme.blockText : theme.blockStroke;
+      g.fillStyle = s.lfe ? theme.wireTapeColor : isCal ? theme.wireGoodColor : theme.portAudioColor;
       g.beginPath();
       if (s.lfe) {
         // Subs read as squares: they are not pannable and should not look like
@@ -484,6 +529,16 @@ function build(body: HTMLElement): DockTabHandle {
       }
       g.fill();
       g.stroke();
+      // A calibrated LFE keeps its square (that shape means "not pannable" and
+      // is load-bearing), so it gets the colour as a halo instead — otherwise
+      // the one speaker whose fill is already spoken for could never show it.
+      if (isCal && s.lfe) {
+        g.strokeStyle = theme.wireGoodColor;
+        g.lineWidth = 2;
+        g.beginPath();
+        g.arc(q.x, q.y, DOT * 1.15, 0, Math.PI * 2);
+        g.stroke();
+      }
 
       // Channel number inside, name beside — the dot IS the channel legend.
       g.fillStyle = '#0d0f12';
@@ -552,8 +607,21 @@ function build(body: HTMLElement): DockTabHandle {
     fitBtn.classList.toggle('on', !userSpan);
     const n = r.speakers.length;
     const view = `${span().toFixed(1)} m${userSpan ? '' : ' (fit)'}`;
+    const cal = calibratedCount(r);
+    // The button reads `on` (accent-coloured) once anything is calibrated, so
+    // the state is visible without hunting for a green dot in a dense rig.
+    calBtn.classList.toggle('on', cal > 0);
+    calBtn.textContent = cal ? `◉ Calibrated ${cal}/${n}` : '◉ Calibrate…';
+    // For a selected speaker, say what its calibration *is*: a green dot tells
+    // you it was measured and nothing about when, or with what.
+    let calNote = '';
+    if (s?.cal) {
+      const days = (Date.now() - (s.cal.when || Date.now())) / 86400000;
+      const age = days < 1 ? 'today' : days < 2 ? 'yesterday' : `${Math.round(days)} days ago`;
+      calNote = ` · calibrated ${age}${s.cal.mic ? ` (${s.cal.mic})` : ''}`;
+    }
     hintEl.textContent = s
-      ? `${r.name} · ${n} ch · “${s.name}” = bus ch ${r.speakers.indexOf(s) + 1} → out ${outChannel(s, r.speakers.indexOf(s))} · ${view}`
+      ? `${r.name} · ${n} ch · “${s.name}” = bus ch ${r.speakers.indexOf(s) + 1} → out ${outChannel(s, r.speakers.indexOf(s))} · ${view}${calNote}`
       : `${r.name} · ${n} ch · click a speaker to edit it · ${view}`;
   };
 
@@ -587,6 +655,16 @@ function build(body: HTMLElement): DockTabHandle {
           fillPresets();
         });
       });
+      return;
+    }
+    if (value === FORGET_VALUE) {
+      const on = !rigFollowsRoom();
+      setRigFollowsRoom(on);
+      // Turning it back on adopts what is on screen right now, rather than
+      // whatever was stored the last time it was on — otherwise the next scene
+      // load would replace the layout the user just approved.
+      if (on) doc.setRig(rig(), true);
+      fillPresets();
       return;
     }
     if (value === DELETE_VALUE) {
@@ -645,14 +723,66 @@ function build(body: HTMLElement): DockTabHandle {
     syncBar();
   });
 
+  calBtn.addEventListener('click', () => openCalibrateDialog());
+
+  // Right-click a speaker for the per-speaker calibration actions. They are on
+  // the dot rather than in the toolbar because both are about *one* speaker,
+  // and the toolbar has no way to say which one that is.
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    // Never over a live drag (docs/07): a menu opening mid-gesture strands it.
+    if (drag.kind !== 'none') return;
+    const ratio = canvas.width / Math.max(1, canvas.clientWidth);
+    const h = hit(toSurface(e), canvas.width / ratio, canvas.height / ratio, isCoarse(e));
+    if (!h) return;
+    const s = h.s;
+    selId = s.id;
+    syncBar();
+    invalidate();
+    showContextMenu(e.clientX, e.clientY, [
+      { label: `Calibrate “${s.name}”…`, action: () => openCalibrateDialog(s.id) },
+      ...(s.cal
+        ? [
+            {
+              label: 'Clear this calibration',
+              action: () => {
+                clearSpeakerCal(s.id);
+                invalidate();
+                syncBar();
+              },
+            },
+          ]
+        : []),
+      { label: 'Calibrate every speaker…', action: () => openCalibrateDialog() },
+    ]);
+  });
+
   // ---- pointer ------------------------------------------------------------
+
+  /**
+   * Two-finger pinch zooms the plan pane. The rig view has no pan — the plan is
+   * always centred on the listener, which is the whole point of it — so this is
+   * a pure scale gesture and the wheel handler below declares `noPan`.
+   */
+  const gesture = new TwoPointerGesture();
 
   canvas.addEventListener('pointerdown', (e) => {
     const ratio = canvas.width / Math.max(1, canvas.clientWidth);
     const W = canvas.width / ratio;
     const H = canvas.height / ratio;
     const pt = toSurface(e);
-    const h = hit(pt, W, H, e.pointerType !== 'mouse');
+    if (isCoarse(e)) {
+      gesture.add(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (gesture.count >= 2) {
+        // A second finger cancels a speaker drag rather than fighting it.
+        if (drag.kind !== 'none') {
+          drag = { kind: 'none' };
+          frozenSpan = 0;
+        }
+        return;
+      }
+    }
+    const h = hit(pt, W, H, isCoarse(e));
     if (!h) {
       selId = '';
       syncBar();
@@ -663,20 +793,29 @@ function build(body: HTMLElement): DockTabHandle {
     // Pin the plan scale for the whole gesture — see `span()`.
     frozenSpan = span();
     drag = { kind: 'speaker', id: h.s.id, pane: h.pane.kind, moved: false };
-    try {
-      canvas.setPointerCapture(e.pointerId);
-    } catch {
-      /* synthetic/stale pointer — the drag still tracks via move events */
-    }
+    capture(canvas, e.pointerId);
     syncBar();
     invalidate();
   });
+
+  /** Zoom the plan by a ratio (>1 = fingers spreading = zoom in = smaller span). */
+  const zoomPlan = (ratio: number): void => {
+    const cur = userSpan || autoSpan();
+    userSpan = Math.max(SPAN_MIN, Math.min(SPAN_MAX, cur / ratio));
+    invalidate();
+    syncBar();
+  };
 
   canvas.addEventListener('pointermove', (e) => {
     const ratio = canvas.width / Math.max(1, canvas.clientWidth);
     const W = canvas.width / ratio;
     const H = canvas.height / ratio;
     const pt = toSurface(e);
+    if (gesture.update(e.pointerId, { x: e.clientX, y: e.clientY }) && gesture.active) {
+      const f = gesture.frame();
+      if (f && f.zoom !== 1) zoomPlan(f.zoom);
+      return;
+    }
     if (drag.kind === 'none') {
       const h = hit(pt, W, H);
       const id = h ? h.s.id : '';
@@ -715,20 +854,28 @@ function build(body: HTMLElement): DockTabHandle {
     // distance, so it has no business touching the plan's zoom.
     if (moved && wasPlan && !userSpan) userSpan = frozenSpan;
     frozenSpan = 0;
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-      /* pointer already gone */
-    }
+    release(canvas, e.pointerId);
     // A click that never moved changed nothing — don't dirty the scene for it.
     if (moved) doc.setRig(rig(), true);
   };
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
+  const releasePointer = (e: PointerEvent): void => {
+    if (gesture.count) {
+      const wasActive = gesture.active;
+      gesture.remove(e.pointerId);
+      if (wasActive || gesture.count >= 1) return;
+    }
+    endDrag(e);
+  };
+  canvas.addEventListener('pointerup', releasePointer);
+  canvas.addEventListener('pointercancel', releasePointer);
 
   // Wheel zooms the PLAN pane only. The direction chart is a fixed ±180/±90
   // domain — that fixed framing is exactly why a speaker's place in it means
   // the same thing from one rig to the next, so it deliberately does not zoom.
+  //
+  // `noPan`: the plan is always centred on the listener and has nothing to
+  // scroll, so a plain trackpad scroll zooms here rather than resolving to a
+  // pan that would do nothing. See `WheelOptions.noPan`.
   canvas.addEventListener(
     'wheel',
     (e) => {
@@ -736,10 +883,8 @@ function build(body: HTMLElement): DockTabHandle {
       const p = paneAt(toSurface(e), canvas.width / ratio, canvas.height / ratio);
       if (!p || p.kind !== 'plan') return;
       e.preventDefault();
-      const cur = userSpan || autoSpan();
-      userSpan = Math.max(SPAN_MIN, Math.min(SPAN_MAX, cur * (e.deltaY > 0 ? 1.15 : 1 / 1.15)));
-      invalidate();
-      syncBar();
+      const it = wheelIntent(e, { noPan: true, zoomRate: 0.002 });
+      if (it.kind === 'zoom') zoomPlan(it.factor);
     },
     { passive: false },
   );

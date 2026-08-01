@@ -69,16 +69,28 @@ avoid stepping on the invariants that keep it fast and correct.
    on a real `node.exe`. See [`05-native-engine.md`](05-native-engine.md) and
    [`11-packaging.md`](11-packaging.md).
 7. **Inside `#app`, CSS pixels are scaled by the UI-zoom.** Any code turning a
-   pointer coordinate into a style value or a canvas hit-test must convert. See
+   pointer coordinate into a style value or a canvas hit-test must convert —
+   and that includes a **measurement fed back into a style**, which is a
+   multiply-by-`scale` loop rather than a one-off offset. A floating panel's
+   `ResizeObserver` stored `getBoundingClientRect()` straight into its saved
+   width and grew by `uiScale()` on every pointer-move of a tear-off, ending up
+   kilopixels wide and *saved that way*. Geometry written back from a
+   measurement also gets a clamp, not just a conversion. See
    [`07-ui.md`](07-ui.md).
 8. **A widget drawn on more than one surface goes through
    `src/ui/facepaint.ts`.** Block faces and the Dock's mirrored clones share one
    painter, one drag feel, and one set of CV/MIDI indicators — a second copy of
    that math is how two surfaces silently drift apart. See
    [`07-ui.md`](07-ui.md).
-9. **Only the app's single rAF loop animates anything.** The Dock's canvases
-   take `onFrame` from it; a tab that starts its own loop burns CPU while
-   hidden. See [`10-performance.md`](10-performance.md).
+9. **Only the app's single rAF loop animates anything — and that loop is never
+   allowed to be throttled.** The Dock's canvases take `onFrame` from it; a tab
+   that starts its own loop burns CPU while hidden. Conversely, CV modulation is
+   applied *on* that loop and the default engine renders in this process, so
+   anything Chromium does to a window it thinks nobody is watching (minimized,
+   or covered by a fullscreen app) comes out as garbled audio — hence the
+   anti-throttling switches in `electron/main.cjs` and the hidden-window pump in
+   `src/main.ts`, which are one fix in two halves. See
+   [`10-performance.md`](10-performance.md).
 10. **A gain that moves must ramp across the quantum, and `Smooth.step` is
     per-QUANTUM, not per-sample.** Stepping a coefficient at quantum boundaries
     is ~370 discontinuities a second; calling `Smooth.step` in a sample loop
@@ -91,6 +103,63 @@ avoid stepping on the invariants that keep it fast and correct.
 12. **`setPointerCapture` always goes in a `try/catch`**, and no context menu
     ever opens on top of a live drag. Both cost whole interactions on touch and
     pen. See [`07-ui.md`](07-ui.md).
+13. **Nothing carrying state across quanta may latch a non-finite value, and
+    the quantum never exceeds `MAXQ`.** These are one bug: a quantum bigger than
+    the engine's 2048-frame buffers makes kernels read past them, `undefined`
+    arithmetic yields NaN, and a NaN in a *recursive* filter is permanent — the
+    block goes silent and stays silent through every change the user makes to
+    recover. That is what "EQ Curve stopped passing audio at 96 kHz" was.
+    **Fix the class, not the block**: trapping it in `Biquad` alone brought the
+    same report back as "now it's the Upmix", because the next stateful block
+    downstream simply inherited it. Every kernel with cross-quantum state calls
+    `trapNonFinite` and purges its **ring buffers** as well as its scalars, and
+    untrusted sample sources — hosted VSTs above all — are scrubbed at the
+    boundary. `scripts/nonfinite-recovery-test.cjs` walks every kernel. See
+    [`10-performance.md`](10-performance.md),
+    [`13-vst-hosting.md`](13-vst-hosting.md) and
+    [`06-audio-io-and-latency.md`](06-audio-io-and-latency.md).
+14. **Never hardcode a sample rate.** Coefficients, ITD taps, delay-line
+    lengths, recording caps and *drawn response curves* all scale with
+    `ctx.sr`. A constant 48 000 is a bug that only appears on someone else's
+    device. See [`10-performance.md`](10-performance.md).
+15. **A per-channel effect goes on every channel of the bus, or none** — and if
+    it has latency, that is doubly true.
+    The cheaper half of this first, because it is the one that keeps recurring:
+    a kernel that allocates a fixed `stereo()` output on a wide net does not
+    fold the bus, it **silences** everything above channel 1 (`computeNet`
+    writes `min(out.length, net.width)`). `eq-curve` did exactly that until
+    2026-08-01, and the bug reached us as *"the parametric EQ is completely
+    garbled"* — six dead speakers of a 7.1 rig with the front pair still
+    playing sounds like broken audio, not like a missing feature. Every
+    per-channel effect implements `setWidth` and builds its state banks there.
+    See [`05-native-engine.md`](05-native-engine.md) and
+    `scripts/width-kernel-test.cjs`.
+    Speaker correction is the case that made the latency half explicit: its
+    convolver costs one hop (~5.3 ms), so correcting only the *calibrated*
+    speakers of a rig would put those a hop behind their neighbours — about
+    1.7 m of path difference, introduced by the feature whose whole purpose is
+    to fix the imaging, and worse the more of the rig you corrected. An
+    uncalibrated speaker in a calibrated rig therefore runs through a **unit
+    impulse**, not a bypass. (A rig with nothing calibrated allocates no
+    convolvers and pays nothing.) The same trap waits for any future
+    overlap-add block applied per speaker. See
+    [`05-native-engine.md`](05-native-engine.md) and
+    [`10-performance.md`](10-performance.md).
+16. **An input port is fed by exactly one wire tree.** The native executor does
+    `node.ins[port] = net.buf` — last net wins, it does **not** sum — so two
+    independent wires into one input silently drop one of them, with a patch
+    that looks correct and compiles clean. Summing two sources into an input
+    means a **branch off the existing trunk** (trunk + branches are one net, and
+    a net sums its sources), which is what dragging a branch in the editor
+    already produces. Hand-built graphs have to do it deliberately; see
+    [`02-core-ir.md`](02-core-ir.md) and `scripts/factory-preset-test.mjs`.
+17. **All pointer, wheel and touch handling goes through `src/ui/input.ts`.**
+    Two-finger drags pan before they scale; on a trackpad, scrolling pans and
+    Ctrl/Shift scale; hit targets widen for a fingertip; `setPointerCapture` is
+    always guarded. Eight surfaces once held eight different answers to those
+    questions, which is why the Roll was uncontrollable and the dock splitters
+    ignored touch. [`14-input.md`](14-input.md) is **normative** — read it
+    before writing a `pointerdown` handler.
 
 ## Document index
 
@@ -110,6 +179,7 @@ avoid stepping on the invariants that keep it fast and correct.
 | 11 | [`11-packaging.md`](11-packaging.md) | Building the installer, releasing, and in-app updates |
 | 12 | [`12-testing-checklist.md`](12-testing-checklist.md) | **The regression checklist for new features** |
 | 13 | [`13-vst-hosting.md`](13-vst-hosting.md) | VST3 hosting: the native addon, threading rules, GUI embedding, scanner |
+| 14 | [`14-input.md`](14-input.md) | **Touch / trackpad / mouse / pen — the input standard (normative)** |
 
 ## Keeping this current
 
@@ -122,4 +192,4 @@ avoid stepping on the invariants that keep it fast and correct.
   with the harnesses in [`12-testing-checklist.md`](12-testing-checklist.md)
   rather than trusting a stale figure.
 
-_Last verified against the codebase: 2026-07-27._
+_Last verified against the codebase: 2026-08-01._

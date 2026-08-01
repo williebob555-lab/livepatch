@@ -1,7 +1,8 @@
 # 06 — Audio IO, Clock Drift, and Latency
 
-_Last verified: 2026-07-27. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
-`engine/src/midi.ts`, `scripts/midi-latency.cjs`._
+_Last verified: 2026-08-01. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
+`engine/src/midi.ts`, `scripts/midi-latency.cjs`, `scripts/ring-latency.cjs`,
+`scripts/out-meter-test.cjs`, `scripts/speaker-cal-test.cjs`._
 
 This is the most performance- and correctness-sensitive code in the app, and the
 place where the subtlest bugs have lived. **Read all of it before touching
@@ -109,13 +110,18 @@ Bounded to ~40 ms under heavy stalls instead of ~300 ms, 0 sustained underruns.
 
 A fixed setpoint has to assume the worst delivery pattern and costs real
 latency; the drift fix originally regressed capture latency to ~15 ms this way.
-`Ring.adapt()` now converges each device to its own floor:
+`Ring.adapt()` converges each device to its own floor:
 
-- Watches the observed fill **trough** over a 128-quantum window. Grows `+2n`
-  on a dip (a dip means it's close to glitching), shrinks by **half the
-  surplus** otherwise (fast convergence without hunting).
-- `floorMiss` (highest setpoint proven too low, slow decay) turns shrink/grow
-  hunting into monotone convergence.
+- Watches the observed fill **trough** over a 128-quantum window (`ADAPT_WIN`).
+- **The target is `floor + peakDip`** — the read floor plus the worst
+  *drawdown* (setpoint − trough) the stream has actually shown. Peak-hold:
+  instant attack, release over `DIP_RELEASE` (1024) windows ≈ 6 min at 128
+  frames / 48 kHz.
+- A window whose trough hits the floor is a **saturated** measurement (a ring
+  that runs dry reads as a smaller dip than it really was), so it isn't fed to
+  the estimator: grow `+2n` and let the next clean windows measure the truth.
+  Growth is bounded by half the ring — a setpoint past what the buffer holds
+  isn't latency, it's a permanent underrun.
 - **The floor is `n + TAPS*2`, not `TAPS*2`.** A read consumes a whole quantum
   in one call, so a start-of-quantum fill above just the tap window still
   starves halfway through — the symptom was a healthy-looking fill with ~50
@@ -123,7 +129,39 @@ latency; the drift fix originally regressed capture latency to ~15 ms this way.
 - **Prime conservatively and shrink down.** Growing into place from too low
   underruns the whole way up, and `burst` (the device's real delivery size)
   isn't known until the first delivery lands — so keep revising the estimate
-  while priming.
+  while priming, and seed `peakDip` from `burst` so the first read-before-push
+  ordering is covered before it has ever been seen.
+
+#### Measure the drawdown; don't probe for it — the "pops every ~10 s" fix (2026-07-30)
+
+**A tuner whose only feedback signal is an underrun has to keep producing
+underruns.** The previous version held the setpoint a fixed `n/2` above
+`floorMiss` (the highest level already proven too low) — but `floorMiss` decayed
+by `n/16` on *every* clean window, unconditionally. Because the setpoint was
+clamped to `floorMiss + n/2`, that decay *was* the steady-state shrink rate: the
+level being converged onto slid downward at ~24 frames/s forever, dragging the
+setpoint straight back into the region that had just glitched. Period ≈
+`2n ÷ decay` ≈ 11 s, indefinitely.
+
+The field logs show it with no ambiguity: `load` 0.02, GC max 0.2 ms, `late` 0,
+`jitterQ` ~1.1 — and `inDepth` falling in exact 48-frame steps every 2 s with
+`xrunsDelta` non-zero at every jump back up. Nothing was overloaded; the
+latency tuner was manufacturing the pop.
+
+The drawdown is observable on **every** window, whether or not it crosses the
+floor, so tracking its peak gives the loop the same information without needing
+an audible failure to produce it. A release that overshoots is corrected by the
+next ordinary dip instead of by a click.
+
+- No positive feedback: in a clean window `dip = setpoint − trough`, so
+  `want = f + dip > setpoint` only when `trough < f` — which that branch already
+  excludes. The loop converges on `trough == f` instead of running away.
+- Measured (`scripts/ring-latency.cjs`, CLUSTERS): **441 → 10** underruns per
+  900 s after settle, at the same standing latency (~34 vs ~37 ms peak). On a
+  tidy device latency lands at `f + burst` and releases toward `f + n/2`.
+- **Don't add a multiplicative safety factor to `peakDip`.** `f + k·dip` with
+  `k > 1` *does* run away (`setpoint > 5T − 4f` is satisfied at the operating
+  point). Margin here has to be additive.
 
 Measured floors: ~5.3 ms for a 128-frame-delivery device, ~13.7 ms on bursty
 Voicemeeter WASAPI capture, ~4.0 ms via the ASIO bridge — all with 0 xruns.
@@ -159,11 +197,57 @@ silence, and it self-limits.
 
 - **The graph still runs on a skipped quantum.** Only the write is dropped, so
   recorders, sequencers and the input rings do not skip a beat.
+- **Both pumps bail if they are not the current master** (2026-07-30). audify
+  posts callbacks to the JS event loop and `closeStream` does not un-post the
+  ones already queued, so a closed WASAPI master delivers one more callback
+  *after* an ASIO master has taken over. By then `masterOutChans` is the ASIO
+  out-span (32 on a MOTU) while `this.mix` is still the 2-channel WASAPI mix, so
+  the interleave read `this.mix[2][i]` and threw — inside an audify callback,
+  which is fatal. The engine died with `0xC0000409` and restarted **every time
+  the user switched to ASIO** (five times in one diagnostics session, each one a
+  hole in the audio, reported as popping). `wasapiPump` returns early when
+  `masterIsAsio`, `asioPump` when it isn't; both also clamp their channel span
+  to the buffers that actually exist.
+- **The ASIO input Buffer gets a cached Float32 view.** `new Float32Array(
+  input.buffer, …)` per callback is ~375 heap allocations a second in the audio
+  pump — the same trap `OutputRec.writeView` documents on the output side.
 - The ASIO buffer is also **capped to `MAXQ`** (2048). Every graph-facing buffer
   in `io.ts` is that size, so a driver whose preferred size is larger would
   overrun them — and audify would then reject every write for a size mismatch.
   Passing a size to ASIO *is* honoured (RtAudio clamps it to the driver's
   granularity), so the stream is re-opened rather than run corrupt.
+
+### No allocation in a capture callback either (2026-07-30)
+
+Golden rule 1 covers the *pump*, and it is easy to forget that a **capture**
+callback is the same audio path. Both input routes were allocating per chunk:
+
+- **WASAPI / DirectSound capture** built
+  `new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4)` inside
+  the callback — a throwaway TypedArray *object* roughly 375 times a second
+  **per open input device**, at 128 frames / 48 kHz. This is precisely the trap
+  `copy` in `dsp.ts` documents for `subarray`, and the ASIO side of this file had
+  already closed it (`asioInView`); the capture path was simply missed. Fixed
+  with `captureView(rec, data)` — the same three-field
+  (`buffer`/`byteOffset`/`byteLength`) invalidation check, cached **per
+  `InputRec`** rather than per manager, because there is one such stream per
+  device and they hand back different buffers.
+- **The ASIO bridge socket** was worse, and it does *not* have the same shape —
+  do not "fix" it by reaching for `captureView`. Every socket chunk genuinely
+  arrives in a different backing store at a different offset (Node hands out
+  slices of a rotating pool), so a cached view would miss on every chunk. The
+  old code did four allocations per chunk: a `Buffer.concat` whenever a
+  remainder carried, an `ArrayBuffer.slice` (a full **copy**, needed because
+  socket offsets are not float-aligned), a `Float32Array` over it, and a
+  `subarray` for the leftover. It is now a persistent byte accumulator plus a
+  persistent float scratch, both grown-only, with `readFloatLE` doing the
+  unaligned reads — steady state allocates nothing. `Ring.push` gained an
+  optional `count` so a reused scratch can be handed over without being sized
+  to fit.
+
+The bridge handler runs on the engine's event loop rather than inside an RtAudio
+callback, which sounds like a reprieve and is not: that is the **same** loop the
+pump runs on, so its garbage lands in the pump's GC pauses.
 
 ### The lowest-latency path
 
@@ -268,10 +352,201 @@ up":**
 4. **No stderr writes near stream spin-up.** A synchronous pipe write in the
    spin-up window freezes the stream; the status header is delayed ~1.5 s past
    `start`. And **no stdin reads** (same class of stall).
+5. **The bridge raises its own process priority** (`PRIORITY_HIGHEST`), exactly
+   as `engine/src/main.ts` does. See below — this one was missing for a while
+   and it is the most expensive omission in the file.
 
 ASIO4ALL and real hardware drivers tolerate all variants; the VB-Audio virtual
 drivers are the strict ones that expose these rules. Test against a virtual ASIO
 driver, not just hardware.
+
+### The bridge dies when the window loses focus — and nothing noticed
+
+**This is "audio garbles when the app is minimized or something is fullscreen in
+front of it", and the measurement is unambiguous** (field capture, 2026-07-31,
+MOTU Gen 5 ASIO master + a Voicemeeter Virtual ASIO capture bridged in):
+
+```
+t=0 … 783.7   window focused   inDepth 486   xrunsDelta 0   late 0   ← 13 minutes clean
+t=784.622     WINDOW BLURRED
+t=785.664     inDepth 2022     xrunsDelta 578
+t=787.665     inDepth 2048     xrunsDelta 1108   starved:["Voicemeeter Virtual ASIO"]
+              … ~1110 xruns per 2 s, indefinitely
+```
+
+Read the rest of that status line while it happens: `late: 0`, `load` 0.03–0.05,
+GC 0.2 ms. **The engine is perfectly healthy.** Only the bridged capture dies,
+one second after the window stops being foreground, and it never comes back.
+
+The bridge reported **nothing dropped** across the whole failure, which is what
+makes the diagnosis: it was not short of CPU and not backed up on its socket, so
+it was not holding audio it could not send. Its ASIO callback had simply stopped
+being delivered — the degradation this file already documents ("an otherwise
+empty loop … the stream freezes within ~1 s"), at exactly that latency. The
+process stays alive and the socket stays open, so from the parent it is
+indistinguishable from a device that has gone quiet.
+
+Three things follow, all of them now in place:
+
+1. **The keepalive is 20 ms, not 250.** The original interval was tuned against
+   an idle foregrounded machine; Windows coalesces and defers timers for a
+   process it considers background, and an under-serviced loop is precisely the
+   documented trigger. An empty callback at 50 Hz costs nothing.
+2. **`IoManager.checkBridges` restarts a capture that has stopped.** No PCM for
+   two seconds while the engine runs means the stream is dead whatever killed
+   it: tear it down and open it again. A ~1 s gap instead of a permanent one.
+   Bounded at `MAX_REVIVES` — a bridge that will not stay up is a configuration
+   problem and respawning it forever hides that. `scripts/bridge-watchdog-test.cjs`.
+3. **The bridge says when it has stalled** — a 2 s heartbeat reported *only*
+   when no frames arrived, so a healthy stream is silent in the log and a dead
+   one announces itself. Without it, "the stream stopped" and "the transport
+   stopped" look the same from the parent, and that was the whole difficulty.
+
+Note what (2) is and is not. It is a **recovery**, not a cure: if the underlying
+freeze still happens, the user hears a short gap every time instead of a
+permanent one. Do not let its presence stop anyone chasing the freeze itself.
+
+#### …except the stream does not actually stop
+
+The next capture (16:16) disproved the freeze hypothesis, which is exactly what
+the telemetry above was added for. Through repeated starvation:
+
+- the bridge's **stall heartbeat never fired** — it never went 2 s without
+  capturing a frame;
+- the **watchdog never fired** — PCM never stopped arriving at the parent;
+- **nothing was dropped.**
+
+So the ASIO callback keeps running and the socket keeps delivering, and the ring
+starves anyway. It is not a dead stream. That capture also weakens the focus
+correlation the previous one showed so cleanly: it ran clean for eight seconds
+in the *middle* of a blur, and kept xrunning after regaining focus.
+
+What is left is one of two things, and they have nothing in common:
+
+- **A rate deficit** — the source genuinely delivers fewer frames per second
+  than the master consumes. The drift resampler has ±0.5 % of authority and
+  cannot close anything larger, so the ring starves forever by arithmetic.
+- **Burstiness** — enough audio, arriving in clumps further apart than the ring
+  holds. A scheduling problem in the transport, not a clock problem.
+
+`status.bridges` reports `fps` (frames the bridge actually delivered per second)
+and `gapMs` (longest interval between deliveries) so the next capture answers it
+outright: the consumer's appetite is exactly the sample rate, so `fps` well
+under it is the first case and `fps` at it with a wide `gapMs` is the second.
+
+**Do not guess between these again — the numbers are in the log now.**
+
+#### Bridge rings are sized for a bridge
+
+Independently of which of the two it turns out to be, the ring was **too small
+by construction**. `frames * 32` is the direct-capture size, and the adaptive
+setpoint is capped at half the ring — so on a 128-frame master a bridge could
+buy at most 2048 frames (21 ms at 96 k) of headroom. Every field capture shows
+the setpoint pinned at exactly that ceiling with the stream still running dry:
+the controller was asking for more headroom than the buffer could physically
+give it.
+
+A bridge is not a direct capture. Its audio crosses a process boundary, a
+batching step and a socket, any of which can clump delivery in a way a driver
+callback does not, so it gets `frames * 128`. This costs no latency — the
+setpoint is adaptive and a healthy bridge settles at the same few-hundred-frame
+fill it always did — and 512 kB of memory, once, at open.
+
+#### …and it was the transport, throttled by a parked event loop
+
+The rate-deficit-vs-burstiness question was the wrong fork: it was neither a
+*clock* deficit nor plain burstiness, it was the transport being **throttled**.
+Measured on the target box (Win11, Ryzen 5 5600G): a backgrounded `node.exe`
+gets a **15.6 ms timer granularity**, regardless of the system-wide timer
+resolution. This is the Windows 10 2004+ per-process `timeBeginPeriod` change —
+one process holding the timer at 1 ms no longer speeds up anyone else, and a
+plain node process never opts in. Confirmed directly: a fresh node process reads
+15.6 ms timer gaps even while Chrome is holding the system timer at 1 ms, and
+**`Atomics.wait(…, 1)` coalesces to 15.6 ms too** — it is not a way out.
+
+audify delivers every ASIO capture buffer through a thread-safe callback that
+must be drained on the bridge's event loop ~750×/s (128 f / 96 k). When that loop
+parks for 15.6 ms at a stretch, the audify thread-call back-pressures against a
+loop that is not being serviced, and the driver's *effective* delivery collapses.
+The signature in the logs is unmistakable and it is what "garbles when minimized"
+actually is: minimize the window and the bridge sustains **~1108 xruns / 2 s
+(≈ 26 % of realtime delivered), indefinitely**, with the process alive, the
+socket open, nothing dropped and no 2 s stall. The stream never *stopped* — it
+was starved of loop-servicing. `PRIORITY_HIGHEST` does not touch this, because
+scheduling priority is not timer resolution.
+
+The `setImmediate` self-loop (`bridge.ts` `keepLoopHot`) keeps libuv in a 0 ms
+poll every iteration so the audify queue drains every ~2 µs and never backs up.
+It is started **only after spin-up** (`live`), leaving the bisected startup
+window — where an over-active loop is itself a documented way to freeze the
+stream — untouched. The 20 ms keepalive stays: it still carries the drop/stall
+reporting. **This was necessary but not sufficient** — see below.
+
+#### The actual root cause: Windows power throttling (EcoQoS)
+
+The loop-hotness fix did not stop it. The deciding experiment: spawn the *exact*
+bridge binary standalone (not under LivePatch) against Voicemeeter Virtual ASIO
+and count delivered frames — it holds a **rock-solid 96000 fps at ~100 % of one
+core**, indefinitely, as an ordinary background process. The same binary, spawned
+as a grandchild of the LivePatch window, collapses to **~26 % of realtime the
+moment that window stops being foreground** (`fps ≈ 24832`, `gapMs ≈ 17`,
+`starved`). The isolation the user found nails it: the fault appears **only** when
+the capture is the ASIO bridge (its own process), never when it is a WASAPI
+capture of the same Voicemeeter output (which runs inside the engine process,
+kept alive by the master callback).
+
+That is the signature of **EcoQoS / power throttling**: Windows runs a
+backgrounded process's threads at reduced execution speed to save power, and it
+does so **independently of priority class** — a `PRIORITY_HIGHEST` process is
+still throttled — and the state is inherited down the process tree from a
+backgrounded GUI parent. Priority, realtime scheduling flags and a hot event
+loop are all orthogonal to it; none of them opt out.
+
+The opt-out is `SetProcessInformation(ProcessPowerThrottling, …)` with the
+EXECUTION_SPEED bit explicitly disabled — "run this process at full speed,
+foreground or not." Node has no binding for it, so `winqos.ts` shells it out once
+at startup via PowerShell + a base64 `-EncodedCommand` (no temp file, off the
+audio path, non-fatal on failure). Applied to **the engine** (self, in `main.ts`)
+and **each bridge child** (from the parent, in `io.ts` right after `spawn`).
+Verification is the bridge's own `fps` telemetry: it must hold the sample rate
+while the window is backgrounded. WASAPI captures need no opt-out — they live on
+the engine's already-protected loop.
+
+Order of the three that shipped, and why each stays: (1) priority — necessary
+floor; (2) hot loop — the bridge does too little work to keep its own loop
+scheduled, so it needs an independent reason to stay hot; (3) EcoQoS opt-out —
+the actual cause of the background-only collapse. Removing any one re-opens a
+door.
+
+### The bridge is a realtime process and must be scheduled like one
+
+The engine raises itself to `PRIORITY_HIGHEST` because the DSP pump shares its
+event loop. The bridge carries a realtime ASIO capture stream on *its* event
+loop and, when it was split into its own process, it never got the same call —
+so it ran at default priority. Windows boosts a foreground/fullscreen app and
+deschedules normal-priority background processes; the bridge then delivers its
+256-frame batches late and in clumps, the parent's capture ring runs dry, and
+every pump that finds it dry is an xrun.
+
+The reason this was hard to see is that **the engine looks healthy the whole
+time**: `late: 0`, `load` under 5 %, `loadMax` fine. The engine *is* healthy —
+it is the process feeding it that is not being scheduled. So the telemetry now
+distinguishes the two cases explicitly:
+
+- `Ring.starved` / `status.starved` — the ring's adaptive setpoint has bought
+  every frame of headroom the buffer can hold and the stream is *still* running
+  dry. That is not a tuning problem and more latency cannot help it; the
+  producer is not keeping up. `status.starved` is **absent unless something is
+  starving**, so its presence in a log is the finding. Field capture before the
+  fix: `inDepth` pegged at the ceiling (2048) with ~556 xruns/s, sustained,
+  which without this field reads as an ordinary badly-tuned stream.
+- The bridge's stall guard (which bounds its queue by **discarding** captured
+  audio — a splice, and audible) now counts what it throws away and reports it
+  from the keepalive timer, never from inside the audify callback. Otherwise
+  "the bridge never got the audio" and "the bridge got it and binned it" are
+  indistinguishable from the parent.
+
+Regression cover: the STARVED/HEALTHY cases in `scripts/ring-latency.cjs`.
 
 ## MIDI
 
@@ -386,6 +661,52 @@ round-trip**, exposed via the `measure-latency` protocol op and the Engine menu
 - Verified against Voicemeeter Virtual ASIO (internal out→in loop): ~2.6 ms
   round trip at 128 frames / 48 kHz.
 
+## Measuring the speakers (the calibration sweep, 2026-07-31)
+
+The Rig tab's **Calibrate** plays an exponential sweep out of every speaker in
+turn and captures a measurement microphone (`IoManager.measureSpeakers` /
+`runSweep`, `measure-speakers` op). It is the loopback probe's bigger sibling
+and shares its shape: preallocate everything up front, run a state machine
+inside the pump, copy floats and nothing else.
+
+**The engine does no analysis, and that is the design.** It plays a sweep it
+was handed and ships back what it heard; the deconvolution, the gating, the
+microphone calibration and the correction curve are all in
+`src/core/calibrate.ts`, in the renderer. The engine's event loop *is* the audio
+pump, so a quarter-million-point FFT here would be a ~50 ms stall — a dropout in
+the middle of the very measurement it was supposed to produce, next to a live
+ASIO stream whose watchdog is documented above to kill the client over less.
+
+Three consequences worth not undoing:
+
+- **The sweep is generated in the renderer and sent** (base64 float32, once per
+  run). The deconvolution divides the capture by *this exact signal*; two
+  hand-copies of an exponential-sweep formula that disagree in the last decimal
+  produce a response that looks entirely plausible and is wrong. One generator,
+  one array — the same reasoning as `__rig` (docs/02).
+- **The capture goes back in chunks** (`speaker-sweep`, 8192 samples of int16
+  each, one per 20 ms tick). `send` writes to stdout, which is **synchronous on
+  Windows for pipes as well as files** — the same fact that put the ASIO bridge
+  on a TCP socket. A single 300 kB write would block the pump for its own
+  length. The chunks go out in the gap between speakers, where there is nothing
+  to hear anyway, and `NativeEngineClient` reassembles them; a chunk arriving
+  out of sequence drops the whole capture rather than stitching a hole into it
+  (a capture with a hole deconvolves into a perfectly plausible wrong answer).
+  `electron/main.cjs` logs the header only — the diagnostics file must not fill
+  with base64 samples.
+- **The sweep is *added* to whatever the graph is producing**, exactly like the
+  latency probe's click, and it goes out through the same route resolution
+  `pushOutputCh` uses (`sweepOut`). Measuring a different channel than the one
+  `speaker-rig` will correct is worse than not measuring at all.
+
+The run needs the output channels to physically exist, so it checks
+`outChannels()` up front and says *that* — "the rig needs 8 channels and the
+device has 2" — rather than letting it fail later as "no signal on the
+microphone", which sends the user hunting for a cable that is fine. A run is
+torn down on `stop()` as well as on completion or cancel: the state machine is
+advanced by the pump, so a run left in flight when audio stops would leave a
+progress dialog that can never finish and a capture stream it opened itself.
+
 ## Telemetry (surface, don't hide, glitches)
 
 `status` carries: `load`/`loadMax` (DSP time ÷ budget), `jitterQ` (worst gap
@@ -394,16 +715,196 @@ that missed their deadline), `inDepth` (converged capture latency), `xruns`.
 `late` and `xruns` surface in the app status bar. When a user reports a click,
 these tell you instantly whether it was starvation, a CPU stall, or drift.
 
+### …and when every one of them is clean (2026-08-01)
+
+All of the above measure whether the **pump** held its deadline. A click
+generated *inside* the DSP — a spliced buffer, an un-ramped gain change, a param
+that jumped, a kernel whose state reset — is delivered perfectly on time, so it
+moves none of them. That is a real and recurring shape of report: field logs of
+sessions the user described as popping throughout read `late: 0`,
+`xrunsDelta: 0`, GC max 0.2 ms and `load` 0.03 from the first line to the last.
+Reading those numbers as "nothing is wrong" is how that report goes in circles.
+
+So the master output is metered too (`IoManager.meterOut`, one sequential pass
+over the buffers the interleave loop is about to read, allocation-free,
+~0.44 % of a 128-frame quantum at a 32-channel ASIO span):
+
+- **`dMax`** — the largest sample-to-sample step written to the device since the
+  last status. A click *is* a step discontinuity, and ordinary audio's slope is
+  bounded by its bandwidth: a full-scale 1 kHz sine steps 0.131 per sample at
+  48 kHz, and the whole "click once a minute" splice was identified by exactly
+  this measurement (jumps of 0.97–1.76 where the signal's own max slope was
+  0.059). `dMax` near 1 with `late: 0` and no xruns says the click is **in the
+  audio the graph produced**; `dMax` at the signal's own slope while the user
+  still hears popping says it is **not in the engine's output at all** — look
+  downstream (the endpoint, a virtual device chain, the interface) instead.
+- **`peak`** — the *pre-clip* peak. Above 1 the graph is driving into `clip()`
+  and the "pop" is distortion, not a dropout; that is what a too-wide rig on a
+  narrow device produced (measured peak 4.000, above).
+- **`clip`** / **`nonFinite`** — clamped samples, and channel-quanta that
+  carried a NaN/Infinity out. **Both are absent from the status unless they
+  happened**, like `starved`, so their presence in a log is the finding.
+  `nonFinite` is the docs/10 NaN latch observed at the end of the chain rather
+  than inferred from "block X went silent".
+
+The last-written sample is carried across quanta (`outLast`), because a seam on
+the **buffer boundary** is precisely where a buffer-level bug puts one, and a
+meter that resets per quantum is blind to exactly that case.
+`scripts/out-meter-test.cjs` covers all six behaviours.
+
+### The splices the engine performs on purpose (2026-08-01)
+
+Three places in this file deliberately create a discontinuity to keep latency
+bounded. Each is audible. **None of them moves any other counter** — nothing
+ran dry, so no xrun; the pump was on time, so no `late` and no `jitterQ` — and
+until they were counted, a session spent splicing produced a log *identical* to
+a clean one. That is one exact shape of "sometimes it runs fine and sometimes it
+just decides to go popping": the popping episodes were not being recorded.
+
+- **`ringTrim`** — `Ring.capLatency` dropped stale capture surplus. Designed to
+  land inside a dropout the stall already caused; when it fires on its own it is
+  a click. Pure drift must never reach it (`scripts/ring-latency.cjs` STEADY
+  asserts 0), so a `ringTrim` in a steady-state log is a real finding.
+- **`ringOver`** — a producer overwrote frames the consumer had not read yet.
+  The same splice from the other end.
+- **`asioSkip`** — `asioPump` skipped a write to drain its output queue. A whole
+  quantum the DAC never hears. The `info` line next to it is deliberately
+  once-per-stream-open so a startup trim storm cannot flood the log, which also
+  meant **recurring** skips mid-session were completely silent; the count is the
+  part that survives that throttling.
+
+All three are absent from `status` unless they happened, so their presence is
+the finding (same rule as `starved`).
+
+### The trim that fired on ordinary delivery — the "random pops" fix (2026-08-01)
+
+The first field log carrying `ringTrim` answered the question in one line, which
+is what naming the ring is for:
+
+```
+ring "in:Voicemeeter Out B1"  n 1  fill 1582  drop 258  set 1197  burst 128
+  late 0   xrunsDelta 0   load 0.06   GC max 0.17 ms   jitterQ 1.2
+```
+
+`fill` equals `set + 2·burst + n` **to the frame**, and `drop` equals
+`fill − (set + burst)` to the frame: `capLatency` is firing exactly at its
+threshold and cutting ~257 frames (2.7 ms) out of the capture, **1–2 times a
+second, for the entire session**. It happens in windows where `peak` is 0 — it
+trims silence — so it is not the material. Every other counter is clean, which
+is why this survived so long.
+
+**Why:** `burst` reads **128**. It is `max(framesPerPush)`, and a capture opened
+at the master's frame size does get 128 frames per callback — but the endpoint's
+period is a fixed ~10 ms, so ~11 callbacks land back-to-back and then nothing.
+The real fill excursion is ~1400. The threshold is therefore *inside* the
+ordinary sawtooth. **And it is rate-dependent**: the clump is a duration, so it
+is twice as many frames at 96 kHz as at 48 kHz while `burst` stays at the frame
+size — which is the "higher sample rates pop more" report, exactly.
+
+**The fix is in the measurement, not the threshold.** `burst` is now *frames
+between two reads* — one delivery, however many callbacks it took — voted as the
+**minimum** over `BURST_HIST` (4) windows. The min-vote is what separates the
+two floods that look identical to a running max: a clumping device produces a
+big delivery in *every* window (and the threshold must clear it), an event-loop
+stall produces one in *one* window (and the trim exists to drain it). During
+warm-up, before the vote has history, the old per-push max still carries the
+estimate — priming and `capLatency` both read `burst` from the first quantum,
+and letting an early stall inflate it stopped the trim firing on the very first
+backlog (93 ms standing fill instead of 29).
+
+Reproduced and asserted by **CLUMPED** in `scripts/ring-latency.cjs`, at both
+rates: before, 0.34 trims/s dropping 257 frames at 96 kHz and 0 at 48 kHz;
+after, **0 at both**. Every other scenario reports numbers identical to before
+the change (STEADY 18.6 ms, STALLS 29.3 ms / 5 trims, CLUSTERS 10 underruns /
+36.6 ms) — which is the point: the threshold was never wrong, the number fed to
+it was.
+
+**Do not move this fix into `capLatency`.** `capLatency` and `adapt` are one
+loop — these trims deepen the troughs `peakDip` measures, so anything that
+merely trims *less* also shrinks the setpoint and the tuner stops buying the
+headroom the stall cases need. Three attempts at the threshold are recorded in
+`Ring.capLatency` with what each one broke (CLUSTERS 10 → 114, 10 → 284, and
+STALLS 29 → 94 ms).
+
+## Sample rate, and the MAXQ ceiling — the "EQ Curve stopped passing audio" fix (2026-07-30)
+
+The engine runs at whatever rate the device is opened at
+(`requestedRate || dev.preferredSampleRate || 48000`), and `ctx.sr` is handed to
+every kernel each quantum. Raising it is a supported thing to do. What was not
+safe was the **buffer size that comes with it**.
+
+Every graph-facing buffer in the engine — `IoManager.mix`, the interleave
+scratch, and every kernel's working arrays in `dsp.ts` — is exactly `MAXQ`
+(2048) frames. Nothing enforced that the quantum fits:
+
+- The **ASIO** path capped at MAXQ (a driver's preferred size can exceed it),
+  and the comment next to it said, accurately, "only the WASAPI path has to live
+  with what it gets."
+- The **WASAPI** path passed `requestedFrames || 256` straight through, and the
+  settings prompt accepted any number the user typed. Measured on this machine:
+  ask WASAPI for 4096, get 4096.
+- WASAPI's period is a fixed **duration**, so the frame count scales with the
+  rate. A size that is comfortable at 48 kHz is twice as many frames at 96 kHz
+  and four times at 192 kHz — the ceiling gets closer precisely when you raise
+  the rate.
+
+A quantum past MAXQ does not throw. Typed-array writes past the end are dropped
+and reads past the end return `undefined`, so the DSP computes `b0 * undefined`
+= **NaN**. And a NaN in a recursive kernel is permanent — see the biquad rule in
+[`10-performance.md`](10-performance.md). The user-visible result was a block
+that "stopped passing audio through" and stayed dead through further sample-rate
+and buffer changes, with no error anywhere.
+
+The fix is three layers, because any one of them alone leaves a hole:
+
+1. `clampFrames()` caps what is *requested* (and `MAX_ENGINE_FRAMES` in
+   `src/engine/native.ts` caps it in the settings UI, including settings saved
+   before the cap existed).
+2. Both master paths re-ask at MAXQ if the driver *grants* more, exactly as ASIO
+   already did.
+3. `refuseOversize()` is the backstop: a driver that still insists gets its
+   stream closed, an explicit error, and the idle pump — audible silence with a
+   stated reason, never a graph reading past its own arrays.
+
+`scripts/samplerate-test.cjs` covers all of it, including the oversize quantum
+itself, so a kernel that regresses to latching NaN fails there rather than in
+someone's session.
+
+**Note on WASAPI and rate:** `getStreamSampleRate()` reports the rate the stream
+was *opened* at, not the endpoint's own. RtAudio's WASAPI backend resamples
+internally, so asking for 192 kHz on a 48 kHz shared-mode endpoint "succeeds"
+and reports 192000 while the endpoint still runs at 48 kHz — you pay for the
+high rate in CPU and get RtAudio's conversion on the way out. If the rate is
+meant to be real, set the endpoint (or use ASIO, where the driver owns it).
+
 ## Invariants (IO-specific)
 
+0. **The quantum never exceeds MAXQ.** Every graph-facing buffer is that size,
+   and overrunning them is NaN in the DSP, not a dropout — see the section
+   above. Buffer sizes scale with the sample rate; the cap must be checked after
+   the driver answers, not only before it is asked.
 1. **Never bridge independent clocks by dropping/repeating samples.** Resample.
 2. **Never hardcode a latency/buffer constant.** Setpoints self-tune per device.
+   But a self-tuner must **not learn by glitching** — if the only thing that
+   moves the setpoint up is an underrun, the loop is obliged to keep producing
+   them, forever, on a fixed period. Tune on a quantity you can observe without
+   failing (here, the fill drawdown). See `Ring.peakDip`.
 3. **The audio callback allocates nothing and blocks on nothing.** No sync IO,
-   no logging, no stderr near stream open.
+   no logging, no stderr near stream open. **This includes *capture* callbacks
+   and the bridge's socket handler** — a per-chunk `Float32Array`, `subarray`,
+   `Buffer.concat` or `ArrayBuffer.slice` is garbage on the audio path however
+   small it looks. Cache the view, reuse the scratch.
 4. **Reconfigure is delta-based**; full teardown per edit is a latency and UX
    regression.
-5. **The bridge's four rules above are load-bearing.** Changing any one has
-   frozen the stream.
+5. **The bridge's five rules above are load-bearing.** Changing any one has
+   frozen the stream — or, in the case of the priority rule, made the audio
+   break whenever another app came to the foreground.
+5a. **Every process on the audio path raises its own priority.** The engine
+   does; the bridge does. A helper process that carries realtime audio and
+   runs at default priority works perfectly on an idle machine and falls apart
+   the moment the user opens a game — and it does it while every engine-side
+   metric reads healthy, because the engine *is* healthy. If a new process ever
+   joins this path, it gets the same call.
 6. **Prefer `asio-in` for low latency**; it bypasses the ring entirely.
 7. **Bound any output path whose writes are not paced by the audio thread.**
    audify preserves the initial write/consume lead forever, so an unbounded

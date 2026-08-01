@@ -81,11 +81,17 @@ export function resetPrefs(): void {
 /**
  * The preferred device for a block type, or `''` when there is no preference.
  *
- * Called from `GraphDoc.makeBlock`, so it must stay cheap and never throw: a
- * preference that cannot be read has to degrade to "(default)", not to a block
- * that fails to be created.
+ * Called from `GraphDoc.makeBlock` **and from the compiler** (every recompile,
+ * per hardware node), so it must stay cheap and never throw: a preference that
+ * cannot be read has to degrade to "(default)", not to a block that fails to be
+ * created or a graph that fails to compile.
+ *
+ * `api` is the block's own driver selection where it has one. Multi In and
+ * Speaker Rig each carry both worlds on one block, so which of the four
+ * preferences applies depends on the driver they are pointed at — reading only
+ * the type would offer an ASIO Multi In a WASAPI device name.
  */
-export function defaultDeviceFor(blockType: string): string {
+export function defaultDeviceFor(blockType: string, api?: string): string {
   const p = prefs();
   switch (blockType) {
     case 'audio-in':
@@ -96,7 +102,32 @@ export function defaultDeviceFor(blockType: string): string {
       return p.asioIn;
     case 'asio-out':
       return p.asioOut;
+    case 'multi-in':
+      return api === 'ASIO' ? p.asioIn : p.deviceIn;
+    case 'speaker-rig':
+      return api === 'Windows' ? p.deviceOut : p.asioOut;
     default:
       return '';
   }
+}
+
+/**
+ * The device a block will actually open: its own `device` param, or the
+ * installation default when that is blank.
+ *
+ * **"(default device)" means the default you chose, not the one Windows
+ * chose.** The preference used to be applied only once, by `makeBlock`, so it
+ * was a template for *new* blocks: every block that predated the setting — and
+ * every block in every scene shared, imported, or built by the factory presets
+ * — stayed on the system default forever, and changing the preference moved
+ * nothing. Resolving it here instead makes a blank `device` a live reference to
+ * the setting, which is what the Options menu reads like it should be.
+ *
+ * A block naming a device explicitly is untouched: an explicit choice always
+ * outranks a default.
+ */
+export function resolveDevice(blockType: string, device: unknown, api?: unknown): string {
+  const own = typeof device === 'string' ? device : '';
+  if (own) return own;
+  return defaultDeviceFor(blockType, typeof api === 'string' ? api : undefined);
 }

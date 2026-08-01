@@ -18,7 +18,9 @@ import { doc } from '../core/graph';
 import { runtime } from '../engine/runtime';
 import { getCassettePeaks } from '../core/cassettes';
 import { resolveAssetFor } from './tape';
-import { SWAPPABLE_WIDGETS, linkTarget, widgetSize } from './layout';
+import { MARK_H, SWAPPABLE_WIDGETS, linkTarget, widgetSize } from './layout';
+import { PANEL_GLYPHS, drawPanelGlyph } from './glyphs';
+import { setFont, uiFont } from './canvastext';
 import {
   SampleHandle,
   drawKeys,
@@ -305,7 +307,7 @@ export interface WidgetPaintOpts {
  */
 export function paintFaceWidget(
   g: CanvasRenderingContext2D,
-  rect: Rect,
+  rect0: Rect,
   r: ResolvedRef,
   theme: Theme,
   o: WidgetPaintOpts = {},
@@ -314,14 +316,39 @@ export function paintFaceWidget(
   if (!spec) return;
   const t = r.target;
 
+  // Panel silkscreen (`ParamSpec.mark`): the strip `layout.ts` reserved at the
+  // bottom of the item. Carved off here, once, so every painter below sees the
+  // widget's own box and none of them has to know the mark exists. Drawn last
+  // (after the widget) so a mark can never be painted over.
+  const mark = o.cs?.showMark === false ? undefined : spec.mark;
+  const rect: Rect = mark && rect0.h > MARK_H * 2 ? { ...rect0, h: rect0.h - MARK_H } : rect0;
+  const paintMark = (): void => {
+    if (!mark || rect === rect0) return;
+    const box = { x: rect0.x, y: rect0.y + rect0.h - MARK_H, w: rect0.w, h: MARK_H };
+    if (PANEL_GLYPHS.has(mark)) {
+      // Symbols are printed small and centred, the width of the dial rather
+      // than of the box, so a row of marked knobs lines up.
+      const w = Math.min(box.w - 6, 26);
+      drawPanelGlyph(g, mark, { x: box.x + (box.w - w) / 2, y: box.y + 2, w, h: box.h - 4 }, theme.portLabelColor, 1.1);
+      return;
+    }
+    setFont(g, uiFont(8));
+    g.fillStyle = theme.portLabelColor;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(mark, box.x + box.w / 2, box.y + box.h / 2);
+  };
+
   // `octave`/`length` are siblings of the widget's own param, so they come
   // from the block that owns it — the child for a mirrored ref, not the host.
   if (spec.widget === 'keys') {
-    drawKeys(g, rect, theme, Number(t.params.octave ?? 4), pressedKeys.get(t.id));
+    drawKeys(g, rect, theme, Number(t.params.octave ?? 4), pressedKeys.get(t.id), o.cs?.variant);
+    paintMark();
     return;
   }
   if (spec.widget === 'wavedraw') {
     drawWave(g, rect, parseWaveStr(t.params[spec.id]), theme);
+    paintMark();
     return;
   }
   if (spec.widget === 'seqgrid') {
@@ -332,6 +359,7 @@ export function paintFaceWidget(
       theme,
       runtime.seqStepFor(r.nodeId),
     );
+    paintMark();
     return;
   }
   if (spec.widget === 'sampleview') {
@@ -347,6 +375,7 @@ export function paintFaceWidget(
       modOf(t, 'start', r.nodeId, r.container),
       modOf(t, 'end', r.nodeId, r.container),
     );
+    paintMark();
     return;
   }
 
@@ -377,6 +406,7 @@ export function paintFaceWidget(
     axes?.y,
   );
   if (!o.noBadges) drawBindingBadges(g, t, spec.id, rect, theme, r.container);
+  paintMark();
 }
 
 /**

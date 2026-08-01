@@ -11,8 +11,21 @@
   --danger: #ff5d5d;
   /* Application chrome scale — see src/ui/uiscale.ts. */
   --ui-scale: 1;
+  /* Chrome hit-target sizes. These are the DOM half of the touch-target rule
+     in docs/14-input.md: a cursor is one pixel, a fingertip is ~10 mm and
+     hides what it is aiming at. The coarse-pointer values below are what make
+     splitters and resize grips usable on a touchscreen. */
+  --splitter: 5px;
+  --grip: 14px;
   font-family: 'Segoe UI', system-ui, sans-serif;
   font-size: 13px;
+}
+/* `pointer: coarse` = the PRIMARY input is a finger. A convertible laptop with
+   both reports `any-pointer: coarse` too, so widen for that as well — a mouse
+   user loses nothing from a 12 px splitter, while a touch user is unable to
+   grab a 5 px one at all. */
+@media (pointer: coarse), (any-pointer: coarse) {
+  :root { --splitter: 14px; --grip: 26px; }
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #app { height: 100%; overflow: hidden; }
@@ -80,14 +93,28 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 }
 .dock-v .panel { flex: 1 1 0; width: 100%; min-width: 0; }
 .dock-h .panel { flex: 1 1 0; height: 100%; }
+/* No `resize: both` — Chromium's native resizer is mouse-only and cannot be
+   driven by touch or pen at all. Floating panels get an explicit `.panel-grip`
+   from dock.ts instead. See docs/14-input.md. */
 .panel.floating {
   position: absolute; z-index: 40; border-radius: 6px;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5); resize: both;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
 }
+.panel-grip {
+  position: absolute; right: 0; bottom: 0; width: var(--grip); height: var(--grip);
+  cursor: nwse-resize; touch-action: none; z-index: 41; display: none;
+  background:
+    linear-gradient(135deg, transparent 55%, var(--border) 55%, var(--border) 70%, transparent 70%),
+    linear-gradient(135deg, transparent 78%, var(--border) 78%, var(--border) 92%, transparent 92%);
+}
+.panel.floating > .panel-grip { display: block; }
 .panel-header {
   display: flex; align-items: center; padding: 5px 8px; gap: 6px;
   background: var(--panel2); border-bottom: 1px solid var(--border); cursor: grab;
   flex: 0 0 auto;
+  /* The header is a tear-off drag handle; without this the browser claims the
+     touch as a scroll and cancels the drag a few px in. */
+  touch-action: none;
 }
 .panel-header .title { flex: 1; font-weight: 600; }
 .panel-header button {
@@ -96,13 +123,23 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 }
 .panel-header button:hover { color: var(--text); background: var(--border); }
 .panel-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 8px; }
-.dock-splitter { flex: 0 0 5px; background: transparent; z-index: 11; }
-.dock-splitter:hover, .dock-splitter.dragging { background: var(--accent); }
+/* Splitter thickness. 5 px is right for a cursor and hopeless for a fingertip
+   (~10 mm, and it hides its own target), so a coarse pointer gets a much
+   thicker grab band — see `--grip` below and docs/14-input.md rule 3. The
+   painted highlight stays thin either way; only the hit area grows. */
+.dock-splitter {
+  flex: 0 0 var(--splitter); background: transparent; z-index: 11;
+  touch-action: none; position: relative;
+}
+.dock-splitter::after {
+  content: ''; position: absolute; inset: 0; background: transparent;
+  transition: background 90ms linear;
+}
+.dock-splitter:hover::after, .dock-splitter.dragging::after { background: var(--accent); }
 .dock-v > .dock-splitter { cursor: ns-resize; }
-#workspace > .dock-splitter { cursor: ew-resize; flex: 0 0 5px; }
+#workspace > .dock-splitter { cursor: ew-resize; flex: 0 0 var(--splitter); }
 .zone-splitter { cursor: ew-resize; }
-#dock-bottom-splitter { cursor: ns-resize; height: 5px; }
-#dock-bottom-splitter:hover { background: var(--accent); }
+#dock-bottom-splitter { cursor: ns-resize; height: var(--splitter); }
 
 /* ---- Library (professional block browser) ---- */
 .lib-panel { outline: none; }
@@ -544,6 +581,45 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 .adveq-del { color: #ff8a8a; }
 .adveq-del:hover { border-color: #ff8a8a; }
 .adveq-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+
+/* Trajectory deep editor (advpath.ts). Same lifecycle contract as .adveq — the
+   dock owns show/hide via .adv-view.on, so the flex layout is scoped to
+   .adv-view.advpath.on or the editor won't hide on deselect (docs/08). */
+.advpath { gap: 6px; padding: 6px; box-sizing: border-box; }
+.adv-view.advpath.on { display: flex; flex-direction: column; height: 100%; }
+.advpath-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.advpath-canvaswrap { position: relative; flex: 1 1 auto; min-height: 120px; }
+.advpath-canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0d0f13; touch-action: none; }
+.advpath-hint { color: var(--text-dim); font-size: 11px; min-height: 14px; }
+.advpath-field { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.advpath-cap { white-space: nowrap; }
+.advpath-num { width: 58px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.advpath-select { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; }
+.advpath-btn { background: var(--panel); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 3px 8px; cursor: pointer; }
+.advpath-btn:hover { border-color: var(--accent); }
+.advpath-btn.on { border-color: #ff6b6b; color: #ff6b6b; }
+.advpath-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+
+/* Matrix router deep editor (advmatrix.ts). Same lifecycle contract as .adveq
+   and .advpath — the flex layout is scoped to .adv-view.advmx.on so the dock's
+   show/hide keeps working (docs/08). */
+.advmx { gap: 6px; padding: 6px; box-sizing: border-box; }
+.adv-view.advmx.on { display: flex; flex-direction: column; height: 100%; }
+.advmx-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.advmx-canvaswrap { position: relative; flex: 1 1 auto; min-height: 140px; }
+.advmx-canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #0d0f13; touch-action: none; }
+.advmx-hint { color: var(--text-dim); font-size: 11px; min-height: 14px; }
+.advmx-field { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.advmx-cap { white-space: nowrap; min-width: 12px; text-align: center; }
+.advmx-btn { background: var(--panel); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 3px 8px; cursor: pointer; }
+.advmx-btn:hover { border-color: var(--accent); }
+.advmx-vsep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+/* The precise crosspoint field. Sized for "100.0" and no wider — it sits in a
+   toolbar that already has two steppers and three buttons in it. */
+.advmx-num { width: 54px; background: var(--panel); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 4px; text-align: right; }
+.advmx-num:focus { outline: none; border-color: var(--accent); }
+.advmx-num:disabled { opacity: 0.4; }
+.advmx-db { min-width: 46px; text-align: left; font-variant-numeric: tabular-nums; }
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }

@@ -15,6 +15,7 @@
 import { CompiledGraph, CompiledNet, Graph, NetTap, NetTapMod, NodeMidiMap, ParamValue, Port, Rig, SignalKind, Wire } from './types';
 import { Block } from './types';
 import { getDef, paramSpec } from './registry';
+import { resolveDevice } from './prefs';
 
 /** Compile a block's learned MIDI bindings (MIDI learn) with the spec info
  *  the engine needs to apply values in param space. */
@@ -67,6 +68,27 @@ function omitDialogActions(b: Block): Record<string, ParamValue> {
   const out = { ...b.params };
   for (const id of drop) delete out[id];
   return out;
+}
+
+/**
+ * Substitute the installation's default device for a blank `device`.
+ *
+ * The engine's own idea of "no device named" is *the operating system's*
+ * default endpoint, which is not what the user picked in Options ▸ Default
+ * devices. Resolving it here — on the compiled node, not on the block — keeps
+ * the document portable: the scene still says "(default)", so handing it to
+ * someone else still means *their* default, while this machine opens the card
+ * this machine was told to use. Changing the preference recompiles and every
+ * blank block follows, which is the behaviour the setting advertises.
+ *
+ * Deliberately narrow: only the id `device`, only when it is empty, and only
+ * for the block types `defaultDeviceFor` names (MIDI In/Out also carry a
+ * `device` param and must never be handed an audio endpoint).
+ */
+function withDefaultDevice(b: Block, params: Record<string, ParamValue>): Record<string, ParamValue> {
+  if (params.device !== '' && params.device !== undefined) return params;
+  const dev = resolveDevice(b.type, params.device, params.api);
+  return dev ? { ...params, device: dev } : params;
 }
 
 /** Build the modulation spec for a `cv:<param>` input port, if it is one. */
@@ -195,7 +217,7 @@ function walk(g: Graph, prefix: string, out: CompiledGraph, rigJson?: string): v
       id: prefix + b.id,
       type: b.type === 'portal-in' || b.type === 'portal-out' ? 'pass' : b.type,
       params: {
-        ...omitDialogActions(b),
+        ...withDefaultDevice(b, omitDialogActions(b)),
         // Spatial blocks read the layout from here, never from their own state.
         ...(def.needsRig && rigJson ? { [RIG_PARAM]: rigJson } : {}),
       },

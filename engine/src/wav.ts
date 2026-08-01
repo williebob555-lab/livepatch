@@ -87,12 +87,13 @@ export function parseWav(buf: Buffer): DecodedAudio | null {
   return { sampleRate, channels };
 }
 
-/** 16-bit PCM WAV writer (recorder → cassette). */
-export function writeWav(channels: Float32Array[], sampleRate: number): Buffer {
-  const nCh = Math.max(1, channels.length);
-  const frames = channels[0]?.length ?? 0;
+/** The 44-byte canonical 16-bit PCM header, on its own — so a long take can be
+ *  streamed to disk a slice at a time instead of encoded into one giant Buffer
+ *  (`writeWavChunked` in dsp.ts; a 153 s stereo 96 kHz take is 56 MB and 235 ms
+ *  of blocked event loop if it is done in one go). */
+export function wavHeader(nCh: number, sampleRate: number, frames: number): Buffer {
   const dataBytes = frames * nCh * 2;
-  const out = Buffer.alloc(44 + dataBytes);
+  const out = Buffer.alloc(44);
   out.write('RIFF', 0, 'ascii');
   out.writeUInt32LE(36 + dataBytes, 4);
   out.write('WAVE', 8, 'ascii');
@@ -106,13 +107,30 @@ export function writeWav(channels: Float32Array[], sampleRate: number): Buffer {
   out.writeUInt16LE(16, 34);
   out.write('data', 36, 'ascii');
   out.writeUInt32LE(dataBytes, 40);
-  let o = 44;
-  for (let i = 0; i < frames; i++) {
+  return out;
+}
+
+/** Interleave + convert `count` frames from `start` into 16-bit LE PCM.
+ *  Returns bytes written. `out` must hold `count * nCh * 2`. */
+export function encodePcm16(channels: Float32Array[], start: number, count: number, out: Buffer): number {
+  const nCh = Math.max(1, channels.length);
+  let o = 0;
+  for (let i = 0; i < count; i++) {
     for (let c = 0; c < nCh; c++) {
-      const v = Math.max(-1, Math.min(1, channels[c][i] ?? 0));
+      const v = Math.max(-1, Math.min(1, channels[c][start + i] ?? 0));
       out.writeInt16LE(v < 0 ? v * 0x8000 : v * 0x7fff, o);
       o += 2;
     }
   }
+  return o;
+}
+
+/** 16-bit PCM WAV writer (recorder → cassette). */
+export function writeWav(channels: Float32Array[], sampleRate: number): Buffer {
+  const nCh = Math.max(1, channels.length);
+  const frames = channels[0]?.length ?? 0;
+  const out = Buffer.alloc(44 + frames * nCh * 2);
+  wavHeader(nCh, sampleRate, frames).copy(out, 0);
+  encodePcm16(channels, 0, frames, out.subarray(44));
   return out;
 }

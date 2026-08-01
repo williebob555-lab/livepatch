@@ -1,6 +1,6 @@
 # 02 — Core IR: Types, Registry, Compiler, Signal Model
 
-_Last verified: 2026-07-28. Files: `src/core/types.ts`, `src/core/registry.ts`,
+_Last verified: 2026-07-31. Files: `src/core/types.ts`, `src/core/registry.ts`,
 `src/core/compile.ts`._
 
 This is the heart of the app. Everything else is either producing this IR
@@ -51,6 +51,11 @@ floor, not a special case.
   instance) carries it for blocks whose width follows a param, live-synced the
   way `GraphDoc.syncRigPorts` sizes a Speaker Rig from the scene Rig.
   Absent = 2.
+- The same sync also owns port **counts** that follow a param (the Matrix
+  router's `in1..inN` / `out1..outM`). The compiler reads `Block.ports`, not the
+  def, so a synthesized port list compiles like any other — but a port that
+  disappears must take its wires with it, or the net keeps a tap the engine
+  cannot resolve. See docs/08, "Add a block whose port count is a parameter".
 - `CompiledNet.width` = **the max over every connected port**, floored at 2.
   Engines size the net buffer from it.
 
@@ -96,6 +101,15 @@ def sets `needsRig`.
 - `GraphDoc.restore()` (undo/redo) must `touch('rig')` as well as
   `'structure'`, or undoing a layout edit restores the document and leaves the
   engine panning to the old speaker positions.
+- **Speaker calibration rides the same param** (2026-07-31). A measured
+  speaker carries a `cal` blob on its `Speaker` record, so a fresh calibration
+  reaches `speaker-rig` through the ordinary rig push with no new channel and
+  no new op — which is exactly what this design is for. The cost is that
+  `__rig` is now a few kB rather than a few hundred bytes on a calibrated rig,
+  and it is stringified and parsed once per pointer-move of a speaker drag
+  (~60 µs a side, measured). The kernel's own filter rebuild is gated behind an
+  integer hash so *that* does not follow the drag — see
+  [`05-native-engine.md`](05-native-engine.md).
 
 ## `types.ts` — the document + compiled IR
 
@@ -266,10 +280,49 @@ childId?].join('/')`. This is how the UI addresses a compiled node for
 `set-param` / `modValueFor` while inside a subgraph — the path prefix matches
 the compiler's flattening. Get this wrong and live edits target the wrong node.
 
+## One wire tree per input port
+
+**An input port takes exactly one net.** The native executor assigns
+`node.ins[port] = slot.net.buf` (`engine/src/graph.ts`) — last net wins, it does
+**not** sum. So two *independent* wires into the same input silently drop one of
+them: the patch looks connected, compiles without complaint, and one source is
+simply not heard.
+
+To sum two sources into one input, put them on the **same wire tree**: one trunk
+wire plus a `branch` (`parentId` + `t`). A trunk and its branches group into a
+single `CompiledNet`, and a net sums every source on it. This is exactly what
+the editor does when you drag a branch off an existing wire, so hand-built
+graphs (factory presets, `docs/09`) have to do the same thing deliberately —
+`scripts/factory-preset-test.mjs` asserts it for every one that ships.
+
+## Control-voltage conventions
+
+CV is ordinary audio-rate signal, so the *meaning* of a voltage is a convention
+rather than a type. Two are load-bearing across the library:
+
+- **Pitch and any other exponential control is 1 volt per octave, with 0
+  meaning "whatever the knob says".** `midi-cv`'s `pitch` output is ±1 per
+  octave around middle C, and the modular-voice blocks (`vco` `pitch`, `ladder`
+  `cut`, `lfo` `rate`) all read their CV input that way. That is what lets a
+  keyboard, an LFO, a sequencer and a Sample & Hold plug into any of them and do
+  the musical thing with nothing in between.
+- **A gate is high above 0.5**, which is what the Logic blocks, `cv-compare`,
+  `env-adsr` and `cv-midi` all threshold at.
+
+Note that this is *not* how the automatic `cv:<param>` modulation path works:
+that one modulates in **normalized param space** (`NetTapMod`), so the same
+voltage means a different amount at every knob setting. Both are correct for
+what they do — the normalized path is for "sweep this control", the 1V/oct
+ports are for "this signal *is* the pitch" — but a block that needs the second
+one must declare a real audio-rate input port and read `ins[port]` itself. It
+cannot get there through `cv:<param>`.
+
 ## Invariants
 
 - **Keep `CompiledGraph` engine-agnostic.** No AudioNode-isms, no RtAudio-isms.
   If both engines can't consume it, it doesn't belong here.
+- **An input port is fed by one wire tree.** Summing two sources means a
+  branch, not a second wire (above).
 - **Add a new theme field → also add it to `defaultTheme()`** so `parseScene`'s
   merge backfills old scenes.
 - **The engine copy of the IR** lives in `engine/src/protocol.ts` (the engine

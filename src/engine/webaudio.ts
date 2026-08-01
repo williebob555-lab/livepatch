@@ -21,6 +21,13 @@ export interface UnitEnv {
    * `tape-created`), and one renderer-side handler writes the param.
    */
   emitAsset(assetId: string): void;
+  /**
+   * An asset's *samples* changed while its id stayed the same — a recorder
+   * punching into its take, or its **live take** growing as it records. Mirrors
+   * the native `Kernel.assetChanged` (docs/05): a unit takes its buffer once and
+   * then holds it, so evicting the decode cache is only half the job.
+   */
+  assetChanged(assetId: string): void;
 }
 
 export interface Unit {
@@ -33,6 +40,11 @@ export interface Unit {
   tapeIn?(ref: TapeRef | null): void;
   /** Tape source: push the current cassette ref on connect and on change. */
   setTapeOut?(cb: ((ref: TapeRef | null) => void) | null): void;
+  /**
+   * Same asset id, new samples. Implement it wherever `getCassetteBuffer` is
+   * called and the result kept — see `UnitEnv.assetChanged`.
+   */
+  assetChanged?(assetId: string): void;
   visual?: VisualFeed;
   loadAsset?(name: string, buffer: AudioBuffer): void;
   /** Current sequencer step for the playhead (−1 = none). */
@@ -298,6 +310,7 @@ export class WebAudioEngine implements EngineAdapter {
         nodeId: id,
         assets: this.assets,
         emitAsset: (assetId) => this.onAsset?.(id, assetId),
+        assetChanged: (assetId) => this.assetChanged(assetId),
       };
       const make = factories.get(node.type);
       const unit = make ? make(node.params, env) : passUnit(env);
@@ -459,6 +472,25 @@ export class WebAudioEngine implements EngineAdapter {
         if (rec.gateHi) this.units.get(rec.node)?.unit.setParam(rec.mod.param, 0);
       } else {
         this.units.get(rec.node)?.unit.setParam(rec.mod.param, rec.base);
+      }
+    }
+  }
+
+  /**
+   * Broadcast "this asset's samples moved" to every unit.
+   *
+   * The native engine has done this since punch-in existed (`GraphExec.
+   * assetReady`); this engine had no equivalent, so a Clip-tab destructive edit
+   * or a punch left a web-engine deck playing pre-edit audio until the graph
+   * was rebuilt. Units early-return on an id they do not hold, so the sweep is
+   * cheap enough to run off a recorder's live take several times a second.
+   */
+  assetChanged(assetId: string): void {
+    for (const rec of this.units.values()) {
+      try {
+        rec.unit.assetChanged?.(assetId);
+      } catch {
+        /* one unit's re-hydrate must never take the sweep down */
       }
     }
   }

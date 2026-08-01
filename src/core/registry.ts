@@ -73,6 +73,35 @@ export interface ParamSpec {
   /** A string param whose value is prose: Properties gives it a textarea
    *  instead of a one-line input, and newlines survive editing. */
   multiline?: boolean;
+  /**
+   * Silkscreen printed under this control's widget: a glyph name from
+   * `src/ui/glyphs.ts` (`saw`, `lowpass`, `attack`, `bipolar`, …), or any other
+   * string, which is printed as small dim text.
+   *
+   * This is the Mavis's front-panel vocabulary made available to ordinary
+   * blocks. A hardware panel does most of its explaining with printed artwork —
+   * the slope under CUTOFF, the rising ramp under ATTACK — and a block face
+   * could only do it by hand-authoring a layout full of `FaceText` decorations,
+   * which is why exactly one block in the app had any. Declared on the spec, it
+   * costs the def one field and needs no layout at all: `autoFace` reserves the
+   * strip and `paintFaceWidget` prints it, so the mark follows the widget onto
+   * the Dock for free. (Library thumbnails paint through `paintWidget`
+   * directly and do not show it — at 96 × 54 there is nothing to read anyway.)
+   */
+  mark?: string;
+  /**
+   * Other params on this block whose *meaning* this one changes — a sync switch
+   * that takes over from a time knob, a mix that decides whether a filter's
+   * cutoff is audible, an amount that scales a source.
+   *
+   * The face draws a tie from this widget to each named one, lit while this
+   * param is away from its default. It answers the question a panel full of
+   * knobs cannot otherwise answer: *why is turning this one doing nothing?*
+   *
+   * Presentation only — the engines never see it, and it does not create a
+   * modulation path. Names that are not params of the block are ignored.
+   */
+  affects?: string[];
 }
 
 /**
@@ -89,7 +118,10 @@ export type VisualKind =
   | 'eq'
   | 'midimon'
   | 'spatial'
-  | 'speakers';
+  | 'speakers'
+  | 'path'
+  | 'matrix'
+  | 'tempo';
 
 export interface BlockDef {
   type: string;
@@ -98,6 +130,24 @@ export interface BlockDef {
   /** Optional sub-group within the category, for Library presentation only.
    *  Never reaches the compiled IR. */
   group?: string;
+  /**
+   * Extra places this block is *also* filed in the Library.
+   *
+   * A block has one home (`category`/`group`) but often more than one honest
+   * answer to "where would I look for this": a Convolution is a time effect and
+   * a room simulator, a VST is hardware and an effect, the Speaker Rig is an
+   * output device and the centre of the surround set. Filing each of those in
+   * exactly one place is what makes the Library feel like a quiz.
+   *
+   * A cross-filed entry is the SAME block — same key, same drag payload, same
+   * pin — drawn in a second section. Search deliberately shows it once
+   * (a flat list of results has no categories to disambiguate, so a duplicate
+   * there is just noise); browsing shows it wherever it is filed.
+   *
+   * Presentation only: this never reaches the compiled IR, and `category` is
+   * still the block's canonical home for anything that needs one answer.
+   */
+  alsoIn?: Array<{ category: string; group?: string }>;
   desc: string;
   inputs: PortSpec[];
   outputs: PortSpec[];

@@ -18,6 +18,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as net from 'net';
 import * as path from 'path';
 import { DeviceInfo, send } from './protocol';
+import { disablePowerThrottling } from './winqos';
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 // audify's enums aren't exported through its .d.ts — bind at runtime.
@@ -82,6 +83,14 @@ const RT_FLAGS =
  */
 const MAXQ = 2048;
 
+/**
+ * Clamp a requested device buffer size to what the graph's buffers can hold.
+ * 0 (= "driver decides") passes through untouched; the post-open check is what
+ * catches a driver that then hands back something bigger.
+ */
+const clampFrames = (want: number): number =>
+  !Number.isFinite(want) || want <= 0 ? 0 : Math.min(MAXQ, Math.floor(want));
+
 export interface HwNeeds {
   /** Playback devices with the channel count each needs (2 = stereo audio-out,
    *  8+ = a Windows-mode speaker-rig). Entry [0] is the preferred master. */
@@ -92,6 +101,17 @@ export interface HwNeeds {
 
 /** Hard cap for Windows-endpoint channel use (7.1). */
 const MAX_WCH = 8;
+
+/**
+ * Silence from a capture bridge that means the stream is dead, not merely late
+ * (`IoManager.checkBridges`). Two seconds is far outside anything a healthy
+ * stream produces — PCM arrives in ~5 ms batches — while still being short
+ * enough that the recovery is a gap rather than an outage.
+ */
+const BRIDGE_DEAD_MS = 2000;
+/** Restarts a single bridge gets before it is left down. A stream that will
+ *  not stay up is a configuration problem; respawning forever hides it. */
+const MAX_REVIVES = 5;
 
 // ---------------------------------------------------------------------------
 // Polyphase fractional-delay filter bank for the drift resampler.
@@ -127,6 +147,39 @@ const FIR = (() => {
   return t;
 })();
 
+/** Quanta per latency-tuning decision (`Ring.adapt`). One window is the unit of
+ *  everything below: at 128 frames / 48 kHz it is ~0.34 s. */
+const ADAPT_WIN = 128;
+/**
+ * Release rate of the drawdown peak-hold, in windows (attack is instant).
+ * 1024 windows ≈ 6 min at 128 frames / 48 kHz. Handing latency back has to be
+ * far slower than the excursions it is protecting against, or the setpoint
+ * walks itself back into the dips it just learned about — which is exactly the
+ * limit cycle `Ring.peakDip` documents. Measured over a 900 s stall model:
+ * 128→95, 256→62, 512→22, 1024→10 post-settle underruns, with the converged
+ * latency unchanged (it is set by the observed dips, not by this rate). Going
+ * slower still keeps helping, but a one-off bad event then holds latency up for
+ * longer than a user will wait — 1024 is where those two curves cross.
+ */
+const DIP_RELEASE = 1024;
+/**
+ * Windows the delivery-size estimate votes over (`Ring.burstHist`).
+ *
+ * `burst` has to answer "how much audio arrives between two reads", and two
+ * very different things produce a big answer: a device that **clumps** its
+ * callbacks (every window, and the trim threshold must clear it) and an
+ * event-loop **stall** (one window, and the trim exists precisely to drain it).
+ * A running max cannot tell them apart and treats the stall as normal delivery,
+ * which puts the threshold above the backlog and stops the trim firing at all —
+ * measured, that is the "latency shoots past 100 ms" regression coming back
+ * (29 → 94 ms). The minimum across several windows is the discriminator: a
+ * recurring clump survives it, a one-off spike is outvoted.
+ *
+ * 4 windows ≈ 2.7 s at 256 frames / 48 kHz, 0.7 s at 128 / 96 kHz — longer than
+ * any single stall, shorter than a user notices a device change.
+ */
+const BURST_HIST = 4;
+
 /**
  * SPSC float ring (interleaved frames) with drift-tracking playback.
  *
@@ -142,9 +195,34 @@ const FIR = (() => {
 export class Ring {
   buf: Float32Array;
   chans: number;
-  /** Largest recent push, in frames (decaying) — the device's real delivery
-   *  granularity. WASAPI shared capture often bursts ~10 ms regardless of the
-   *  requested frame size, so latency targets must respect it. */
+  /**
+   * Largest recent **delivery**, in frames (decaying) — the device's real
+   * granularity. WASAPI shared capture often bursts ~10 ms regardless of the
+   * requested frame size, so latency targets must respect it.
+   *
+   * **Frames between two reads, not frames in one push** (2026-08-01). A
+   * capture opened at the master's frame size does hand back that many frames
+   * per callback, but the endpoint's period is a fixed *duration*, so the
+   * callbacks arrive in clumps — ~11 back-to-back at 128 frames / 96 kHz, then
+   * nothing. Measuring one push read 128 while the fill's real excursion was
+   * ~1400, which put `capLatency`'s trim threshold *inside* the ordinary
+   * sawtooth: it spliced ~257 frames out of the capture 1–2 times a second,
+   * for entire sessions, with `late 0` and `xrunsDelta 0` throughout. The
+   * consumer takes exactly one quantum per read, so frames-between-reads is
+   * what every reader of this field already assumes it to be.
+   *
+   * It is also why the report was **"higher sample rates pop more"**: the clump
+   * is a duration, so it is twice as many frames at 96 kHz as at 48 kHz, while
+   * a per-push measurement stays at the frame size and never notices.
+   *
+   * Two measurements feed it, and both are load-bearing:
+   * - **Steady state** — the min-vote over `BURST_HIST` windows (`burstHist`),
+   *   so a stall's flood cannot masquerade as the device's granularity.
+   * - **Warm-up** — the old per-push max, until the vote has history. Priming
+   *   and `capLatency` both read `burst` from the first quantum, and letting a
+   *   stall inside that window inflate it stopped the trim firing on the very
+   *   first backlog (measured: standing fill 93 ms instead of 29).
+   */
   burst = 0;
   /** Fractional position between two frames (0..1). */
   private frac = 0;
@@ -164,10 +242,42 @@ export class Ring {
   private setpoint = 0;
   private winMin = Infinity;
   private winCount = 0;
-  /** Highest setpoint already proven too low — the shrink never crosses it
-   *  again, which turns hunting into convergence. Decays very slowly so a
-   *  one-off startup hiccup doesn't inflate latency forever. */
-  private floorMiss = 0;
+  /**
+   * Worst recent drawdown (setpoint − trough), in frames — the headroom the
+   * setpoint actually has to carry, **measured rather than probed for**.
+   *
+   * The controller this replaced walked the setpoint down until the fill dipped
+   * below the read floor and only then backed off, holding the result a fixed
+   * margin above the last level that had missed ("floorMiss") — but that margin
+   * decayed unconditionally on every clean window, so the level the setpoint was
+   * parked on slid downward forever at n/16 per window. The setpoint was dragged
+   * with it, straight back into the region that had just glitched, and the cycle
+   * repeated. Field logs show it plainly: `inDepth` falling 24 frames/s and an
+   * xrun every ~10 s, indefinitely, at 2 % CPU and 0.2 ms GC — a pop with no
+   * external cause, produced by the tuner itself. `scripts/ring-latency.cjs`
+   * asserts it stays gone.
+   *
+   * The drawdown is visible on **every** window, glitch or not, so tracking its
+   * peak gives the loop a feedback signal that doesn't require an audible
+   * failure to produce. Instant attack (a single bad excursion is carried
+   * immediately), very slow release (latency comes back only after a long
+   * stretch proves it isn't needed) — and a release that overshoots is corrected
+   * by the next ordinary dip instead of by a click.
+   */
+  private peakDip = 0;
+  /** Frames pushed since the last read — one delivery. See `burst`. */
+  private sinceRead = 0;
+  /** Largest delivery inside the current adapt window. */
+  private winPush = 0;
+  /** Each recent window's largest delivery; `burst` is the MIN of them once
+   *  there are `BURST_HIST` of them. See the constant for why min. */
+  private burstHist = new Float64Array(BURST_HIST);
+  private burstSeen = 0;
+  /**
+   * The setpoint has hit the ring's ceiling and the stream is still starving.
+   * Read by `IoManager` for the status stream — see `adapt`.
+   */
+  starved = false;
   private w = 0;
   private r = 0;
   constructor(frames: number, chans: number) {
@@ -194,24 +304,46 @@ export class Ring {
   /**
    * Re-tune the setpoint from the observed trough. Asymmetric on purpose:
    * grow fast (a dip means we are close to glitching), shrink gently.
+   *
+   * The target is the read floor plus the worst drawdown the stream has
+   * actually shown (`peakDip`) — so the loop converges on measured evidence and
+   * never has to glitch to learn where the floor is. See `peakDip`.
    */
   private adapt(n: number): void {
     const fill = this.availRead;
     if (fill < this.winMin) this.winMin = fill;
-    if (++this.winCount < 128) return;
+    if (++this.winCount < ADAPT_WIN) return;
     this.winCount = 0;
+    this.noteBurstWindow();
     const f = this.floorFor(n);
     if (this.winMin < f) {
-      // Too tight: remember this level and back off decisively.
-      if (this.setpoint > this.floorMiss) this.floorMiss = this.setpoint;
-      this.setpoint += n * 2;
-    } else if (this.winMin > f + n / 2) {
-      this.floorMiss = Math.max(0, this.floorMiss - n / 16);
-      // Shrink by half the measured surplus (min one quarter-quantum): a very
-      // over-buffered stream converges in a second or two instead of ~20 s,
-      // while a nearly-tuned one still creeps down gently.
-      const shrink = Math.max(n / 4, (this.winMin - f) / 2);
-      this.setpoint = Math.max(f, this.floorMiss + n / 2, this.setpoint - shrink);
+      // The trough bottomed out against the floor, so this window's drawdown is
+      // only a lower bound (a ring that runs dry reads as a smaller dip than it
+      // really was). Don't feed a saturated measurement into the estimator: buy
+      // headroom now and let the next, clean windows measure the real number.
+      // Bounded by the ring itself: a setpoint past what the buffer can hold is
+      // not latency, it is a permanent underrun.
+      const ceiling = this.buf.length / this.chans / 2;
+      this.setpoint = Math.min(this.setpoint + n * 2, ceiling);
+      // **Saturated.** The controller has bought every frame of headroom the
+      // ring can hold and the stream is *still* running dry, so this is no
+      // longer a tuning problem — the producer is not keeping up, and no
+      // amount of latency will fix it. Worth saying out loud: in a log it is
+      // otherwise just `inDepth` sitting on a number, and the fault (a bridge
+      // process being descheduled) reads as an ordinary xrun count.
+      this.starved = this.setpoint >= ceiling;
+    } else {
+      this.starved = false;
+      // Clean window — the drawdown is honest. Peak-hold it.
+      const dip = Math.max(0, this.setpoint - this.winMin);
+      this.peakDip = dip > this.peakDip ? dip : this.peakDip + (dip - this.peakDip) / DIP_RELEASE;
+      const want = f + Math.max(this.peakDip, n / 2);
+      if (want > this.setpoint) this.setpoint = want;
+      else if (want < this.setpoint - n / 4)
+        // Shrink by half the surplus (min one quarter-quantum): a very
+        // over-buffered stream converges in a second or two instead of ~20 s,
+        // while a nearly-tuned one still creeps down gently.
+        this.setpoint = Math.max(want, this.setpoint - Math.max(n / 4, (this.setpoint - want) / 2));
     }
     this.winMin = Infinity;
   }
@@ -243,6 +375,12 @@ export class Ring {
       // place from too low underruns the whole way up.
       const want = Math.max(this.floorFor(n), Math.ceil(this.burst) + n);
       if (want > this.setpoint) this.setpoint = want;
+      // Seed the drawdown estimate with the device's delivery size so the very
+      // first read-before-push ordering is already covered. It is only a seed:
+      // `peakDip` releases below it if the stream proves over minutes that its
+      // real excursions are smaller, so this costs nothing on a tidy device
+      // and doesn't glitch its way down on a bursty one.
+      if (this.burst > this.peakDip) this.peakDip = Math.ceil(this.burst);
       if (this.availRead >= this.setpoint) this.primed = true;
     }
     return this.primed;
@@ -292,9 +430,92 @@ export class Ring {
    * already caused a discontinuity, so this masks into the same dropout while
    * keeping latency near the setpoint. Pure drift never reaches the threshold
    * (the rate handles it), so this never fires in steady state — no new clicks.
+   *
+   * ### `burst` is the size of one push, NOT the size of the sawtooth (2026-08-01)
+   *
+   * That distinction is the whole bug. `burst` is `max(framesPushed)`, so it
+   * measures how much audio arrives **per callback**. The sawtooth this
+   * threshold is supposed to clear is how much arrives **between reads** — and
+   * a WASAPI capture opened at the master's frame size delivers its callbacks
+   * in *clumps*: the endpoint's period is a fixed ~10 ms, so at 128 frames /
+   * 96 kHz roughly eleven of them land back-to-back, then nothing. `burst`
+   * reads 128; the real excursion is ~1400.
+   *
+   * So the threshold sat at `setpoint + 384` while the fill's honest peak was
+   * `setpoint + ~1400`, and this fired on ordinary delivery — one to two times
+   * a second, for the entire session, splicing ~257 frames (2.7 ms) out of the
+   * capture every time. Field log, every status window and unmistakable once
+   * the ring is named:
+   *
+   * ```
+   * ring "in:Voicemeeter Out B1"  fill 1582  drop 258  set 1197  burst 128
+   *   late 0   xrunsDelta 0   load 0.06   GC max 0.17 ms
+   * ```
+   *
+   * `fill` equals `set + 2*128 + 128` to the frame, and it happened in windows
+   * where `peak` was 0 — trimming silence, so not the material. **And it is
+   * worse at higher sample rates**: the endpoint period is a duration, so the
+   * clump is twice as many frames at 96 kHz as at 48 kHz while `burst` stays at
+   * the frame size. That is the "higher rates pop more" report.
+   *
+   * ### It fired on ordinary delivery for a clumped device (2026-08-01)
+   *
+   * `burst` used to be the size of one *push*, and this threshold then sat
+   * *inside* the natural sawtooth of a device that delivers its callbacks in
+   * clumps — so it spliced 257 frames (2.7 ms) out of the capture one to two
+   * times a second, indefinitely. The field log, once the ring was named:
+   *
+   * ```
+   * ring "in:Voicemeeter Out B1"  fill 1582  drop 258  set 1197  burst 128
+   *   late 0   xrunsDelta 0   load 0.06   GC max 0.17 ms
+   * ```
+   *
+   * `fill` == `set + 2*burst + n` and `drop` == `fill - (set + burst)`, both to
+   * the frame. It also fired in windows where `peak` was 0 — trimming silence,
+   * so not the material. **The fix is in `burst`**, which is measured per
+   * delivery now; this function is unchanged. See `burst` and `BURST_HIST`.
+   *
+   * ### Do not "fix" it here instead — three ways were tried and measured
+   *
+   * `capLatency` and `adapt` are **one loop**: these trims deepen the troughs
+   * that `peakDip` measures, so anything that merely trims *less* also shrinks
+   * the setpoint and the tuner stops buying the headroom the stall cases need.
+   *
+   * 1. `headroom = max(burst, peakDip, n)` — CLUSTERS 10 → **114** underruns,
+   *    with standing latency *falling* 36.6 → 31.3 ms.
+   * 2. `headroom = max(burst, observed fill swing, n)` — CLUSTERS 10 → **284**,
+   *    STALLS latency 29 → **53 ms**.
+   * 3. Per-delivery `burst` with no window vote — a stall's own flood then
+   *    looks like the device's granularity, the threshold rises above the
+   *    backlog and the trim stops firing at all: STALLS 29 → **94 ms**, i.e.
+   *    the "latency shoots past 100 ms" bug, back.
+   *
+   * Fixing the *measurement* costs none of that: every other scenario in
+   * `scripts/ring-latency.cjs` reports numbers identical to before the change.
    */
+  /**
+   * Close out one delivery. Called once per drift-tracked read: whatever the
+   * producer pushed since the previous read IS one delivery, however many
+   * callbacks it arrived in.
+   */
+  private noteRead(): void {
+    if (this.sinceRead > this.winPush) this.winPush = this.sinceRead;
+    this.sinceRead = 0;
+  }
+
+  /** Close out one window's delivery measurement and re-vote. See `burst`. */
+  private noteBurstWindow(): void {
+    this.burstHist[this.burstSeen % BURST_HIST] = this.winPush;
+    this.burstSeen++;
+    this.winPush = 0;
+    if (this.burstSeen < BURST_HIST) return; // warm-up: `push` owns the estimate
+    let mn = Infinity;
+    for (let i = 0; i < BURST_HIST; i++) if (this.burstHist[i] < mn) mn = this.burstHist[i];
+    this.burst = mn;
+  }
+
   capLatency(n: number): void {
-    const headroom = Math.max(this.burst, n); // one burst = the sawtooth peak
+    const headroom = Math.max(this.burst, n); // one delivery = the sawtooth peak
     if (this.availRead > this.setpoint + headroom * 2 + n) this.trimTo(this.setpoint + headroom);
   }
 
@@ -304,6 +525,7 @@ export class Ring {
       for (let c = 0; c < this.chans; c++) dst[c].fill(this.hold[c], 0, n);
       return false;
     }
+    this.noteRead();
     this.capLatency(n);
     this.updateRatio(n);
     const ch = this.chans;
@@ -342,6 +564,7 @@ export class Ring {
         for (let c = 0; c < this.chans; c++) dst[i * this.chans + c] = this.hold[c];
       return false;
     }
+    this.noteRead();
     this.capLatency(n);
     this.updateRatio(n);
     const ch = this.chans;
@@ -377,14 +600,35 @@ export class Ring {
     if (d < 0) d += this.buf.length;
     return Math.floor(d / this.chans);
   }
-  push(data: Float32Array): void {
-    const frames = data.length / this.chans;
-    this.burst = Math.max(frames, this.burst * 0.995);
+  /**
+   * Append interleaved frames.
+   *
+   * `count` (in floats, default the whole array) lets a producer hand over a
+   * **reused** scratch buffer rather than a right-sized fresh one. That matters
+   * because the alternative — minting a correctly-sized `Float32Array` per
+   * callback — is a heap allocation on the audio path, which is docs/10 rule 1.
+   */
+  /** Frames ever pushed. Against the consumer's known appetite (exactly one
+   *  quantum per pump) this is the producer's true delivery rate — the one
+   *  number that separates "not enough audio" from "audio in clumps". */
+  pushed = 0;
+  push(data: Float32Array, count = data.length): void {
+    const frames = count / this.chans;
+    this.pushed += frames;
+    this.sinceRead += frames;
+    // Warm-up only: until the window vote has history, `burst` is the old
+    // per-push max. See `burst` — the vote takes over below.
+    if (this.burstSeen < BURST_HIST) this.burst = Math.max(frames, this.burst * 0.995);
     const cap = this.buf.length;
-    for (let i = 0; i < data.length; i++) {
+    for (let i = 0; i < count; i++) {
       this.buf[this.w] = data[i];
       this.w = this.w + 1 >= cap ? 0 : this.w + 1;
-      if (this.w === this.r) this.r = this.r + this.chans >= cap ? this.r + this.chans - cap : this.r + this.chans; // overwrite oldest frame
+      if (this.w === this.r) {
+        // Overwriting the oldest frame is a splice at the producer end. Counted
+        // for the same reason as `trims`: it makes no other telemetry move.
+        this.overs++;
+        this.r = this.r + this.chans >= cap ? this.r + this.chans - cap : this.r + this.chans;
+      }
     }
   }
   /** Deinterleave `n` frames into L/R (mono duplicates); zero-fills on underrun. */
@@ -415,9 +659,29 @@ export class Ring {
   trimTo(frames: number): void {
     const excess = this.availRead - frames;
     if (excess <= 0) return;
+    // A trim is a SPLICE — it is the one thing this file is otherwise built to
+    // never do (rule 1). It is justified only when it lands inside a dropout
+    // the stall already caused; when it fires on its own it is an audible
+    // click, and until this counter existed it fired with no trace at all:
+    // not an xrun (nothing ran dry), not `late` (the pump was on time). Count
+    // it so a popping session can be told from a healthy one in a log.
+    this.trims++;
+    // Enough state to explain the trim without guessing at it later: what the
+    // fill had reached, and how much audio was thrown away. Plain numbers —
+    // formatting a message here would be a string allocation in the audio path.
+    this.lastFill = this.availRead;
+    this.lastDrop = excess;
     const cap = this.buf.length;
     this.r = (this.r + excess * this.chans) % cap;
   }
+  /** Splices performed by `trimTo`/`capLatency` since the last status read. */
+  trims = 0;
+  /** Fill (frames) at the last trim, and how many frames it dropped. */
+  lastFill = 0;
+  lastDrop = 0;
+  /** Frames the producer overwrote because the ring was full — the same splice
+   *  seen from the other end, and just as silent before it was counted. */
+  overs = 0;
 
   /** Pop `n` interleaved frames straight into `dst`; zero-fills on underrun. */
   popInterleaved(dst: Float32Array, n: number): boolean {
@@ -466,7 +730,64 @@ interface InputRec {
   /** True once frames have flowed — underruns only count as xruns after that
    *  (a freshly opened stream legitimately starts empty). */
   warm: boolean;
+  /** Bridge inputs only: when PCM last arrived over the socket, and the
+   *  device this record was opened from. Both exist for `checkBridges`. */
+  lastPcmMs?: number;
+  dev?: DeviceInfo;
+  /** Longest gap between socket deliveries since the last report, ms, and the
+   *  `Ring.pushed` reading at that report. See `bridgeStats`. */
+  maxGapMs?: number;
+  statPushed?: number;
+  statMs?: number;
+  /** Restarts this stream has already been given, so a bridge that cannot
+   *  stay up is not respawned in a loop forever. */
+  revives?: number;
+  /**
+   * Cached Float32 view over the capture Buffer audify hands back, plus the
+   * three fields that identify which backing store it is a view of. Mirrors
+   * `IoManager.asioInView` — see `captureView` for why this is not optional.
+   * Unused on bridge-fed inputs (their PCM arrives over a socket).
+   */
+  viewBuf: ArrayBufferLike | null;
+  viewOff: number;
+  viewLen: number;
+  view: Float32Array;
 }
+
+/**
+ * Float32 view over a capture callback's Buffer, rebuilt **only** when audify
+ * hands back a different backing store.
+ *
+ * The naive form — `new Float32Array(data.buffer, data.byteOffset,
+ * data.byteLength / 4)` inside the callback — allocates a throwaway TypedArray
+ * *object* every time. At 128 frames / 48 kHz that is ~375 allocations a second
+ * **per open input device**, in the audio path, which is exactly the garbage
+ * that docs/10 rule 1 exists to keep out: nothing sounds wrong for a while, the
+ * objects simply accumulate until V8 collects them, and that collection is a
+ * pop. It is the same trap `copy` in dsp.ts documents for `subarray`, and the
+ * ASIO side of this file already fixed the identical bug (`asioInView`) — the
+ * capture path was just missed.
+ *
+ * The cache is per-`InputRec` rather than per-`IoManager` because there is one
+ * of these streams per device and they hand back different buffers.
+ */
+function captureView(rec: InputRec, data: Buffer): Float32Array {
+  if (data.buffer !== rec.viewBuf || data.byteOffset !== rec.viewOff || data.byteLength !== rec.viewLen) {
+    rec.viewBuf = data.buffer;
+    rec.viewOff = data.byteOffset;
+    rec.viewLen = data.byteLength;
+    rec.view = new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4);
+  }
+  return rec.view;
+}
+
+/** The view-cache fields every fresh `InputRec` starts with. */
+const emptyView = (): Pick<InputRec, 'viewBuf' | 'viewOff' | 'viewLen' | 'view'> => ({
+  viewBuf: null,
+  viewOff: -1,
+  viewLen: -1,
+  view: new Float32Array(0),
+});
 interface OutputRec {
   rt: RtAudioLike;
   ring: Ring;
@@ -522,12 +843,73 @@ interface ProbeState {
   threshold: number;
 }
 
+/**
+ * Speaker-calibration run state.
+ *
+ * The audio-path half of this is deliberately trivial — copy `sweep[k]` onto
+ * one output channel, copy the microphone channel into `capture` — because the
+ * whole point of the design is that the engine does no analysis (see
+ * `MeasureSpeakersMsg`). Everything preallocated in `measureSpeakers`; the
+ * pump never allocates, and never sends.
+ *
+ * Sending is done by `sweepTimer`, off the audio path, which is also what
+ * advances the run from one speaker to the next. That keeps the base64 encode
+ * and the synchronous stdout write — both of which would be a dropout inside
+ * the pump — on an ordinary timer tick.
+ */
+interface SweepState {
+  device: string; // '' = the ASIO master's own input
+  inCh: number;
+  asioOut: boolean;
+  outDevice: string;
+  speakers: Array<{ id: string; ch: number }>;
+  at: number; // index of the speaker being measured
+  sweep: Float32Array;
+  capture: Float32Array;
+  captureLen: number;
+  /** Frames of silence recorded after the sweep ends. */
+  tailFrames: number;
+  openedInput: boolean;
+  /**
+   * `settle` lets the stream and the capture ring prime (and any previous
+   * speaker's tail die away) before anything is emitted; `sweep` plays and
+   * records; `record` keeps recording after the sweep for the room's tail;
+   * `ship` hands the capture to the timer. `idle` is a finished run waiting to
+   * be torn down by the timer.
+   */
+  stage: 'settle' | 'sweep' | 'record' | 'ship' | 'idle';
+  pos: number; // frames into the current stage
+  settleFrames: number;
+  /** Chunk the shipper has sent so far, and how many there are in total. */
+  chunk: number;
+  chunks: number;
+}
+
+/** Samples per `speaker-sweep` message. 8192 int16 → ~22 kB of base64, which
+ *  is the same order as a `visuals` message and safely under anything that
+ *  would stall a synchronous stdout write. See `SpeakerSweepMsg`. */
+const CAP_CHUNK = 8192;
+
 export class IoManager {
   /** The audio pump: graph render for one quantum. */
   onQuantum: ((n: number, sr: number) => void) | null = null;
   devices: DeviceInfo[] = [];
   sampleRate = 48000;
   frames = 256;
+  /**
+   * Requested device buffer size, in frames. 0 = let the driver decide.
+   *
+   * **Assign through `setRequestedFrames`, which clamps to MAXQ.** Every
+   * graph-facing buffer in the engine — `this.mix`, the scratch interleave, and
+   * every kernel's working arrays in dsp.ts — is exactly MAXQ frames. A quantum
+   * larger than that does not throw: typed-array writes past the end are
+   * silently dropped and reads past the end return `undefined`, so the DSP
+   * quietly computes `b0 * undefined` = NaN. In a *recursive* kernel that NaN
+   * is permanent (see `Biquad.process`), which is how a 4096-frame buffer
+   * setting killed EQ Curve outright and kept it dead through later setting
+   * changes. WASAPI grants oversize requests verbatim — measured: req 4096 →
+   * granted 4096 — so nothing downstream catches this for us.
+   */
   requestedFrames = 0; // 0 = driver/default
   requestedRate = 0;
   running = false;
@@ -539,6 +921,8 @@ export class IoManager {
   late = 0;
   private lastCbNs = 0n;
   private probe: ProbeState | null = null;
+  private sweep: SweepState | null = null;
+  private sweepTimer: NodeJS.Timeout | null = null;
 
   private master: RtAudioLike | null = null;
   private masterIsAsio = false;
@@ -583,6 +967,9 @@ export class IoManager {
   private static readonly ASIO_MAX_LEAD = 2;
   /** Warned once per stream open, so a trim storm can't flood the log. */
   private asioTrimmed = false;
+  /** Quanta whose write was skipped to drain the ASIO output queue, since the
+   *  last status read. Each one is a dropped quantum — see `asioPump`. */
+  private asioSkips = 0;
   private outScratchA: Buffer = Buffer.alloc(0);
   private outScratchB: Buffer = Buffer.alloc(0);
   /**
@@ -769,6 +1156,10 @@ export class IoManager {
 
   stop(): void {
     this.running = false;
+    // A run in flight holds a capture stream it opened itself and a state
+    // machine the pump will never advance again — end it before the streams go,
+    // or the renderer sits on a progress dialog that can never complete.
+    if (this.sweep) this.endSweep('audio stopped');
     this.teardown();
   }
 
@@ -883,7 +1274,7 @@ export class IoManager {
           RT_FLAGS,
           errCb,
         );
-      let frames = openAsio(this.requestedFrames);
+      let frames = openAsio(clampFrames(this.requestedFrames));
       // Every graph-facing buffer in this file is MAXQ frames, so a driver
       // whose preferred size is bigger would overrun them — and audify would
       // then reject every write for a size mismatch. Ask again for MAXQ, which
@@ -895,6 +1286,7 @@ export class IoManager {
         frames = openAsio(MAXQ);
         send({ op: 'status', info: `ASIO buffer capped to ${frames} frames` });
       }
+      if (this.refuseOversize(rt, frames, 'ASIO', dev.name)) return;
       this.frames = frames || 256;
       this.masterIsAsio = true;
       this.masterDevice = dev.name;
@@ -930,18 +1322,34 @@ export class IoManager {
       }
       const mChans = Math.max(2, Math.min(MAX_WCH, first.chans, Math.max(2, dev.outputChannels)));
       this.sampleRate = this.requestedRate || dev.preferredSampleRate || 48000;
-      const frames = rt.openStream(
-        { deviceId: dev.id, nChannels: mChans, firstChannel: 0 },
-        null,
-        F32,
-        this.sampleRate,
-        this.requestedFrames || 256,
-        'LivePatch',
-        null,
-        () => this.wasapiPump(),
-        RT_FLAGS,
-        errCb,
-      );
+      const openWasapi = (want: number): number =>
+        rt.openStream(
+          { deviceId: dev.id, nChannels: mChans, firstChannel: 0 },
+          null,
+          F32,
+          this.sampleRate,
+          want,
+          'LivePatch',
+          null,
+          () => this.wasapiPump(),
+          RT_FLAGS,
+          errCb,
+        );
+      let frames = openWasapi(clampFrames(this.requestedFrames) || 256);
+      // The ASIO branch above caps at MAXQ because a driver's preferred size can
+      // exceed it; WASAPI needs the same cap for a different reason. WASAPI's
+      // period is a fixed *duration*, so the frame count scales with the sample
+      // rate — the same setting that is comfortable at 48 kHz is twice as many
+      // frames at 96 kHz and four times at 192 kHz. Since every graph-facing
+      // buffer here is MAXQ frames (see `requestedFrames`), running past it is
+      // not a glitch, it is NaN in the DSP. Re-ask smaller rather than run
+      // corrupt.
+      if (frames > MAXQ) {
+        rt.closeStream();
+        frames = openWasapi(MAXQ);
+        send({ op: 'status', info: `output buffer capped to ${frames} frames (${MAXQ} max at ${this.sampleRate} Hz)` });
+      }
+      if (this.refuseOversize(rt, frames, 'WASAPI', dev.name)) return;
       this.frames = frames || 256;
       this.masterIsAsio = false;
       this.masterDevice = dev.name;
@@ -963,6 +1371,35 @@ export class IoManager {
 
     // ---- Windows capture inputs (one stream per distinct device) ----
     for (const name of this.needs.wasapiIn) this.openInput(name, errCb);
+  }
+
+  /**
+   * Last line of defence: a driver that hands back more than MAXQ frames even
+   * after being asked for MAXQ. Running it would feed the graph a quantum
+   * larger than its buffers, and the result is not a dropout but NaN latched
+   * into every recursive kernel (see `requestedFrames`). Silence the user can
+   * see the reason for beats audio that dies quietly and stays dead, so: close
+   * the stream, say so, and keep the graph alive on the idle pump.
+   *
+   * Returns true when the caller must abandon this stream.
+   */
+  private refuseOversize(rt: RtAudioLike, frames: number, api: string, device: string): boolean {
+    if (frames <= MAXQ) return false;
+    try {
+      rt.closeStream();
+    } catch {
+      /* already gone */
+    }
+    this.apiInUse = 'idle (buffer too large)';
+    this.frames = 256; // the idle pump paces off this; don't inherit the bad size
+    send({
+      op: 'status',
+      error:
+        `${api} device "${device}" insists on a ${frames}-frame buffer at ${this.sampleRate} Hz; ` +
+        `the engine's limit is ${MAXQ}. Lower the buffer size, or the sample rate, in Audio settings.`,
+    });
+    this.startIdlePump();
+    return true;
   }
 
   private allocScratch(chans: number): void {
@@ -1021,22 +1458,10 @@ export class IoManager {
       // with all its channels; blocks read the pairs they need from it.
       const chans = Math.min(MAX_WCH, Math.max(1, dev.inputChannels));
       const ring = new Ring(this.frames * 32, chans);
-      rt.openStream(
-        null,
-        { deviceId: dev.id, nChannels: chans, firstChannel: 0 },
-        F32,
-        this.sampleRate,
-        this.frames,
-        'LivePatch-in',
-        (data) => {
-          ring.push(new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4));
-        },
-        null,
-        RT_FLAGS,
-        errCb,
-      );
-      rt.start();
-      this.inputs.set(key, {
+      // The record has to exist before the stream opens: the capture callback
+      // closes over it for its cached view, and audify can deliver a callback
+      // as soon as `start()` returns.
+      const rec: InputRec = {
         rt,
         ring,
         name: dev.name,
@@ -1044,7 +1469,27 @@ export class IoManager {
         chanBufs: Array.from({ length: chans }, () => new Float32Array(MAXQ)),
         stamp: -1,
         warm: false,
-      });
+        ...emptyView(),
+      };
+      rt.openStream(
+        null,
+        { deviceId: dev.id, nChannels: chans, firstChannel: 0 },
+        F32,
+        this.sampleRate,
+        this.frames,
+        'LivePatch-in',
+        // Cached view — see `captureView`. Building one here allocated a
+        // throwaway TypedArray per callback (~375/s per device) in the audio
+        // path, the same GC-pop trap `asioInView` was written to close.
+        (data) => {
+          ring.push(captureView(rec, data));
+        },
+        null,
+        RT_FLAGS,
+        errCb,
+      );
+      rt.start();
+      this.inputs.set(key, rec);
     } catch (err) {
       send({ op: 'status', error: `open input "${dev.name}" failed: ` + String(err) });
     }
@@ -1053,9 +1498,29 @@ export class IoManager {
   /** Capture from a second ASIO driver via the bridge child process. PCM
    *  arrives over a localhost TCP socket — stdio is synchronous on Windows
    *  and stalls the bridge's event loop (see bridge.ts header). */
-  private openBridgeInput(key: string, dev: DeviceInfo): void {
+  private openBridgeInput(key: string, dev: DeviceInfo, prev?: InputRec): void {
     const chans = Math.min(MAX_WCH, Math.max(1, dev.inputChannels));
-    const ring = new Ring(this.frames * 32, chans);
+    /**
+     * **A bridge ring is four times a direct capture's**, because a bridge is
+     * not a direct capture: its audio crosses a process boundary, a batching
+     * step and a socket before it arrives, and every one of those can clump
+     * delivery in a way a driver callback does not.
+     *
+     * `frames * 32` is the direct-capture size, and the adaptive setpoint is
+     * capped at half the ring — so on a 128-frame master a bridge could buy at
+     * most 2048 frames of headroom (21 ms at 96 k). Field captures show the
+     * setpoint pinned at exactly that ceiling with the stream still running
+     * dry: the controller had asked for more headroom than the buffer could
+     * physically give it. That is a sizing bug, whatever is clumping the
+     * delivery.
+     *
+     * This does **not** cost latency. The setpoint is adaptive and converges on
+     * measured drawdown, so a healthy bridge settles at the same standing fill
+     * it always did (a few hundred frames) and only spends the extra headroom
+     * if the stream genuinely needs it. It costs memory: 16384 frames × 8 ch ×
+     * 4 B = 512 kB, allocated once at open.
+     */
+    const ring = new Ring(this.frames * 128, chans);
     const rec: InputRec = {
       rt: null,
       ring,
@@ -1064,21 +1529,60 @@ export class IoManager {
       chanBufs: Array.from({ length: chans }, () => new Float32Array(MAXQ)),
       stamp: -1,
       warm: false,
+      lastPcmMs: Date.now(),
+      dev,
+      revives: prev?.revives ?? 0,
+      ...emptyView(),
     };
     this.inputs.set(key, rec);
     const frameBytes = chans * 4;
+    /**
+     * The bridge socket does NOT have the same shape as a capture callback, so
+     * it does not get `captureView`.
+     *
+     * Every socket chunk genuinely arrives in a different backing store at a
+     * different offset — Node hands out slices of a rotating pool — so the
+     * three-field invalidation check would miss on every single chunk and
+     * rebuild anyway. The previous code was worse than one view per chunk: a
+     * `Buffer.concat` whenever a remainder was carried, an `ArrayBuffer.slice`
+     * (a full *copy*, needed because socket offsets are not float-aligned), a
+     * `Float32Array` over it, and a `subarray` for the leftover — four
+     * allocations per chunk, one of them the size of the audio.
+     *
+     * Instead: a persistent byte accumulator and a persistent float scratch,
+     * both grown-only, with `readFloatLE` doing the unaligned reads. Steady
+     * state allocates nothing. This runs on the engine's event loop rather than
+     * inside an RtAudio callback, but that is the *same* loop the pump runs on,
+     * so its garbage lands in the pump's GC pauses all the same.
+     */
+    let acc = Buffer.alloc(Math.max(64 * 1024, frameBytes * 4));
+    let accLen = 0;
+    let scratch = new Float32Array(acc.length / 4);
     const server = net.createServer((sock) => {
       sock.setNoDelay(true);
-      let pending: Buffer = Buffer.alloc(0);
       sock.on('data', (chunk: Buffer) => {
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-        const usable = pending.length - (pending.length % frameBytes);
+        if (accLen + chunk.length > acc.length) {
+          const grown = Buffer.alloc(Math.max(acc.length * 2, accLen + chunk.length));
+          acc.copy(grown, 0, 0, accLen);
+          acc = grown;
+        }
+        chunk.copy(acc, accLen);
+        accLen += chunk.length;
+        const usable = accLen - (accLen % frameBytes);
         if (!usable) return;
-        // slice() copies into an aligned ArrayBuffer (socket chunk offsets
-        // aren't guaranteed float-aligned).
-        const ab = pending.buffer.slice(pending.byteOffset, pending.byteOffset + usable);
-        ring.push(new Float32Array(ab));
-        pending = pending.subarray(usable);
+        const floats = usable / 4;
+        if (scratch.length < floats) scratch = new Float32Array(floats);
+        for (let i = 0; i < floats; i++) scratch[i] = acc.readFloatLE(i * 4);
+        ring.push(scratch, floats);
+        // Liveness stamp for `checkBridges`, and the delivery gap for
+        // `bridgeStats`. Two assignments per chunk (~190/s), not per frame.
+        const now = Date.now();
+        const gap = now - (rec.lastPcmMs ?? now);
+        if (gap > (rec.maxGapMs ?? 0)) rec.maxGapMs = gap;
+        rec.lastPcmMs = now;
+        // Carry the sub-frame remainder to the front, in place.
+        acc.copyWithin(0, usable, accLen);
+        accLen -= usable;
       });
       sock.on('error', () => {});
     });
@@ -1093,6 +1597,13 @@ export class IoManager {
       );
       rec.child = child;
       rec.server = server;
+      // Opt the bridge out of Windows power throttling (EcoQoS). This is the
+      // process that measurably collapses to ~26 % of realtime once the
+      // LivePatch window is backgrounded; the bridge itself raises priority and
+      // keeps its loop hot, but neither defeats execution-speed throttling. Done
+      // from the parent (the bridge's spin-up path must stay minimal) and off
+      // the audio path. See winqos.ts.
+      if (child.pid) disablePowerThrottling(child.pid, `bridge:${dev.name}`, (info) => send({ op: 'status', info }));
       child.stderr!.on('data', (chunk: Buffer) => {
         for (const line of String(chunk).split('\n')) {
           if (!line.trim()) continue;
@@ -1100,7 +1611,24 @@ export class IoManager {
             const m = JSON.parse(line);
             if (m.ok === false) send({ op: 'status', error: `asio bridge (${dev.name}): ${m.error}` });
             else if (m.chans)
-              send({ op: 'status', info: `asio bridge up: ${dev.name} ${m.chans}ch @${m.sampleRate} (${m.frames}f)` });
+              send({
+                op: 'status',
+                info: `asio bridge up: ${dev.name} ${m.chans}ch @${m.sampleRate} (${m.frames}f)${m.hotLoop ? ' hot-loop' : ''}`,
+              });
+            // The bridge binned captured audio to bound its queue. That is a
+            // splice — it is heard — and without this it is indistinguishable
+            // from the ring simply running dry.
+            else if (m.dropped)
+              send({ op: 'status', error: `asio bridge (${dev.name}) dropped ${m.dropped} frames — it is not being scheduled` });
+            // The bridge's ASIO callback delivered NOTHING for ~2 s. This is
+            // the one distinction the parent cannot make for itself: a starving
+            // ring looks identical whether the stream died or the transport
+            // did. Healthy streams stay silent here.
+            else if (m.stalled !== undefined)
+              send({
+                op: 'status',
+                error: `asio bridge (${dev.name}) captured nothing for 2 s — the ASIO stream has stopped (${m.stalled} frames total)`,
+              });
           } catch {
             /* non-JSON stderr noise */
           }
@@ -1214,9 +1742,19 @@ export class IoManager {
 
   /** WASAPI master pump: one quantum per finished output frame. */
   private wasapiPump(): void {
+    // A closed WASAPI master can still deliver one more callback *after* an ASIO
+    // master has taken over: audify posts callbacks to the JS event loop, and
+    // `closeStream` does not un-post the ones already queued. By then
+    // `masterOutChans` is the ASIO out-span (32 on a MOTU) while `this.mix` is
+    // still the 2-channel WASAPI mix, so the interleave loop below read
+    // `this.mix[2][i]` and threw — from inside an audify callback, which is
+    // fatal: the engine died with 0xC0000409 and restarted, every single time
+    // the user switched to ASIO. Five of those in one diagnostics session, each
+    // one a hole in the audio. Bail; the ASIO pump owns the graph now.
+    if (this.masterIsAsio) return;
     this.markCallback();
     const n = this.frames;
-    const mc = this.masterOutChans;
+    const mc = Math.min(this.masterOutChans, this.mix.length);
     this.quantumId++;
     for (const m of this.mix) m.fill(0, 0, n);
     for (const [, mix] of this.secMix) for (const m of mix) m.fill(0, 0, n);
@@ -1226,9 +1764,11 @@ export class IoManager {
       send({ op: 'status', error: 'dsp error: ' + String(err) });
     }
     this.runProbe(n); // adds a click / reads input if a measurement is active
+    this.runSweep(n); // plays / records a calibration sweep, if one is running
     // Preallocated interleave target + write window (see `outFloatA`). Building
     // either of these here allocated twice per callback.
     this.ensureOutViews(n, mc);
+    this.meterOut(this.mix, mc, n);
     const useA = this.flip;
     this.flip = !this.flip;
     const f = useA ? this.outFloatA : this.outFloatB;
@@ -1240,6 +1780,22 @@ export class IoManager {
       /* torn down */
     }
     this.feedSecondaries(n);
+  }
+
+  /** Float32 view over the ASIO input Buffer, rebuilt only when audify hands
+   *  back a different backing store (see the call site — allocation-free path). */
+  private asioInBuf: ArrayBufferLike | null = null;
+  private asioInOff = -1;
+  private asioInLen = -1;
+  private asioInF32: Float32Array = new Float32Array(0);
+  private asioInView(input: Buffer): Float32Array {
+    if (input.buffer !== this.asioInBuf || input.byteOffset !== this.asioInOff || input.byteLength !== this.asioInLen) {
+      this.asioInBuf = input.buffer;
+      this.asioInOff = input.byteOffset;
+      this.asioInLen = input.byteLength;
+      this.asioInF32 = new Float32Array(input.buffer, input.byteOffset, input.byteLength / 4);
+    }
+    return this.asioInF32;
   }
 
   /**
@@ -1270,6 +1826,9 @@ export class IoManager {
    * again the depth sits at the lead and stays there.
    */
   private asioPump(input: Buffer | null, outSpan: number, inSpan: number): void {
+    // Symmetric to the guard in `wasapiPump`: an already-posted callback from a
+    // torn-down ASIO stream must not run against a WASAPI master's buffers.
+    if (!this.masterIsAsio || outSpan > this.asioOut.length) return;
     this.markCallback();
     const n = this.frames;
     this.quantumId++;
@@ -1283,7 +1842,12 @@ export class IoManager {
     }
     this.asioLastPumpNs = nowNs;
     if (input && inSpan > 0) {
-      const f = new Float32Array(input.buffer, input.byteOffset, input.byteLength / 4);
+      // Cached view — `new Float32Array(input.buffer, …)` here was a heap
+      // allocation on every callback (~375/s at 128 frames), in the audio pump,
+      // which is exactly the GC pressure `OutputRec.writeView` and docs/10 rule
+      // 1 exist to keep out of this path. audify hands back the same buffer
+      // each callback, so the view is rebuilt only when it actually changes.
+      const f = this.asioInView(input);
       const frames = Math.min(n, Math.floor(f.length / inSpan));
       for (let c = 0; c < inSpan; c++) {
         const dst = this.asioIn[c];
@@ -1299,12 +1863,21 @@ export class IoManager {
       send({ op: 'status', error: 'dsp error: ' + String(err) });
     }
     this.runProbe(n); // adds a click / reads input if a measurement is active
+    this.runSweep(n); // plays / records a calibration sweep, if one is running
     if (this.asioQueue >= IoManager.ASIO_MAX_LEAD) {
       // Backlogged: the queue already holds more audio than the allowed lead,
       // so dropping this quantum is what pays the delay back. The graph has
       // already run, so nothing downstream (recorders, sequencers, the input
       // ring) skips a beat — only the write does.
       this.asioQueue -= 1;
+      // A skipped write is a whole quantum of audio the DAC never hears — an
+      // audible discontinuity, not a bookkeeping detail. The one-shot `info`
+      // below is deliberately once per stream open (a trim storm must not flood
+      // the log), but that also meant *recurring* skips later in a session were
+      // completely invisible: no xrun, no `late`, the pump on time throughout.
+      // That is one of the shapes "it sometimes just decides to go popping"
+      // can take, so count every one and report the count per status window.
+      this.asioSkips++;
       if (!this.asioTrimmed) {
         this.asioTrimmed = true;
         send({ op: 'status', info: 'ASIO output backlog trimmed (event-loop stall at stream start)' });
@@ -1315,6 +1888,10 @@ export class IoManager {
     // Preallocated interleave target + write window (see `outFloatA`). Building
     // either of these here allocated twice per callback.
     this.ensureOutViews(n, outSpan);
+    // After the backlog check: a trimmed quantum never reaches the DAC, so
+    // metering it would invent a discontinuity the listener does not hear (and
+    // the trim reports itself separately).
+    this.meterOut(this.asioOut, outSpan, n);
     const useA = this.flip;
     this.flip = !this.flip;
     const f = useA ? this.outFloatA : this.outFloatB;
@@ -1339,8 +1916,91 @@ export class IoManager {
       const take = Math.min(n, Math.floor(tmp.length / ch));
       for (let i = 0; i < take; i++)
         for (let c = 0; c < ch; c++) tmp[i * ch + c] = clip(mix[c][i]);
-      rec.ring.push(tmp.subarray(0, take * ch));
+      // `push(data, count)` exists precisely so this can hand over the reused
+      // scratch: `tmp.subarray(0, take * ch)` allocated a wrapper object per
+      // secondary output per quantum (~375/s each) in the audio pump — the same
+      // violation of golden rule 1 that `outFloatA` and `asioInView` document.
+      rec.ring.push(tmp, take * ch);
     }
+  }
+
+  // ---- output meter (the telemetry for a pop that leaves no other trace) ----
+  /**
+   * `jitterQ`, `late` and `xruns` catch a pop the **engine** caused: a missed
+   * deadline, a ring that ran dry. They say nothing about a click that is *in
+   * the audio the graph produced* — a spliced buffer, an un-ramped gain change,
+   * a param that jumped, a kernel that batches. Field logs of sessions that
+   * popped repeatedly read `late: 0`, `xrunsDelta: 0`, GC max 0.2 ms and `load`
+   * 0.03 from end to end: every IO-level number healthy, the user still hearing
+   * it. When that is the shape of the report, the next measurement has to be of
+   * the signal, not of the plumbing.
+   *
+   * - **`dMax` is the largest sample-to-sample step that left the box.** A click
+   *   *is* a step discontinuity, and ordinary audio's slope is bounded by its
+   *   bandwidth — a full-scale 1 kHz sine steps 0.13 per sample at 48 kHz. This
+   *   is the same measurement that identified the "click once a minute" splice
+   *   (jumps of 0.97–1.76 where the signal's own max slope was 0.059), and it
+   *   does not care what the click was made of.
+   * - **`peak` is the pre-clip peak.** Above 1 the graph is driving into
+   *   `clip()` and the "pop" is distortion, not a dropout — the failure a rig
+   *   folded onto a too-narrow device already produced once (docs/06).
+   * - **`clip` and `nonFinite` are absent from the status unless they happened**,
+   *   so their presence in a log is the finding. `nonFinite` is the NaN latch
+   *   from docs/10 seen at the very end of the chain, where it is a fact rather
+   *   than an inference from "block X went silent".
+   *
+   * Costs one sequential pass over buffers the interleave loop is about to read
+   * anyway, allocates nothing in steady state, and holds peaks until the status
+   * tick reads them (`takeOutMeter`).
+   */
+  private outPeak = 0;
+  private outJump = 0;
+  private outClip = 0;
+  private outNonFinite = 0;
+  /** Last written sample per channel — so a step across a quantum boundary
+   *  (exactly where a spliced or dropped buffer shows up) is measured too. */
+  private outLast = new Float32Array(0);
+
+  private meterOut(bufs: Float32Array[], span: number, n: number): void {
+    if (this.outLast.length < span) {
+      // Grow-only, and only when the channel span changes — not per quantum.
+      const grown = new Float32Array(span);
+      grown.set(this.outLast);
+      this.outLast = grown;
+    }
+    let peak = this.outPeak;
+    let jump = this.outJump;
+    let clipped = this.outClip;
+    for (let c = 0; c < span; c++) {
+      const b = bufs[c];
+      let prev = this.outLast[c];
+      // Non-finite detection is a sum, exactly as `trapNonFinite` in dsp.ts
+      // argues: NaN and ±Infinity both poison a running total, so one check per
+      // channel-quantum replaces n branches in the audio path.
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const raw = b[i];
+        sum += raw;
+        const a = raw < 0 ? -raw : raw;
+        if (a > peak) peak = a;
+        if (a > 1) clipped++;
+        const v = raw > 1 ? 1 : raw < -1 ? -1 : raw;
+        const d = v > prev ? v - prev : prev - v;
+        if (d > jump) jump = d;
+        prev = v;
+      }
+      if (Number.isFinite(sum)) {
+        this.outLast[c] = prev;
+      } else {
+        // A NaN in `prev` would make every later comparison false and blind the
+        // meter for the rest of the session — report it and carry on measuring.
+        this.outNonFinite++;
+        this.outLast[c] = 0;
+      }
+    }
+    this.outPeak = peak;
+    this.outJump = jump;
+    this.outClip = clipped;
   }
 
   /** Idle pump for output-less graphs: ~10 ms timer, wall-clock paced. */
@@ -1540,6 +2200,73 @@ export class IoManager {
   }
 
   /**
+   * Read + reset the **splice** counters (called by the status timer).
+   *
+   * Every one of these is a deliberate discontinuity the engine introduces to
+   * keep latency bounded, and every one of them is audible. None of them moves
+   * `xruns` (nothing ran dry), `late` or `jitterQ` (the pump was on time), or
+   * `load` — so before they were counted, a session spent splicing looked
+   * *identical in the log* to a session that ran perfectly. That is the gap
+   * behind "sometimes it runs fine and sometimes it just decides to go
+   * popping": the popping episodes were not being recorded at all.
+   *
+   * - `ringTrim` — `Ring.capLatency` dropped stale capture surplus.
+   * - `ringOver` — a producer overwrote frames the consumer had not taken.
+   * - `asioSkip` — `asioPump` skipped a write to drain its output queue.
+   */
+  takeSplices(): {
+    ringTrim: number;
+    ringOver: number;
+    asioSkip: number;
+    trimmed: Array<{ ring: string; n: number; fill: number; drop: number; set: number; burst: number }>;
+  } {
+    let trim = 0;
+    let over = 0;
+    // **Name the ring.** "Something spliced" sends you reading all of io.ts;
+    // "the capture ring for device X trimmed 900 frames off a fill of 3300
+    // against a setpoint of 1216 with a burst of 960" is an arithmetic problem
+    // with one answer. Built here, in the status timer, never in the pump.
+    const trimmed: Array<{ ring: string; n: number; fill: number; drop: number; set: number; burst: number }> = [];
+    const sweep = (label: string, key: string, ring: Ring): void => {
+      trim += ring.trims;
+      over += ring.overs;
+      if (ring.trims)
+        trimmed.push({
+          ring: `${label}:${key || '(default)'}`,
+          n: ring.trims,
+          fill: Math.round(ring.lastFill),
+          drop: Math.round(ring.lastDrop),
+          set: Math.round(ring.latencyTarget),
+          burst: Math.round(ring.burst),
+        });
+      ring.trims = 0;
+      ring.overs = 0;
+    };
+    for (const [key, rec] of this.inputs) sweep('in', key, rec.ring);
+    for (const [key, rec] of this.secOuts) sweep('out', key, rec.ring);
+    const r = { ringTrim: trim, ringOver: over, asioSkip: this.asioSkips, trimmed };
+    this.asioSkips = 0;
+    return r;
+  }
+
+  /**
+   * Read + reset the output meter (called by the status timer). See `meterOut`.
+   */
+  takeOutMeter(): { peak: number; dMax: number; clip: number; nonFinite: number } {
+    const r = {
+      peak: Math.round(this.outPeak * 1000) / 1000,
+      dMax: Math.round(this.outJump * 1000) / 1000,
+      clip: this.outClip,
+      nonFinite: this.outNonFinite,
+    };
+    this.outPeak = 0;
+    this.outJump = 0;
+    this.outClip = 0;
+    this.outNonFinite = 0;
+    return r;
+  }
+
+  /**
    * Standing capture latency, in frames: the largest self-tuned setpoint over
    * the open inputs. This is the meaningful number (the instantaneous fill
    * swings by a whole delivery burst and reads as noise).
@@ -1548,6 +2275,106 @@ export class IoManager {
     let d = 0;
     for (const rec of this.inputs.values()) d = Math.max(d, rec.ring.latencyTarget);
     return d;
+  }
+
+  /**
+   * Respawn a bridge whose capture has stopped.
+   *
+   * **The failure this exists for, measured:** with the window focused the
+   * stream ran 13 minutes with zero xruns; one second after the window lost
+   * focus the capture stopped and never came back. The child was still alive,
+   * the socket was still open, and the bridge reported **nothing dropped** — so
+   * it was not being starved of CPU or backed up on the socket, its ASIO
+   * callback simply stopped being delivered. That is the documented audify
+   * thread-call degradation in `bridge.ts` (which freezes the stream "within
+   * ~1 s"), and it is unrecoverable from the parent's side: the ring starves
+   * for as long as the user is willing to listen to it.
+   *
+   * Nothing noticing is the real defect. A capture stream that has delivered no
+   * PCM for two seconds while the engine is running is dead, whatever killed
+   * it, so tear it down and open it again — a ~1 s gap instead of a permanent
+   * one. Bounded, because a bridge that cannot stay up must not be respawned in
+   * a loop forever; after `MAX_REVIVES` it is left down and said so.
+   *
+   * Called from the status timer in `main.ts` — off the audio path.
+   */
+  checkBridges(): void {
+    if (!this.running) return;
+    const now = Date.now();
+    for (const [key, rec] of [...this.inputs]) {
+      if (!rec.child || !rec.dev || rec.lastPcmMs === undefined) continue;
+      if (now - rec.lastPcmMs < BRIDGE_DEAD_MS) continue;
+      const tries = rec.revives ?? 0;
+      if (tries >= MAX_REVIVES) {
+        // Say it once, then stop trying — a stream that will not stay up is a
+        // configuration problem, and respawning it forever hides that.
+        if (tries === MAX_REVIVES) {
+          rec.revives = tries + 1;
+          send({
+            op: 'status',
+            error: `asio bridge (${rec.name}) stopped delivering and would not stay up after ${MAX_REVIVES} restarts — leaving it down`,
+          });
+        }
+        continue;
+      }
+      send({
+        op: 'status',
+        error: `asio bridge (${rec.name}) stopped delivering audio — restarting it (${tries + 1}/${MAX_REVIVES})`,
+      });
+      rec.revives = tries + 1;
+      this.closeInput(rec);
+      this.inputs.delete(key);
+      this.openBridgeInput(key, rec.dev, rec);
+    }
+  }
+
+  /**
+   * Per-bridge delivery, for the status stream. Two numbers, and between them
+   * they decide the question the last three captures could not:
+   *
+   * - **`fps`** — frames the bridge actually delivered per second. The consumer's
+   *   appetite is not a guess: it takes exactly one quantum per pump, i.e. the
+   *   sample rate. So `fps` materially below `sampleRate` is a **rate deficit**
+   *   (the source genuinely is not producing enough, and the ±0.5 % resampler
+   *   cannot close it), while `fps` ≈ `sampleRate` with a starving ring is
+   *   **burstiness** (enough audio, arriving in clumps too far apart).
+   * - **`gapMs`** — the longest interval between socket deliveries. Healthy is
+   *   the batch period (~2.7 ms at 96 k). A gap wider than the ring's standing
+   *   fill is, by itself, the underrun.
+   *
+   * The distinction matters because the two have nothing in common: one is a
+   * clock/configuration problem, the other is a scheduling problem in the
+   * transport, and until now a starving ring looked identical either way.
+   */
+  bridgeStats(): Array<{ name: string; fps: number; gapMs: number }> {
+    const out: Array<{ name: string; fps: number; gapMs: number }> = [];
+    const now = Date.now();
+    for (const rec of this.inputs.values()) {
+      if (!rec.child) continue;
+      const since = rec.statMs === undefined ? 0 : now - rec.statMs;
+      const frames = rec.statPushed === undefined ? 0 : rec.ring.pushed - rec.statPushed;
+      rec.statMs = now;
+      rec.statPushed = rec.ring.pushed;
+      const gap = rec.maxGapMs ?? 0;
+      rec.maxGapMs = 0;
+      if (since > 0) out.push({ name: rec.name, fps: Math.round((frames / since) * 1000), gapMs: gap });
+    }
+    return out;
+  }
+
+  /**
+   * Names of capture streams whose ring has bought every frame of headroom it
+   * can hold and is *still* running dry (`Ring.starved`).
+   *
+   * This is the difference between "the tuner is still converging" and "the
+   * source is not keeping up and never will". A log with `inDepth` parked on a
+   * number and a steady xrun count says nothing about which — and the answer
+   * decides whether to look at the patch or at the process feeding it.
+   */
+  starvedInputs(): string[] {
+    const out: string[] = [];
+    for (const rec of this.inputs.values()) if (rec.ring.starved) out.push(rec.name);
+    return out;
   }
 
   // ---- round-trip latency probe ----
@@ -1693,6 +2520,230 @@ export class IoManager {
       driverFrames: this.latencyFrames,
       sampleRate: this.sampleRate,
     });
+  }
+
+  // ---- speaker calibration sweeps ----
+  /**
+   * Begin a calibration run. Result arrives as a stream of `speaker-sweep`
+   * chunks plus `speaker-cal` progress; the renderer does the analysis.
+   *
+   * Everything the pump will touch is allocated here, before the first
+   * quantum: the sweep, the capture buffer and the speaker list. `measureLatency`
+   * has the same shape and for the same reason.
+   */
+  measureSpeakers(opts: {
+    device?: string;
+    channel?: number;
+    asioOut?: boolean;
+    outDevice?: string;
+    speakers: Array<{ id: string; ch: number }>;
+    sweep: Float32Array;
+    tail?: number;
+    cancel?: boolean;
+  }): void {
+    if (opts.cancel) {
+      this.endSweep('cancelled');
+      return;
+    }
+    const fail = (error: string): void => send({ op: 'speaker-cal', done: true, error });
+    if (this.sweep) return fail('a calibration is already running');
+    if (!this.running) return fail('turn audio on first');
+    if (!opts.speakers.length) return fail('no speakers to measure');
+    if (!opts.sweep.length) return fail('empty sweep');
+    const asioOut = !!opts.asioOut;
+    const outDevice = opts.outDevice ?? '';
+    // A speaker's channel has to physically exist on the route, or the sweep
+    // goes nowhere and the run reports "no signal on the microphone" — which
+    // sends the user hunting for a cable that is fine. Say the real thing.
+    const avail = this.outChannels(outDevice, asioOut);
+    if (avail <= 0)
+      return fail(
+        `no ${asioOut ? 'ASIO' : 'output'} stream is open — put a Speaker Rig block in the patch and turn audio on`,
+      );
+    let widest = 0;
+    for (const s of opts.speakers) if (s.ch > widest) widest = s.ch;
+    if (widest > avail)
+      return fail(`the rig needs ${widest} output channels and the device has ${avail}`);
+
+    const device = opts.device ?? '';
+    const inCh = Math.max(1, Math.min(MAX_WCH, opts.channel ?? 1)) - 1;
+    let openedInput = false;
+    const usesMasterInput = device === '' && this.masterIsAsio;
+    if (!usesMasterInput) {
+      if (!this.inputs.has(device)) {
+        this.openInput(device, this.errCb);
+        openedInput = this.inputs.has(device);
+      }
+      if (!this.inputs.has(device)) return fail(`could not open input "${device || '(default)'}"`);
+    }
+
+    const sr = this.sampleRate;
+    const tailFrames = Math.max(0, Math.round((opts.tail ?? 0.35) * sr));
+    const captureLen = opts.sweep.length + tailFrames;
+    this.sweep = {
+      device,
+      inCh,
+      asioOut,
+      outDevice,
+      speakers: opts.speakers.slice(),
+      at: 0,
+      sweep: opts.sweep,
+      capture: new Float32Array(captureLen),
+      captureLen,
+      tailFrames,
+      openedInput,
+      stage: 'settle',
+      pos: 0,
+      // Half a second: long enough for a freshly opened capture stream to prime
+      // its ring, and for the previous speaker's tail to be gone.
+      settleFrames: Math.round(sr * 0.5),
+      chunk: 0,
+      chunks: Math.ceil(captureLen / CAP_CHUNK),
+    };
+    send({ op: 'speaker-cal', id: opts.speakers[0].id, index: 0, total: opts.speakers.length });
+    this.startSweepTimer();
+  }
+
+  /**
+   * The output buffer a sweep should be added to, or null.
+   *
+   * This resolves the route exactly the way `pushOutputCh` does, including the
+   * ASIO fallback, because the whole measurement is only meaningful if the
+   * sweep comes out of the same physical socket the `speaker-rig` kernel would
+   * have used for that speaker. A calibration of a different channel than the
+   * one that gets corrected is worse than no calibration.
+   */
+  private sweepOut(s: SweepState, ch: number): Float32Array | null {
+    if (!s.asioOut) {
+      let mix = this.secMix.get(s.outDevice);
+      if (!mix && !this.masterIsAsio && this.master && s.outDevice === this.masterKey) mix = this.mix;
+      if (mix) return mix[ch] ?? null;
+    }
+    return this.asioOut[ch] ?? null;
+  }
+  private sweepIn(s: SweepState): Float32Array | null {
+    if (s.device === '' && this.masterIsAsio) return this.asioIn[s.inCh] ?? this.asioIn[0] ?? null;
+    const rec = this.freshInput(s.device);
+    return rec?.chanBufs[s.inCh] ?? rec?.chanBufs[0] ?? null;
+  }
+
+  /**
+   * Advance the sweep state machine for one quantum. Runs inside the pump, so
+   * it copies floats and nothing else — no sends, no allocation, no analysis.
+   */
+  private runSweep(n: number): void {
+    const s = this.sweep;
+    if (!s || s.stage === 'ship' || s.stage === 'idle') return;
+    const spk = s.speakers[s.at];
+    if (!spk) return;
+    const inBuf = this.sweepIn(s);
+    const outBuf = this.sweepOut(s, spk.ch - 1);
+    for (let i = 0; i < n; i++) {
+      if (s.stage === 'settle') {
+        if (++s.pos >= s.settleFrames) {
+          s.stage = 'sweep';
+          s.pos = 0;
+        }
+        continue;
+      }
+      // The sweep is *added* to whatever the graph produced, exactly as the
+      // latency probe's click is: a calibration must work on a patch that is
+      // already making noise, and muting the graph from here would be a step
+      // on every other output channel.
+      if (s.stage === 'sweep') {
+        if (outBuf) outBuf[i] += s.sweep[s.pos];
+        if (inBuf) s.capture[s.pos] = inBuf[i];
+        if (++s.pos >= s.sweep.length) s.stage = 'record';
+        continue;
+      }
+      // 'record' — the tail. `pos` keeps counting through the capture buffer.
+      if (inBuf) s.capture[s.pos] = inBuf[i];
+      if (++s.pos >= s.captureLen) {
+        s.stage = 'ship';
+        s.pos = 0;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Ship the finished capture and move to the next speaker. Timer-driven, at a
+   * chunk per tick — see `SpeakerSweepMsg` for why this must not be one write.
+   */
+  private startSweepTimer(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => {
+      const s = this.sweep;
+      if (!s) {
+        this.stopSweepTimer();
+        return;
+      }
+      // A run only makes sense while the pump is turning. If audio stops
+      // half-way the state machine would sit in `settle` forever.
+      if (!this.running) {
+        this.endSweep('audio stopped');
+        return;
+      }
+      if (s.stage !== 'ship') return;
+      const spk = s.speakers[s.at];
+      const from = s.chunk * CAP_CHUNK;
+      const count = Math.min(CAP_CHUNK, s.captureLen - from);
+      // int16, with a per-capture scale — see `SpeakerSweepMsg`. Allocating a
+      // buffer per chunk is fine here: this is a timer, not the pump.
+      const bytes = Buffer.allocUnsafe(count * 2);
+      const SCALE = 32767;
+      for (let i = 0; i < count; i++) {
+        let v = Math.round(s.capture[from + i] * SCALE);
+        if (v > 32767) v = 32767;
+        else if (v < -32768) v = -32768;
+        bytes.writeInt16LE(v, i * 2);
+      }
+      send({
+        op: 'speaker-sweep',
+        id: spk.id,
+        chunk: s.chunk,
+        chunks: s.chunks,
+        frames: s.captureLen,
+        scale: 1 / SCALE,
+        sampleRate: this.sampleRate,
+        pcm: bytes.toString('base64'),
+      });
+      if (++s.chunk < s.chunks) return;
+      // On to the next speaker.
+      s.at++;
+      s.chunk = 0;
+      s.pos = 0;
+      s.capture.fill(0);
+      if (s.at >= s.speakers.length) {
+        this.endSweep('');
+        return;
+      }
+      s.stage = 'settle';
+      send({ op: 'speaker-cal', id: s.speakers[s.at].id, index: s.at, total: s.speakers.length });
+    }, 20);
+  }
+
+  private stopSweepTimer(): void {
+    if (!this.sweepTimer) return;
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+  }
+
+  /** Tear a run down. `error` empty = it finished normally. */
+  private endSweep(error: string): void {
+    const s = this.sweep;
+    // Clear the pump's view first: `runSweep` bails on a null state, so the
+    // audio path stops touching any of this before the buffers go.
+    this.sweep = null;
+    this.stopSweepTimer();
+    if (s?.openedInput) {
+      const rec = this.inputs.get(s.device);
+      if (rec) {
+        this.closeInput(rec);
+        this.inputs.delete(s.device);
+      }
+    }
+    if (s) send({ op: 'speaker-cal', done: true, ...(error ? { error } : {}) });
   }
 
   pullAsioIn(ch: number, out: Float32Array, n: number): void {
