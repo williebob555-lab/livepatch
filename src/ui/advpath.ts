@@ -19,7 +19,16 @@ import { registerAdvancedView, AdvancedViewHandle } from './advanced';
 import { ResolvedRef } from './facepaint';
 import { showContextMenu } from './menus';
 import { fitCanvasBacking } from './uiscale';
-import { PathPoint, parsePoints, serializePoints, samplePath, MAX_PATH_POINTS } from '../core/trajectory';
+import { TwoPointerGesture, capture, grabSlop, isCoarse, release, wheelDelta } from './input';
+import {
+  PathPoint,
+  parsePoints,
+  serializePoints,
+  samplePath,
+  insertIndexFor,
+  simplifyPath,
+  MAX_PATH_POINTS,
+} from '../core/trajectory';
 
 function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
   host.classList.add('advpath');
@@ -109,9 +118,11 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
       y: ((e.clientY - rect.top) / rect.height) * (canvas.clientHeight || 1),
     };
   };
-  const nearestHandle = (p: { x: number; y: number }): number => {
+  /** The waypoint under a point, or −1. `slop` is the grab radius in canvas px
+   *  — callers with an event widen it for a fingertip (docs/14-input.md). */
+  const nearestHandle = (p: { x: number; y: number }, slop = 12): number => {
     const pts = points();
-    let best = 12;
+    let best = slop;
     let hit = -1;
     for (let i = 0; i < pts.length; i++) {
       const s = toPx(pts[i].x, pts[i].y);
@@ -150,9 +161,11 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
     const closed = P().mode !== 'Once';
     const smooth = P().interp !== 'Linear';
 
-    // Curve.
+    // Curve. At least a few samples per segment however many segments there
+    // are, or a dense recorded path draws as its own chords and the Smooth /
+    // Linear distinction disappears exactly where it matters most.
     if (pts.length >= 2) {
-      const steps = Math.min(400, Math.max(40, pts.length * 24));
+      const steps = Math.min(1600, Math.max(60, pts.length * 8));
       g.strokeStyle = '#b478ff';
       g.lineWidth = 2;
       g.beginPath();
@@ -164,17 +177,23 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
       g.stroke();
     }
 
-    // Waypoint handles — fill brightness encodes height (z −1..1).
+    // Waypoint handles — fill brightness encodes height (z −1..1). A recorded
+    // path has too many for numbered discs to read as anything but noise, so
+    // past a threshold they shrink to plain dots and lose their labels; the
+    // selected one keeps its full size so it is still findable.
+    const dense = pts.length > 40;
+    const numbered = pts.length <= 24;
     for (let i = 0; i < pts.length; i++) {
       const s = toPx(pts[i].x, pts[i].y);
       const lift = (pts[i].z + 1) / 2; // 0..1
       const hot = i === sel;
       g.beginPath();
-      g.arc(s.x, s.y, hot ? 7 : 5.5, 0, Math.PI * 2);
+      g.arc(s.x, s.y, hot ? 7 : dense ? 2.6 : 5.5, 0, Math.PI * 2);
       const c = Math.round(120 + lift * 135);
       g.fillStyle = hot ? '#9ecbff' : `rgb(${c},${c},${c})`;
       g.fill();
       g.strokeStyle = 'rgba(0,0,0,0.7)'; g.lineWidth = 1; g.stroke();
+      if (!numbered) continue;
       g.fillStyle = '#0d0f12';
       g.font = '600 8px Segoe UI, sans-serif';
       g.textAlign = 'center'; g.textBaseline = 'middle';
@@ -193,13 +212,65 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
 
   // ---- interaction --------------------------------------------------------
   let dragIdx = -1;
+  /**
+   * The freehand gesture as drawn, at capture resolution — **not** the path.
+   *
+   * Capture used to write waypoints straight into `points` and stop at the
+   * ceiling, so a gesture longer than about two seconds was cut off mid-draw
+   * and most shapes were unfinishable. The stroke is kept here at full detail
+   * and *simplified* into the path (`simplifyPath`), so the ceiling costs
+   * fidelity instead of costing the end of the gesture.
+   *
+   * The raw stroke has a ceiling of its own — a bound on memory, not on the
+   * drawing: at it, the capture spacing doubles and the stroke is re-thinned in
+   * place, which halves its length and lets the gesture run on indefinitely.
+   */
   let recStroke: PathPoint[] = [];
+  const REC_RAW_CAP = 4096;
+  const REC_MIN_STEP = 0.008;
+  let recStep = REC_MIN_STEP;
+  /** Points in the stroke when the path was last previewed (simplify is not
+   *  free, and a preview per pointermove would run it hundreds of times). */
+  let recDrawn = 0;
+
+  /** Drop points closer together than `step`, keeping the ends. */
+  const thinStroke = (step: number): void => {
+    const out: PathPoint[] = [];
+    for (const q of recStroke) {
+      const last = out[out.length - 1];
+      if (!last || Math.hypot(q.x - last.x, q.y - last.y) >= step) out.push(q);
+    }
+    const tail = recStroke[recStroke.length - 1];
+    if (tail && out[out.length - 1] !== tail) out.push(tail);
+    recStroke = out;
+  };
+
+  const previewStroke = (): void => {
+    recDrawn = recStroke.length;
+    commit(simplifyPath(recStroke, MAX_PATH_POINTS));
+    draw();
+  };
+  /**
+   * Two fingers set the selected waypoint's height, matching the wheel. Height
+   * was otherwise mouse-only: on a touchscreen you could lay out a trajectory
+   * in plan but never lift any of it off the floor, which is most of the point
+   * of the block.
+   */
+  const gesture = new TwoPointerGesture();
 
   canvas.addEventListener('pointerdown', (e) => {
     if (!block) return;
     const p = localPt(e);
+    if (isCoarse(e)) {
+      gesture.add(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (gesture.count >= 2) {
+        dragIdx = -1;
+        recStroke = [];
+        return;
+      }
+    }
     if (e.button === 2) {
-      const h = nearestHandle(p);
+      const h = nearestHandle(p, grabSlop(12, e));
       if (h >= 0) { sel = h; pointMenu(e.clientX, e.clientY, h); }
       return;
     }
@@ -208,27 +279,38 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
       doc.pushHistory();
       const n = toNorm(p.x, p.y);
       recStroke = [{ x: n.x, y: n.y, z: 0 }];
-      try { canvas.setPointerCapture(e.pointerId); } catch { /* pen quirk */ }
+      recStep = REC_MIN_STEP;
+      recDrawn = 0;
+      capture(canvas, e.pointerId);
       return;
     }
-    const h = nearestHandle(p);
+    const h = nearestHandle(p, grabSlop(12, e));
     if (h >= 0) {
       sel = h;
       dragIdx = h;
       doc.pushHistory();
-      try { canvas.setPointerCapture(e.pointerId); } catch { /* pen quirk */ }
+      capture(canvas, e.pointerId);
       draw();
     } else {
-      // Empty space: append a new waypoint here and grab it.
+      // Empty space: insert a waypoint into the leg the click is nearest to
+      // and grab it. Appending would drop every new point onto the last→first
+      // leg of a closed path, which is what made the block only extendable at
+      // one place (see `insertIndexFor`).
       const pts = points();
       if (pts.length >= MAX_PATH_POINTS) return;
       const n = toNorm(p.x, p.y);
       doc.pushHistory();
-      pts.push({ x: n.x, y: n.y, z: 0 });
-      sel = pts.length - 1;
-      dragIdx = sel;
+      const at = insertIndexFor(pts, n.x, n.y, P().interp !== 'Linear', P().mode !== 'Once');
+      // Height is interpolated from the neighbours it lands between, so a point
+      // added to a lifted stretch of path doesn't drop it back to the floor.
+      const before = pts[(at - 1 + pts.length) % pts.length];
+      const after = pts[at % pts.length];
+      const z = pts.length ? ((before?.z ?? 0) + (after?.z ?? 0)) / 2 : 0;
+      pts.splice(at, 0, { x: n.x, y: n.y, z });
+      sel = at;
+      dragIdx = at;
       commit(pts);
-      try { canvas.setPointerCapture(e.pointerId); } catch { /* pen quirk */ }
+      capture(canvas, e.pointerId);
       draw();
     }
   });
@@ -236,16 +318,26 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
   canvas.addEventListener('pointermove', (e) => {
     if (!block) return;
     const p = localPt(e);
+    if (gesture.update(e.pointerId, { x: e.clientX, y: e.clientY }) && gesture.active) {
+      const f = gesture.frame();
+      const h = sel >= 0 ? sel : nearestHandle(p);
+      if (f && h >= 0 && f.dy) nudgeZ(h, f.dy * 3);
+      return;
+    }
     if (recording && recStroke.length) {
       const n = toNorm(p.x, p.y);
       const last = recStroke[recStroke.length - 1];
-      // Distance-throttle so a slow drag doesn't pack in hundreds of points.
-      if (Math.hypot(n.x - last.x, n.y - last.y) > 0.04 && recStroke.length < MAX_PATH_POINTS) {
-        recStroke.push({ x: n.x, y: n.y, z: 0 });
-        // Live preview without spamming history: write straight through.
-        commit(recStroke);
-        draw();
+      // Distance-throttle so a slow drag doesn't pack in samples that say
+      // nothing; the step widens as the stroke grows (see recStroke).
+      if (Math.hypot(n.x - last.x, n.y - last.y) < recStep) return;
+      recStroke.push({ x: n.x, y: n.y, z: 0 });
+      if (recStroke.length >= REC_RAW_CAP) {
+        recStep *= 2;
+        thinStroke(recStep);
       }
+      // Live preview without spamming history: write straight through, but
+      // only every few points — simplify is cheap, not free.
+      if (recStroke.length - recDrawn >= 4) previewStroke();
       return;
     }
     if (dragIdx >= 0) {
@@ -261,14 +353,19 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
   });
 
   const endDrag = (e: PointerEvent): void => {
+    if (gesture.count) {
+      const wasActive = gesture.active;
+      gesture.remove(e.pointerId);
+      if (wasActive || gesture.count >= 1) return;
+    }
     if (recording && recStroke.length) {
-      commit(recStroke);
+      previewStroke();
       recStroke = [];
       sel = -1;
       draw();
     }
     dragIdx = -1;
-    try { canvas.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+    release(canvas, e.pointerId);
   };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
@@ -286,40 +383,74 @@ function buildPathEditor(host: HTMLElement): AdvancedViewHandle {
     }
   });
 
-  // Wheel over a handle sets its height (z), mirroring the EQ editor's
-  // wheel-for-Q. Over empty space it does nothing (lets the panel scroll).
+  /**
+   * Wheel over a handle sets its height (z), mirroring the EQ editor's
+   * wheel-for-Q. Over empty space it does nothing (lets the panel scroll).
+   *
+   * A *value* wheel, so it scales by the normalised delta rather than treating
+   * each event as one notch — see `wheelDelta` and docs/14-input.md.
+   */
+  const nudgeZ = (h: number, dy: number): void => {
+    const pts = points();
+    if (h < 0 || h >= pts.length) return;
+    pts[h].z = Math.max(-1, Math.min(1, pts[h].z - dy / 500));
+    sel = h;
+    commit(pts);
+    draw();
+  };
   canvas.addEventListener('wheel', (e) => {
     if (!block) return;
     const h = sel >= 0 ? sel : nearestHandle(localPt(e));
     if (h < 0) return;
     e.preventDefault();
-    const pts = points();
-    if (h >= pts.length) return;
-    pts[h].z = Math.max(-1, Math.min(1, pts[h].z - e.deltaY / 500));
-    sel = h;
-    commit(pts);
-    draw();
+    nudgeZ(h, wheelDelta(e).dy);
   }, { passive: false });
 
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  /** Put a waypoint halfway along the leg on one side of waypoint `i`. The
+   *  explicit form of clicking on that leg, for when the legs are too close
+   *  together to aim at. */
+  function insertBeside(i: number, side: -1 | 1): void {
+    const pts = points();
+    if (pts.length >= MAX_PATH_POINTS || i >= pts.length) return;
+    const closed = P().mode !== 'Once';
+    const j = i + side;
+    // An open path has nothing beyond its ends to halve; extend outward instead.
+    const other = closed ? pts[((j % pts.length) + pts.length) % pts.length] : pts[j];
+    const at = side > 0 ? i + 1 : i;
+    const p = other
+      ? { x: (pts[i].x + other.x) / 2, y: (pts[i].y + other.y) / 2, z: (pts[i].z + other.z) / 2 }
+      : { x: Math.max(-1, Math.min(1, pts[i].x + side * 0.2)), y: pts[i].y, z: pts[i].z };
+    doc.pushHistory();
+    pts.splice(at, 0, p);
+    sel = at;
+    commit(pts);
+    draw();
+  }
 
   function pointMenu(x: number, y: number, i: number): void {
     const pts = points();
     if (i >= pts.length) return;
     showContextMenu(x, y, [
-      { label: `Waypoint ${i + 1} — height ${pts[i].z.toFixed(2)}`, disabled: true, action: () => {} },
+      { label: `Waypoint ${i + 1} of ${pts.length} — height ${pts[i].z.toFixed(2)}`, disabled: true, action: () => {} },
       { label: 'Raise (+z)', action: () => { pts[i].z = Math.min(1, pts[i].z + 0.25); doc.pushHistory(); commit(pts); draw(); } },
       { label: 'Lower (−z)', action: () => { pts[i].z = Math.max(-1, pts[i].z - 0.25); doc.pushHistory(); commit(pts); draw(); } },
       { label: 'Reset height', action: () => { pts[i].z = 0; doc.pushHistory(); commit(pts); draw(); } },
+      { sep: true },
+      { label: 'Insert waypoint before', action: () => insertBeside(i, -1) },
+      { label: 'Insert waypoint after', action: () => insertBeside(i, 1) },
       { sep: true },
       { label: 'Delete waypoint', action: () => { pts.splice(i, 1); doc.pushHistory(); commit(pts); sel = -1; draw(); } },
     ]);
   }
 
   function updateHint(): void {
+    const n = block ? points().length : 0;
+    const budget = `${n}/${MAX_PATH_POINTS} waypoints`;
     hint.textContent = recording
-      ? 'Record on — press and drag in the plan to draw a new path'
-      : 'Click to add a waypoint · drag to move · wheel over one to set height · double-click to delete';
+      ? `Record on — press and drag in the plan to draw a new path (any length; it is simplified to fit) · ${budget}`
+      : `Click on or near the curve to insert a waypoint into that leg · drag to move · wheel over one to set height · double-click to delete · ${budget}`;
   }
 
   function refresh(): void {

@@ -12,6 +12,18 @@ export const TITLE_H = 18;
 const GAP = 8;
 const MAX_ROW_W = 176;
 
+/**
+ * Height of the silkscreen strip below a widget whose spec declares a `mark`.
+ *
+ * It is added to the item, not carved out of it: shrinking the widget would
+ * make a knob that prints its symbol smaller than the identical knob beside it
+ * that does not, which reads as a mistake rather than as a label.
+ */
+export const MARK_H = 13;
+
+/** Does this face ref print a panel mark under its widget? */
+export const markOf = (spec: ParamSpec | undefined): string | undefined => spec?.mark;
+
 export const widgetSize: Record<WidgetKind, { w: number; h: number }> = {
   knob: { w: 48, h: 60 },
   fader: { w: 34, h: 100 },
@@ -85,14 +97,18 @@ function itemSize(block: Block, ref: string): { w: number; h: number } {
     const lines = (tx?.text ?? '').split('\n').length;
     return { w: Math.max(24, Math.ceil(longest * size * 0.58) + 8), h: Math.max(16, lines * size * 1.25 + 6) };
   }
+  // A widget that prints a panel mark is that much taller, so the strip is
+  // real space in the flow rather than something drawn over the neighbour below.
+  const withMark = (sz: { w: number; h: number }, spec: ParamSpec | undefined): { w: number; h: number } =>
+    spec?.mark ? { w: sz.w, h: sz.h + MARK_H } : sz;
   if (ref.startsWith('param:')) {
     // paramSpec (not def.params) so pinned vst plugin params size correctly.
     const spec = paramSpec(block, ref.slice(6));
-    return spec ? widgetSize[controlOf(block, ref, spec).kind] : { w: 60, h: 24 };
+    return spec ? withMark(widgetSize[controlOf(block, ref, spec).kind], spec) : { w: 60, h: 24 };
   }
   if (ref.startsWith('link:')) {
     const t = linkTarget(block, ref);
-    return t ? widgetSize[controlOf(block, ref, t.spec).kind] : { w: 48, h: 60 };
+    return t ? withMark(widgetSize[controlOf(block, ref, t.spec).kind], t.spec) : { w: 48, h: 60 };
   }
   if (ref.startsWith('expose:')) {
     const child = block.graph?.blocks.find((b) => b.id === ref.slice(7));

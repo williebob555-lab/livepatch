@@ -16,6 +16,7 @@ import { GraphExec } from './graph';
 import { IoManager } from './io';
 import { initHardwareMidi, midiDirectAvailable, onHardwareMidi, sendMidiOut } from './midi';
 import { dispatchVstUi, setVstAddonPath, setVstHostWindow, setVstRateProvider } from './vst';
+import { disablePowerThrottling } from './winqos';
 
 const assets = new AssetStore();
 const io = new IoManager();
@@ -45,6 +46,10 @@ try {
 } catch {
   /* not fatal */
 }
+// …and opt out of Windows power throttling (EcoQoS). Priority is not enough:
+// when the LivePatch window is backgrounded, Windows runs this process at
+// reduced execution speed regardless of priority class. See winqos.ts.
+disablePowerThrottling(process.pid, 'engine', (info) => send({ op: 'status', info }));
 
 let lastHwSig = '';
 let reconfTimer: NodeJS.Timeout | null = null;
@@ -110,6 +115,24 @@ function handle(msg: InMsg): void {
     case 'measure-latency':
       io.measureLatency({ device: msg.device, channel: msg.channel, runs: msg.runs });
       break;
+    case 'measure-speakers': {
+      // The sweep arrives as base64 float32 (see MeasureSpeakersMsg). Decoding
+      // here rather than in `io.ts` keeps the allocation on the message path,
+      // which is where every other one-off decode in this file lives.
+      const raw = Buffer.from(msg.sweep ?? '', 'base64');
+      const sweep = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2);
+      io.measureSpeakers({
+        device: msg.device,
+        channel: msg.channel,
+        asioOut: msg.asioOut,
+        outDevice: msg.outDevice,
+        speakers: msg.speakers ?? [],
+        sweep,
+        tail: msg.tail,
+        cancel: msg.cancel,
+      });
+      break;
+    }
     case 'vst-ui':
     case 'vst-ui-rect':
       dispatchVstUi(msg);
@@ -141,7 +164,13 @@ setInterval(() => {
   if (io.running && graph.watched.length) send({ op: 'visuals', nodes: graph.visualsPayload() });
 }, 66);
 setInterval(() => {
+  // A capture bridge that has stopped delivering is dead and will not recover
+  // on its own — restart it rather than starve behind it. Off the audio path.
+  io.checkBridges();
+  const bridges = io.bridgeStats();
   const j = io.takeJitter();
+  const m = io.takeOutMeter();
+  const sp = io.takeSplices();
   send({
     op: 'status',
     running: io.running,
@@ -150,11 +179,31 @@ setInterval(() => {
     frames: io.frames,
     latencyFrames: io.latencyFrames,
     inDepth: io.inputDepth(),
+    // Only present when something is actually starving — a field that is
+    // usually absent reads as a fault in a log, which is the point.
+    ...(io.starvedInputs().length ? { starved: io.starvedInputs() } : {}),
+    // Present whenever a bridge exists: its delivery rate and worst gap are
+    // what tell a rate deficit from a burstiness problem (see `bridgeStats`).
+    ...(bridges.length ? { bridges } : {}),
     xruns: io.xruns,
     load: Math.round(graph.loadAvg * 1000) / 1000,
     loadMax: graph.takeLoadMax(),
     jitterQ: j.jitterQ,
     late: j.late,
+    // What actually left the box. `late`/`xruns`/`jitterQ` only see pops the
+    // engine caused; these see a click that is in the audio itself, which is
+    // the case a log full of healthy IO numbers and an unhappy user describes.
+    peak: m.peak,
+    dMax: m.dMax,
+    // Absent unless they happened — a field that is usually missing reads as a
+    // fault in a log, which is the point (same rule as `starved`).
+    ...(m.clip ? { clip: m.clip } : {}),
+    ...(m.nonFinite ? { nonFinite: m.nonFinite } : {}),
+    // Deliberate splices — audible, and invisible in every other counter (the
+    // pump is on time and nothing ran dry while they happen). Absent when zero.
+    ...(sp.ringTrim ? { ringTrim: sp.ringTrim, trimmed: sp.trimmed } : {}),
+    ...(sp.ringOver ? { ringOver: sp.ringOver } : {}),
+    ...(sp.asioSkip ? { asioSkip: sp.asioSkip } : {}),
     midiDirect: midiDirectAvailable(),
     midiMs: io.midiToDacMs(),
   });

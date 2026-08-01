@@ -76,6 +76,45 @@ class CreateWorker : public Napi::AsyncWorker {
   std::unique_ptr<lp::VstInstance> inst_;
 };
 
+/**
+ * Runs one already-posted UI-thread job and delivers its result to JS.
+ *
+ * The split matters and is not the obvious one: the *post* happens on the JS
+ * thread at call time (cheap — a mutex and a deque push) so UI-thread work
+ * stays in JS call order and a destroy can never overtake a read that was
+ * issued before it. Only the **wait** runs here, on a uv worker, so the JS
+ * thread — which is the audio pump — never blocks on a plugin.
+ *
+ * Everything marshalled this way touches the plugin's edit controller, which
+ * belongs to the UI thread once an editor exists (threading rule 1, docs/13).
+ * These are also the slow calls: parameter enumeration is one COM round trip
+ * per parameter (hundreds, for an Ozone or a Raum) and `getState` serializes
+ * the plugin's entire state. Run inline on the JS thread they stall the pump
+ * outright — that was "the audio freezes when I touch a plugin parameter".
+ */
+class UiCallWorker : public Napi::AsyncWorker {
+ public:
+  UiCallWorker(Napi::Function& cb, HANDLE done, uint32_t timeoutMs = 10000)
+      : Napi::AsyncWorker(cb), done_(done), timeout_(timeoutMs) {}
+
+  void Execute() override {
+    if (!lp::UiThread::waitCall(done_, timeout_)) SetError("plugin UI thread timed out");
+    done_ = nullptr; // waitCall closed it
+  }
+
+  /** Build the JS result from whatever the job filled in. */
+  virtual Napi::Value Result(Napi::Env env) = 0;
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    Callback().Call({env.Null(), Result(env)});
+  }
+
+ private:
+  HANDLE done_;
+  uint32_t timeout_;
+};
+
 void ThrowJs(Napi::Env env, const std::string& msg) {
   Napi::Error::New(env, msg).ThrowAsJavaScriptException();
 }
@@ -196,6 +235,183 @@ Napi::Value Params(const Napi::CallbackInfo& info) {
     arr.Set(static_cast<uint32_t>(i), o);
   }
   return arr;
+}
+
+/**
+ * paramsAsync(handle, cb(err, [{…, value}])) — enumeration + current values,
+ * off the JS thread.
+ *
+ * Also returns each parameter's **value** alongside its descriptor. The JS side
+ * used to call `params()` and then `getParam()` once per parameter; on a plugin
+ * with a few hundred parameters that is a few hundred separate COM calls, each
+ * one racing an open editor. One trip, one thread, one consistent snapshot.
+ */
+class ParamsWorker : public UiCallWorker {
+ public:
+  ParamsWorker(Napi::Function& cb, HANDLE done,
+               std::shared_ptr<std::vector<lp::ParamDesc>> descs,
+               std::shared_ptr<std::vector<double>> values)
+      : UiCallWorker(cb, done), descs_(std::move(descs)), values_(std::move(values)) {}
+
+  Napi::Value Result(Napi::Env env) override {
+    Napi::Array arr = Napi::Array::New(env, descs_->size());
+    for (size_t i = 0; i < descs_->size(); i++) {
+      const auto& p = (*descs_)[i];
+      Napi::Object o = Napi::Object::New(env);
+      o.Set("id", p.id);
+      o.Set("title", p.title);
+      o.Set("units", p.units);
+      o.Set("stepCount", p.stepCount);
+      o.Set("def", p.defaultNormalized);
+      o.Set("value", i < values_->size() ? (*values_)[i] : p.defaultNormalized);
+      o.Set("canAutomate", p.canAutomate);
+      o.Set("readOnly", p.isReadOnly);
+      o.Set("bypass", p.isBypass);
+      o.Set("hidden", p.isHidden);
+      arr.Set(static_cast<uint32_t>(i), o);
+    }
+    return arr;
+  }
+
+ private:
+  std::shared_ptr<std::vector<lp::ParamDesc>> descs_;
+  std::shared_ptr<std::vector<double>> values_;
+};
+
+Napi::Value ParamsAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* v = Inst(info);
+  Napi::Function cb = info[1].As<Napi::Function>();
+  if (!v) {
+    cb.Call({Napi::Error::New(env, "bad handle").Value(), env.Null()});
+    return env.Undefined();
+  }
+  auto descs = std::make_shared<std::vector<lp::ParamDesc>>();
+  auto values = std::make_shared<std::vector<double>>();
+  HANDLE done = lp::UiThread::instance().postCall([v, descs, values]() {
+    *descs = v->params();
+    values->reserve(descs->size());
+    for (const auto& p : *descs) values->push_back(v->getParamNormalized(p.id));
+  });
+  (new ParamsWorker(cb, done, descs, values))->Queue();
+  return env.Undefined();
+}
+
+// getStateAsync(handle, cb(err, Buffer|null)) — full state chunk, off the JS
+// thread. Plugins serialize a lot here (Ozone's chunk is tens of KB).
+class StateWorker : public UiCallWorker {
+ public:
+  StateWorker(Napi::Function& cb, HANDLE done,
+              std::shared_ptr<std::vector<uint8_t>> buf, std::shared_ptr<bool> ok)
+      : UiCallWorker(cb, done), buf_(std::move(buf)), ok_(std::move(ok)) {}
+
+  Napi::Value Result(Napi::Env env) override {
+    if (!*ok_) return env.Null();
+    return Napi::Buffer<uint8_t>::Copy(env, buf_->data(), buf_->size());
+  }
+
+ private:
+  std::shared_ptr<std::vector<uint8_t>> buf_;
+  std::shared_ptr<bool> ok_;
+};
+
+Napi::Value GetStateAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* v = Inst(info);
+  Napi::Function cb = info[1].As<Napi::Function>();
+  if (!v) {
+    cb.Call({Napi::Error::New(env, "bad handle").Value(), env.Null()});
+    return env.Undefined();
+  }
+  auto buf = std::make_shared<std::vector<uint8_t>>();
+  auto ok = std::make_shared<bool>(false);
+  HANDLE done = lp::UiThread::instance().postCall([v, buf, ok]() {
+    bool got = false;
+    *buf = v->getState(got);
+    *ok = got;
+  });
+  (new StateWorker(cb, done, buf, ok))->Queue();
+  return env.Undefined();
+}
+
+// setStateAsync(handle, buf, cb(err, ok)) — applying a chunk re-initializes the
+// plugin's whole parameter set, which is the same class of cost as reading it.
+class SetStateWorker : public UiCallWorker {
+ public:
+  SetStateWorker(Napi::Function& cb, HANDLE done, std::shared_ptr<bool> ok)
+      : UiCallWorker(cb, done), ok_(std::move(ok)) {}
+  Napi::Value Result(Napi::Env env) override { return Napi::Boolean::New(env, *ok_); }
+
+ private:
+  std::shared_ptr<bool> ok_;
+};
+
+Napi::Value SetStateAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* v = Inst(info);
+  Napi::Function cb = info[2].As<Napi::Function>();
+  if (!v) {
+    cb.Call({Napi::Error::New(env, "bad handle").Value(), env.Undefined()});
+    return env.Undefined();
+  }
+  // Copy the chunk: the JS Buffer may be collected before the UI thread runs.
+  auto src = info[1].As<Napi::Buffer<uint8_t>>();
+  auto data = std::make_shared<std::vector<uint8_t>>(src.Data(), src.Data() + src.Length());
+  auto ok = std::make_shared<bool>(false);
+  HANDLE done = lp::UiThread::instance().postCall(
+      [v, data, ok]() { *ok = v->setState(data->data(), data->size()); });
+  (new SetStateWorker(cb, done, ok))->Queue();
+  return env.Undefined();
+}
+
+/**
+ * resetupAsync(handle, sampleRate, maxBlock, chans, cb(err, latency)) —
+ * re-negotiate the processing setup off the JS thread.
+ *
+ * `resetup` deactivates the component, re-runs `setupProcessing`, renegotiates
+ * bus arrangements and reallocates the process buffers. The kernel called it
+ * from `process()` — inside the audio callback — whenever the device rate or
+ * the block's Channels param changed, which allocates on the audio path
+ * (golden rule 1) and stalls it for however long the plugin takes to cycle.
+ * The caller passes audio through while this is in flight, so a slow plugin
+ * costs a bypassed stretch instead of a dropout.
+ */
+class ResetupWorker : public UiCallWorker {
+ public:
+  ResetupWorker(Napi::Function& cb, HANDLE done, std::shared_ptr<int32_t> latency,
+                std::shared_ptr<std::string> err)
+      : UiCallWorker(cb, done), latency_(std::move(latency)), err_(std::move(err)) {}
+
+  Napi::Value Result(Napi::Env env) override {
+    if (!err_->empty()) return env.Null(); // refused — caller keeps the old setup
+    return Napi::Number::New(env, *latency_);
+  }
+
+ private:
+  std::shared_ptr<int32_t> latency_;
+  std::shared_ptr<std::string> err_;
+};
+
+Napi::Value ResetupAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* v = Inst(info);
+  Napi::Function cb = info[4].As<Napi::Function>();
+  if (!v) {
+    cb.Call({Napi::Error::New(env, "bad handle").Value(), env.Null()});
+    return env.Undefined();
+  }
+  const double sr = info[1].As<Napi::Number>().DoubleValue();
+  const int32_t maxBlock = info[2].As<Napi::Number>().Int32Value();
+  const int32_t chans = info[3].As<Napi::Number>().Int32Value();
+  auto latency = std::make_shared<int32_t>(0);
+  auto err = std::make_shared<std::string>();
+  HANDLE done = lp::UiThread::instance().postCall([v, sr, maxBlock, chans, latency, err]() {
+    if (chans > 0) v->requestChannels(chans);
+    if (!v->resetup(sr, maxBlock, *err) && err->empty()) *err = "resetup failed";
+    *latency = static_cast<int32_t>(v->latencySamples());
+  });
+  (new ResetupWorker(cb, done, latency, err))->Queue();
+  return env.Undefined();
 }
 
 Napi::Value SetParam(const Napi::CallbackInfo& info) {
@@ -474,6 +690,13 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("setup", Napi::Function::New(env, Setup));
   exports.Set("resetup", Napi::Function::New(env, Resetup));
   exports.Set("params", Napi::Function::New(env, Params));
+  // Off-JS-thread variants — see UiCallWorker. The kernel uses these; the
+  // synchronous forms above stay for the scanner and the smoke tests, which
+  // run in throwaway processes with no audio to stall.
+  exports.Set("paramsAsync", Napi::Function::New(env, ParamsAsync));
+  exports.Set("resetupAsync", Napi::Function::New(env, ResetupAsync));
+  exports.Set("getStateAsync", Napi::Function::New(env, GetStateAsync));
+  exports.Set("setStateAsync", Napi::Function::New(env, SetStateAsync));
   exports.Set("setParam", Napi::Function::New(env, SetParam));
   exports.Set("getParam", Napi::Function::New(env, GetParam));
   exports.Set("paramDisplay", Napi::Function::New(env, ParamDisplay));

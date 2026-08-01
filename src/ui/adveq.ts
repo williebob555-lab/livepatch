@@ -17,6 +17,9 @@ import { registerAdvancedView, AdvancedViewHandle } from './advanced';
 import { ResolvedRef, hasCvPort } from './facepaint';
 import { showContextMenu } from './menus';
 import { fitCanvasBacking } from './uiscale';
+// `capture` is aliased: this file already has a local `capture()` that
+// snapshots the EQ's params for the A/B slots.
+import { TwoPointerGesture, capture as capturePointer, isCoarse, release, wheelDelta } from './input';
 import {
   EQ_MAX_BANDS, EQ_TYPES, EQ_TYPE_LABELS, EQ_MODES, EQ_FMIN, EQ_FMAX, EQ_GMAX,
   EqChannel, eqBand, eqBandHandles, eqGlobals, eqEnabledBands, eqBusesDiffer,
@@ -407,9 +410,24 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
   };
 
   let dragBand = 0;
+  /**
+   * Two fingers set Q, matching the wheel exactly (a vertical drag is the same
+   * gesture a wheel makes). Without this a touch user could drag a band's
+   * frequency and gain on the plot but had no way to reach Q at all except the
+   * inspector — the plot's most-used control was mouse-only.
+   */
+  const gesture = new TwoPointerGesture();
+
   canvas.addEventListener('pointerdown', (e) => {
     if (!block) return;
     const p = localPt(e);
+    if (isCoarse(e)) {
+      gesture.add(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (gesture.count >= 2) {
+        dragBand = 0; // the second finger supersedes a freq/gain drag
+        return;
+      }
+    }
     const band = nearestBand(p);
     if (e.button === 2) {
       if (band) { sel = band; rebuildInspector(); bandMenu(e.clientX, e.clientY, band); }
@@ -420,7 +438,7 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
       sel = band;
       dragBand = band;
       doc.pushHistory();
-      canvas.setPointerCapture(e.pointerId);
+      capturePointer(canvas, e.pointerId);
       applyDrag(p);
       rebuildInspector();
     } else {
@@ -428,8 +446,26 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
       rebuildInspector();
     }
   });
-  canvas.addEventListener('pointermove', (e) => { if (dragBand) applyDrag(localPt(e)); });
-  const endDrag = (e: PointerEvent): void => { if (dragBand) { dragBand = 0; try { canvas.releasePointerCapture(e.pointerId); } catch { /* already released */ } } };
+  canvas.addEventListener('pointermove', (e) => {
+    if (gesture.update(e.pointerId, { x: e.clientX, y: e.clientY }) && gesture.active) {
+      const f = gesture.frame();
+      const band = sel || nearestBand(localPt(e));
+      if (f && band && f.dy) nudgeQ(band, f.dy * 3);
+      return;
+    }
+    if (dragBand) applyDrag(localPt(e));
+  });
+  const endDrag = (e: PointerEvent): void => {
+    if (gesture.count) {
+      const wasActive = gesture.active;
+      gesture.remove(e.pointerId);
+      if (wasActive || gesture.count >= 1) return;
+    }
+    if (dragBand) {
+      dragBand = 0;
+      release(canvas, e.pointerId);
+    }
+  };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
   canvas.addEventListener('dblclick', (e) => {
@@ -438,14 +474,25 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
     if (band) { doc.pushHistory(); write('e' + band, false); if (sel === band) sel = 0; rebuildInspector(); }
     else addBandAt(p);
   });
+  /**
+   * Wheel over a band sets its Q. This is a *parameter* wheel, not navigation,
+   * so it takes `wheelDelta` (normalised px) rather than `wheelIntent`: a
+   * trackpad emits a stream of small deltas where a mouse emits one big one,
+   * and treating each event as a fixed notch made the same flick move Q an
+   * order of magnitude further on a trackpad. Scaling by the delta itself puts
+   * both devices in the same place. See docs/14-input.md, "value wheels".
+   */
+  const nudgeQ = (band: number, dy: number): void => {
+    const q = Number(P()['q' + band] ?? 1) * Math.pow(2, -dy / 400);
+    write('q' + band, Math.round(clampNum('q' + band, q) * 100) / 100);
+    if (sel !== band) { sel = band; rebuildInspector(); }
+  };
   canvas.addEventListener('wheel', (e) => {
     if (!block) return;
     const band = sel || nearestBand(localPt(e));
     if (!band) return;
     e.preventDefault();
-    const q = Number(P()['q' + band] ?? 1) * Math.pow(2, -e.deltaY / 400);
-    write('q' + band, Math.round(clampNum('q' + band, q) * 100) / 100);
-    if (sel !== band) { sel = band; rebuildInspector(); }
+    nudgeQ(band, wheelDelta(e).dy);
   }, { passive: false });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 

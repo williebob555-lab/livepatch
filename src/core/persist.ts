@@ -234,10 +234,15 @@ function tryGetDef(type: string): { inputs?: any[]; outputs?: any[] } | null {
  * dropping the wires that reached it.
  */
 const RETIRED_PORTS: Record<string, string[]> = {
-  // Both were "the take, as an asset" — a route nobody used, because the take
-  // is reached through the Library once "Save As…" has named it.
-  'tape-recorder': ['tape'],
+  // "The take, as an asset" — a route nobody used, because the take is reached
+  // through the Library once "Save As…" has named it.
   'midi-recorder': ['roll'],
+  // `tape-recorder: ['tape']` used to be listed here and is deliberately gone.
+  // The port came back on 2026-08-01 as something different: the **live take**,
+  // the capture buffer itself, readable while recording. `backfillDefPorts`
+  // adds it to any scene saved without it, so nothing needs migrating — a
+  // pre-2026-07-23 scene that still has the port keeps its wires too, which is
+  // right, because it now points at the same recorder's take.
 };
 
 function normalizeGraph(g: { blocks?: any[]; wires?: any[] }): void {

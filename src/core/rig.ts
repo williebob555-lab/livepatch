@@ -13,7 +13,7 @@
 // sound in the room disagree, which is close to impossible to debug from the
 // listening position.
 // ============================================================================
-import { Rig, Speaker } from './types';
+import { Rig, Speaker, SpeakerCal } from './types';
 
 /** Speakers that actually carry directional signal (subs have no direction and
  *  are fed by bass management, never by a panner). */
@@ -91,20 +91,142 @@ export function parseRig(json: unknown): Rig | null {
   try {
     const r = JSON.parse(json);
     if (!r || !Array.isArray(r.speakers) || !r.speakers.length) return null;
-    const speakers: Speaker[] = r.speakers.map((s: Partial<Speaker>, i: number) => ({
-      id: String(s?.id ?? 's' + (i + 1)),
-      name: String(s?.name ?? i + 1),
-      az: Number(s?.az) || 0,
-      el: Number(s?.el) || 0,
-      dist: Math.max(0.01, Number(s?.dist) || 2),
-      ...(s?.lfe ? { lfe: true as const } : {}),
-      ...(Number(s?.out) > 0 ? { out: Math.round(Number(s!.out)) } : {}),
-    }));
+    const speakers: Speaker[] = r.speakers.map((s: Partial<Speaker>, i: number) => {
+      const cal = parseCal(s?.cal);
+      return {
+        id: String(s?.id ?? 's' + (i + 1)),
+        name: String(s?.name ?? i + 1),
+        az: Number(s?.az) || 0,
+        el: Number(s?.el) || 0,
+        dist: Math.max(0.01, Number(s?.dist) || 2),
+        ...(s?.lfe ? { lfe: true as const } : {}),
+        ...(Number(s?.out) > 0 ? { out: Math.round(Number(s!.out)) } : {}),
+        ...(cal ? { cal } : {}),
+      };
+    });
     return { name: String(r.name ?? 'Rig'), speakers };
   } catch {
     return null;
   }
 }
+
+// -------------------------------------------------------- calibration --
+// The *validity* half of `SpeakerCal` lives here, next to the geometry it is
+// about; the measurement maths is in `core/calibrate.ts`. The engine has its
+// own copy of `parseCal` (`engine/src/rig.ts`) for the same reason it has its
+// own `speakerVec` — it cannot import renderer code. Change one, change both.
+
+/** Points a stored curve must have to be usable. Mirrors `CAL_N` in
+ *  `core/calibrate.ts`; kept as a literal here so `rig.ts` stays importable by
+ *  anything without dragging the FFT in. */
+const CAL_POINTS = 121;
+
+const numArray = (v: unknown): number[] | null => {
+  if (!Array.isArray(v) || v.length !== CAL_POINTS) return null;
+  const out: number[] = new Array(CAL_POINTS);
+  for (let i = 0; i < CAL_POINTS; i++) {
+    const n = Number(v[i]);
+    // A single non-finite entry poisons the whole filter derived from it, and
+    // the engine would build a NaN FIR out of it — reject the curve instead
+    // (docs/10 rule 4: guard on the control path where one is possible).
+    if (!Number.isFinite(n)) return null;
+    out[i] = n;
+  }
+  return out;
+};
+
+/** Validate a `cal` blob from a scene, a saved preset or the `__rig` param.
+ *  Anything malformed reads as "not calibrated", never as a broken filter. */
+export function parseCal(v: unknown): SpeakerCal | null {
+  if (!v || typeof v !== 'object') return null;
+  const c = v as Partial<SpeakerCal>;
+  const resp = numArray(c.resp);
+  const corr = numArray(c.corr);
+  if (!resp || !corr) return null;
+  const gain = Number(c.gain);
+  const delay = Number(c.delay);
+  const at = c.at;
+  if (!at || typeof at !== 'object') return null;
+  if (!Number.isFinite(gain) || gain <= 0 || gain > 4) return null;
+  if (!Number.isFinite(delay) || delay < 0 || delay > 1) return null;
+  return {
+    resp,
+    corr,
+    gain,
+    delay,
+    at: {
+      az: Number(at.az) || 0,
+      el: Number(at.el) || 0,
+      dist: Number(at.dist) || 0,
+      out: Math.max(1, Math.round(Number(at.out) || 1)),
+      lfe: !!at.lfe,
+    },
+    when: Number(c.when) || 0,
+    ...(c.mic ? { mic: String(c.mic) } : {}),
+  };
+}
+
+/**
+ * How far a speaker may move before its calibration stops describing it.
+ *
+ * Non-zero on purpose. A calibration is two minutes of sweeps, and a click
+ * that lands one pixel off in the plan view moves a speaker by a hundredth of
+ * a degree — throwing the measurement away for that would make the feature
+ * unusable in exactly the editor it lives in. These are the smallest changes
+ * that are *deliberate*: half a degree is under the angular resolution of the
+ * inspector's own step, and 2 cm is inside the error of measuring a room with
+ * a tape measure in the first place.
+ */
+export const CAL_TOL_DEG = 0.5;
+export const CAL_TOL_M = 0.02;
+
+/** The baseline a fresh calibration records — what it must still match. */
+export const calBaseline = (s: Speaker, i: number): SpeakerCal['at'] => ({
+  az: s.az,
+  el: s.el,
+  dist: s.dist,
+  out: outChannel(s, i),
+  lfe: !!s.lfe,
+});
+
+/**
+ * Has this speaker moved (or been repatched) since it was calibrated?
+ *
+ * `i` is its index in the rig, because the hardware channel a speaker without
+ * an explicit `out` lands on is its index + 1 — so deleting an earlier speaker
+ * silently re-points this one at a different amplifier channel, and the old
+ * measurement is then a measurement of something else. That case is exactly
+ * why this takes an index rather than just a speaker.
+ */
+export function calStale(s: Speaker, i: number): boolean {
+  const c = s.cal;
+  if (!c) return false;
+  const at = c.at;
+  return (
+    Math.abs(s.az - at.az) > CAL_TOL_DEG ||
+    Math.abs(s.el - at.el) > CAL_TOL_DEG ||
+    Math.abs(s.dist - at.dist) > CAL_TOL_M ||
+    outChannel(s, i) !== at.out ||
+    !!s.lfe !== at.lfe
+  );
+}
+
+/** The rig with every stale calibration dropped. Returns the *same* rig object
+ *  when nothing changed, so callers can use it as a cheap "did anything go?"
+ *  test and avoid minting a new object on every pointer-move of a drag. */
+export function dropStaleCals(rig: Rig): Rig {
+  let hit = false;
+  const speakers = rig.speakers.map((s, i) => {
+    if (!calStale(s, i)) return s;
+    hit = true;
+    const { cal: _drop, ...rest } = s;
+    return rest;
+  });
+  return hit ? { ...rig, speakers } : rig;
+}
+
+/** How many speakers in this rig carry a calibration. */
+export const calibratedCount = (rig: Rig): number => rig.speakers.reduce((n, s) => n + (s.cal ? 1 : 0), 0);
 
 // ---------------------------------------------------------------- presets --
 // Angles follow ITU-R BS.775 / Dolby's published layouts where they define one.
@@ -278,6 +400,95 @@ export function saveRigPreset(name: string, rig: Rig): SavedRig {
 export function deleteRigPreset(name: string): void {
   saved = savedRigs().filter((e) => e.name !== name);
   writeSaved();
+}
+
+// -------------------------------------------------- the installation's rig --
+//
+// **The rig belongs to the room, not to the patch.** A speaker layout describes
+// where the user's speakers physically are; opening a different scene does not
+// move them. It used to live only in `Scene.rig`, so loading a patch — your own
+// from yesterday, a factory preset, anything shared — silently repointed every
+// panner at somebody else's room, and the only way back was to rebuild the
+// layout by hand.
+//
+// So the *active* rig is app-level state (localStorage, next to saved rig
+// presets, Library pins and the UI scale) and `Scene.rig` becomes a record of
+// what the scene was authored against: still written, still exported, still
+// what a hand-built test scene compiles with — but overridden by this on load.
+// Keeping the field means scenes stay portable and nothing downstream of
+// `doc.scene.rig` had to change.
+//
+// The calibration rides along, which is the other half of the point: two
+// minutes of sweeps per speaker is not something to re-do per scene.
+
+const ACTIVE_KEY = 'livepatch.rig';
+const FOLLOW_KEY = 'livepatch.rig.follow';
+
+let active: Rig | null | undefined;
+let follow: boolean | undefined;
+
+/**
+ * Does the installation's rig override every scene's? On by default.
+ *
+ * This is a real switch rather than "delete the stored rig", because deleting
+ * it would re-arm on the very next speaker drag — `setActiveRig` runs on every
+ * edit — and an opt-out that undoes itself the first time you touch the editor
+ * is not an opt-out.
+ */
+export function rigFollowsRoom(): boolean {
+  if (follow === undefined) {
+    try {
+      follow = localStorage.getItem(FOLLOW_KEY) !== '0';
+    } catch {
+      follow = true;
+    }
+  }
+  return follow;
+}
+
+export function setRigFollowsRoom(on: boolean): void {
+  follow = on;
+  try {
+    if (on) localStorage.removeItem(FOLLOW_KEY);
+    else localStorage.setItem(FOLLOW_KEY, '0');
+  } catch {
+    /* storage disabled — the choice still applies for this session */
+  }
+}
+
+/**
+ * The rig this installation is set up for, or `null` when there is none to
+ * apply — a fresh install (the scene's own layout stands, so a factory preset
+ * arrives configured as it was designed), or the override switched off.
+ */
+export function activeRig(): Rig | null {
+  if (!rigFollowsRoom()) return null;
+  if (active !== undefined) return active;
+  try {
+    active = parseRig(localStorage.getItem(ACTIVE_KEY));
+  } catch {
+    active = null;
+  }
+  return active;
+}
+
+/**
+ * Record the rig as this installation's. Called from `GraphDoc.setRig` — every
+ * route into the rig funnels through there (drag, inspector, preset, ±speaker,
+ * undo), so there is no path that edits the layout without it sticking.
+ *
+ * Deep-copied on the way in: the scene keeps editing its object afterwards, and
+ * an "installation rig" that tracked those edits by reference would write
+ * half-finished drag states.
+ */
+export function setActiveRig(rig: Rig): void {
+  if (!rigFollowsRoom()) return;
+  active = JSON.parse(JSON.stringify(rig)) as Rig;
+  try {
+    localStorage.setItem(ACTIVE_KEY, JSON.stringify(active));
+  } catch {
+    /* storage disabled — the rig still applies for this session */
+  }
 }
 
 /** Fresh speaker id that doesn't collide with the rig's existing ones. */

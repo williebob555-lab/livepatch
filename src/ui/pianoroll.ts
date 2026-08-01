@@ -26,6 +26,7 @@ import {
   setRollData,
 } from '../core/rolls';
 import { MenuItem, showContextMenu } from './menus';
+import { COARSE_SLOP, WheelIntent } from './input';
 
 type Vec = { x: number; y: number };
 
@@ -39,6 +40,9 @@ const HANDLE = 5;
 const BAR_W = 4;
 const BAR_HEAD = 9;
 const BAR_TOL = 8;
+/** How far a play bar reaches *into* the region it bounds. Small on purpose —
+ *  see `barAt`; the note right in front of the end bar has to stay clickable. */
+const BAR_INNER_TOL = 2;
 /**
  * How much every grab tolerance grows under a finger.
  *
@@ -49,7 +53,7 @@ const BAR_TOL = 8;
  * is multiplied by this when the gesture came from touch or pen, and nothing
  * changes for mouse input.
  */
-const TOUCH_SLOP = 2.6;
+const TOUCH_SLOP = COARSE_SLOP;
 /**
  * Shortest note the editor will make, when the grid is off. With a grid on,
  * one grid division is the floor. Nothing may produce a note below this: a
@@ -237,14 +241,34 @@ export class PianoRoll {
     return this.bx(Math.max(0, Math.min(1, frac)) * (t?.endBeats ?? 1), w, h);
   }
 
-  /** The play bar near a point, if the transport is showing one. */
+  /**
+   * The play bar near a point, if the transport is showing one.
+   *
+   * **The grab zone is asymmetric, deliberately.** It used to be ±`BAR_TOL`
+   * around each bar, which handed the end bar eight pixels of the region's
+   * *inside* — and the inside of the end bar is exactly where the last notes
+   * are. Drawing a note up to the end of the roll, or dragging its right edge
+   * out to meet the bar, meant fighting the bar for every click, in the one
+   * place you are most likely to be working.
+   *
+   * So a bar keeps its full reach on the **outside**, where there is nothing
+   * else to click, and only `BAR_INNER_TOL` on the inside. The bar is no harder
+   * to grab — you approach it from the empty side — and the notes in front of
+   * it are reachable again.
+   */
   barAt(p: Vec, w: number, h: number): 'start' | 'end' | null {
     const t = this.transport;
     if (!t || p.x < KEYS_W) return null;
-    const ds = Math.abs(this.regX(t.regStart, w, h) - p.x);
-    const de = Math.abs(this.regX(t.regEnd, w, h) - p.x);
-    if (Math.min(ds, de) > this.slop(BAR_TOL)) return null;
-    return ds <= de ? 'start' : 'end';
+    const out = this.slop(BAR_TOL);
+    const inner = this.slop(BAR_INNER_TOL);
+    // Signed: the start bar's outside is to the left, the end bar's to the right.
+    const ds = p.x - this.regX(t.regStart, w, h);
+    const de = p.x - this.regX(t.regEnd, w, h);
+    const hitS = ds <= 0 ? -ds <= out : ds <= inner;
+    const hitE = de >= 0 ? de <= out : -de <= inner;
+    if (!hitS && !hitE) return null;
+    if (hitS && hitE) return Math.abs(ds) <= Math.abs(de) ? 'start' : 'end';
+    return hitS ? 'start' : 'end';
   }
 
   /** True when a point grabs the playhead — on the head itself, or anywhere in
@@ -531,38 +555,52 @@ export class PianoRoll {
   }
 
   /**
-   * Scroll wheel. Plain = zoom time at the cursor (zoom-first, like the
-   * waveform tab); Ctrl = zoom pitch at the cursor; Shift = scroll time;
-   * Alt = scroll pitch. Trackpad two-finger scroll arrives here too, so
-   * Shift/Alt give it a way to pan.
+   * Apply a classified wheel intent (`src/ui/input.ts`).
+   *
+   * The roll is the app's only genuinely 2D editor, so it takes the `'2d'`
+   * branch of the standard: **plain scroll pans both axes**, Ctrl scales time,
+   * Shift scales pitch. It used to be zoom-first on a bare wheel and ignored
+   * `deltaX` entirely, which meant a trackpad two-finger pan zoomed the time
+   * axis and pitch could not be scrolled at all.
+   *
+   * Zoom anchors under the pointer on both axes so the note you are looking at
+   * stays where it is — without that, scaling pitch walks the view off the
+   * notes you were editing.
    */
-  wheel(deltaY: number, p: Vec, w: number, h: number, e: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean }): void {
-    const factor = deltaY > 0 ? 1.2 : 1 / 1.2;
-    if (e.shiftKey) {
-      this.view.t0 = Math.max(0, this.view.t0 + (deltaY / 300) * this.view.beats);
+  applyWheel(it: WheelIntent, p: Vec, w: number, h: number): void {
+    const r = this.gridRect(w, h);
+    if (it.kind === 'pan') {
+      this.view.t0 = Math.max(0, this.view.t0 + (it.dx / Math.max(1, r.w)) * this.view.beats);
+      // **A scroll moves the VIEWPORT, a drag moves the CONTENT** — the two have
+      // opposite signs and this axis had the drag's. Scrolling down moves the
+      // viewport down the page, and down the page is *lower* pitch (`ny` puts
+      // note `lo` at the bottom), so `lo` decreases. It read as "the octaves are
+      // backwards": scroll down, get higher notes. The x axis above is already
+      // viewport-relative (scroll right → later beats), and the grab-drag in
+      // `applyDrag` keeps the opposite sign on purpose, because there the note
+      // under the finger has to stay under the finger.
+      this.view.lo = Math.max(
+        0,
+        Math.min(127 - this.view.rows, Math.round(this.view.lo - it.dy / this.rowH(h))),
+      );
       return;
     }
-    if (e.altKey) {
-      this.view.lo = Math.max(0, Math.min(127 - this.view.rows, this.view.lo + Math.round(deltaY / 60)));
-      return;
+    if (it.axis === 'x' || it.axis === 'both') {
+      // Zoom time, keeping the beat under the cursor fixed.
+      const beat = this.xb(p.x, w, h);
+      const span = Math.max(0.5, Math.min(256, this.view.beats / it.factor));
+      const frac = (p.x - r.x) / Math.max(1, r.w);
+      this.view.beats = span;
+      this.view.t0 = Math.max(0, beat - frac * span);
     }
-    if (e.ctrlKey) {
+    if (it.axis === 'y' || it.axis === 'both') {
       // Zoom pitch, keeping the note under the cursor fixed.
       const anchor = this.yn(p.y, w, h);
-      const rows = Math.max(8, Math.min(80, Math.round(this.view.rows * factor)));
-      const r = this.gridRect(w, h);
-      const frac = (r.y + r.h - p.y) / r.h;
+      const rows = Math.max(8, Math.min(80, Math.round(this.view.rows / it.factor)));
+      const frac = (r.y + r.h - p.y) / Math.max(1, r.h);
       this.view.rows = rows;
       this.view.lo = Math.max(0, Math.min(127 - rows, Math.round(anchor - frac * rows)));
-      return;
     }
-    // Zoom time, keeping the beat under the cursor fixed.
-    const beat = this.xb(p.x, w, h);
-    const span = Math.max(0.5, Math.min(256, this.view.beats * factor));
-    const r = this.gridRect(w, h);
-    const frac = (p.x - r.x) / r.w;
-    this.view.beats = span;
-    this.view.t0 = Math.max(0, beat - frac * span);
   }
 
   /** Abandon the current gesture without committing — used when a second

@@ -9,6 +9,7 @@
 // ============================================================================
 import { ShapePoint, Vec2 } from '../core/types';
 import { buildModal } from './menus';
+import { capture, grabSlop } from './input';
 
 const LS_KEY = 'livepatch.customshapes';
 
@@ -393,27 +394,25 @@ export function openShapeEditor(initial?: ShapePoint[]): Promise<ShapePoint[] | 
       x: Math.max(8, Math.min(CW - 8, p.x)),
       y: Math.max(8, Math.min(CH - 8, p.y)),
     });
-    const vertexAt = (s: Vec2): number => {
+    /** Vertex under a point. `tol` widens for a fingertip — an 8 px vertex is
+     *  a comfortable cursor target and an impossible touch one. */
+    const vertexAt = (s: Vec2, tol = 8): number => {
       for (let i = 0; i < pts.length; i++) {
-        if (dist(toScreen(pts[i]), s) <= 8) return i;
+        if (dist(toScreen(pts[i]), s) <= tol) return i;
       }
       return -1;
     };
 
     cv.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      try {
-        cv.setPointerCapture(e.pointerId);
-      } catch {
-        /* synthetic pointers have no capture */
-      }
+      capture(cv, e.pointerId);
       const s = ptAt(e);
       if (mode === 'draw') {
         stroke = [toNorm(clampToCanvas(s))];
         redraw();
         return;
       }
-      dragIdx = vertexAt(s);
+      dragIdx = vertexAt(s, grabSlop(8, e));
     });
     cv.addEventListener('pointermove', (e) => {
       const s = ptAt(e);
@@ -436,6 +435,14 @@ export function openShapeEditor(initial?: ShapePoint[]): Promise<ShapePoint[] | 
       } else {
         cv.style.cursor = vertexAt(s) >= 0 ? 'grab' : 'default';
       }
+    });
+    // A cancelled gesture (the browser or OS claiming the touch) must reset the
+    // same state pointerup does, or the next press starts mid-drag with a
+    // half-finished stroke still buffered.
+    cv.addEventListener('pointercancel', () => {
+      stroke = [];
+      dragIdx = -1;
+      redraw();
     });
     cv.addEventListener('pointerup', () => {
       if (mode === 'draw' && stroke.length > 4) {

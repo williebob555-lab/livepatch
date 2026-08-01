@@ -167,5 +167,84 @@ function makeIR(len, seed) {
   }
 }
 
+// 6. Correct at any quantum size, including quanta LONGER than the hop.
+//
+// The partition sum for p ≥ 1 is now built a few partitions at a time across
+// the hop period instead of all at once when a hop completes, so "is the sum
+// finished before the hop that needs it" depends on the quantum size — and a
+// quantum at least a hop long leaves nothing to spread over, which is the case
+// the catch-up fold inside `hop()` exists for. Both sides of that boundary.
+{
+  const ir = makeIR(1800, 31337); // ~7 partitions at the 48 kHz hop
+  const x = makeIR(3000, 4242);
+  const ref = directConv(x, ir);
+  for (const n of [64, 128, 300, 512, 1024]) {
+    const k = mk([ir], {});
+    const c = { sr: SR, n };
+    const outLen = ref.length + 2048;
+    const out = new Float32Array(outLen);
+    const buf = [new Float32Array(n), new Float32Array(n)];
+    let inPos = 0;
+    let outPos = 0;
+    while (outPos < outLen) {
+      for (let i = 0; i < n; i++, inPos++) {
+        const v = inPos < x.length ? x[inPos] : 0;
+        buf[0][i] = v;
+        buf[1][i] = v;
+      }
+      k.process({ in: buf }, c);
+      for (let i = 0; i < n && outPos < outLen; i++, outPos++) out[outPos] = k.out('out')[0][i];
+    }
+    const { err } = alignError(out, ref, 2048);
+    check(err < 1e-3, `n=${String(n).padEnd(4)} matches direct convolution (rms err ${err.toExponential(1)})`);
+  }
+}
+
+// 7. Cost shape: flat across quanta, and LINEAR in the sample rate.
+//
+// Both were wrong, both are silent — the block sounds perfect either way and
+// only the xrun counter knows. Measured, so they cannot regress unnoticed:
+//   • a fixed 256-sample hop made cost grow with the SQUARE of the rate (2× the
+//     rate = 2× the partitions AND 2× the hops/s), the whole of "it pops more
+//     at higher sample rates";
+//   • accumulating every partition in the hop quantum made the peak H/n times
+//     the average, so hop quanta overran a budget the engine was 8 % of.
+function costLoad(sr, n, irSec, quanta) {
+  const irLen = Math.floor(irSec * sr);
+  const k = kernelFactory('conv')(
+    { asset: 'ir', mix: 1, gain: 1, normalize: false },
+    { assets: { wait: (_id, cb) => cb({ sampleRate: sr, channels: [makeIR(irLen, 9)] }) } },
+  );
+  const c = { sr, n };
+  const buf = [new Float32Array(n), new Float32Array(n)];
+  for (let i = 0; i < n; i++) buf[0][i] = buf[1][i] = Math.sin(i * 0.05) * 0.3;
+  const INS = { in: buf };
+  for (let q = 0; q < 400; q++) k.process(INS, c); // warm / JIT
+  const t = new Float64Array(quanta);
+  for (let q = 0; q < quanta; q++) {
+    const t0 = process.hrtime.bigint();
+    k.process(INS, c);
+    t[q] = Number(process.hrtime.bigint() - t0) / 1e6;
+  }
+  const sorted = Float64Array.from(t).sort();
+  let sum = 0;
+  for (const v of t) sum += v;
+  const budget = (n / sr) * 1000;
+  return { avg: sum / quanta / budget, p99: sorted[Math.floor(quanta * 0.99)] / budget };
+}
+
+{
+  // A hop is 4 quanta at 96 kHz / 128, so the old shape put ~4× the average
+  // into one quantum in every four. Under 2.5× means the sum really is spread.
+  const c = costLoad(96000, 128, 1, 4000);
+  const peak = c.p99 / c.avg;
+  check(peak < 2.5, `96k/128, 1 s IR: p99 is ${peak.toFixed(2)}× the average (avg load ${c.avg.toFixed(3)})`);
+
+  // Same IR *duration* at both rates. Quadratic scaling measured ~4.0×.
+  const lo = costLoad(48000, 128, 1, 4000).avg;
+  const hi = costLoad(96000, 128, 1, 4000).avg;
+  check(hi / lo < 2.6, `1 s IR: load 48k→96k scales ${(hi / lo).toFixed(2)}× (quadratic was ~4×)`);
+}
+
 console.log(ok ? '\nAll convolution checks passed.' : '\nFAILURES above.');
 process.exit(ok ? 0 : 1);

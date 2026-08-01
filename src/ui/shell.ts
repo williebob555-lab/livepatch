@@ -11,6 +11,7 @@ import {
   loadSceneByName,
   saveSceneAs,
 } from '../core/persist';
+import { buildFactoryScene } from '../core/factory';
 import { syncRolls } from '../core/rolls';
 import { runtime } from '../engine/runtime';
 import type { LatencyResult } from '../engine/native';
@@ -20,6 +21,7 @@ import { Editor } from './editor';
 import { manageImages } from './imagepicker';
 import { MenuItem, buildModal, confirmModal, promptModal, showContextMenu } from './menus';
 import { checkForUpdatesFlow, checkForUpdatesQuietly } from './updates';
+import { setEqDisplayRate } from './widgets';
 
 let ed: Editor;
 let modeBtn: HTMLButtonElement;
@@ -76,6 +78,24 @@ export async function doLoad(name?: string): Promise<void> {
     afterSceneLoad();
     ed.exitTo(0);
   }
+}
+
+/**
+ * Open a built-in preset (Scenes panel → Factory presets).
+ *
+ * It loads with `savedAs = null` and `dirty = true`, exactly like an import:
+ * the preset is a starting point, so Save asks for a name and writes a copy.
+ * There is no path by which a factory scene can be edited in place.
+ */
+export async function doLoadPreset(key: string): Promise<void> {
+  if (doc.dirty && !(await confirmModal('Open preset', 'Discard unsaved changes?', 'Discard'))) return;
+  const scene = buildFactoryScene(key);
+  if (!scene) return;
+  doc.loadScene(scene, null, true);
+  afterSceneLoad();
+  doc.dirty = true;
+  doc.touch('meta');
+  ed.exitTo(0);
 }
 
 export async function doImport(): Promise<void> {
@@ -280,13 +300,19 @@ function optionsMenu(): void {
 /** Buffer size / sample rate for the native engine (shared by Engine ▸ and
  *  Options ▸, because it is the same setting either way). */
 async function nativeSettingsFlow(): Promise<void> {
-  const { loadNativeSettings, saveNativeSettings } = await import('../engine/native');
+  const { loadNativeSettings, saveNativeSettings, MAX_ENGINE_FRAMES } = await import('../engine/native');
   const s = loadNativeSettings();
-  const fr = await promptModal('Hardware buffer size in frames (0 = driver default; try 128–512)', String(s.frames));
+  const fr = await promptModal(
+    `Hardware buffer size in frames (0 = driver default; try 128–512, max ${MAX_ENGINE_FRAMES})`,
+    String(s.frames),
+  );
   if (fr == null) return;
-  const sr = await promptModal('Sample rate (0 = device preferred)', String(s.sampleRate));
+  const sr = await promptModal('Sample rate — 44100 / 48000 / 88200 / 96000 / 176400 / 192000 (0 = device preferred)', String(s.sampleRate));
   if (sr == null) return;
-  const frames = Math.max(0, parseInt(fr, 10) || 0);
+  // Clamped here as well as in the engine: a buffer past the engine's quantum
+  // limit is not a "large buffer", it is a graph reading past its own arrays.
+  // See `requestedFrames` in engine/src/io.ts.
+  const frames = Math.min(MAX_ENGINE_FRAMES, Math.max(0, parseInt(fr, 10) || 0));
   const sampleRate = Math.max(0, parseInt(sr, 10) || 0);
   saveNativeSettings({ frames, sampleRate });
   // Applies live when the native engine is running.
@@ -492,6 +518,13 @@ export function initShell(editor: Editor): void {
 
 // ---------- status bar ----------
 export function updateStatus(): void {
+  // Keep the EQ drawing model on whatever rate is actually running. This is the
+  // one function every engine/status change already funnels through, and the
+  // curves are repainted by the app's rAF loop, so nothing else has to know.
+  // See `setEqDisplayRate` — at 96 kHz a curve drawn at 48 kHz is simply wrong.
+  setEqDisplayRate(
+    runtime.engine === runtime.native ? runtime.native.status.sampleRate : runtime.webaudio.ctx?.sampleRate,
+  );
   const el = document.getElementById('statusbar')!;
   const state = doc.dirty ? '<span class="dirty">unsaved</span>' : '<span class="saved">saved</span>';
   const engine =

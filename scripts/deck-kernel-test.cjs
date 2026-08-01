@@ -206,4 +206,140 @@ const sampler = (params) =>
   check(lastLoud >= 4 && lastLoud <= 5, 'a slice plays at its own pitch (no transposition)');
 }
 
+// ---------------------------------------------------------------------------
+// Slice mode runs the ADSR. It used to ignore note-off entirely and then cut
+// the material off at the slice boundary with the envelope still open — the
+// R knob did nothing you could hear, and every slice ended on a step.
+// ---------------------------------------------------------------------------
+{
+  // Gate (the default): note-off releases the slice, exactly like Classic.
+  const k = sampler({ mode: 'slice', slices: JSON.stringify([1 / 3, 2 / 3]), release: 0.01 });
+  k.midiIn({ type: 'on', note: 61, velocity: 1 }, 0);
+  k.process({}, ctx);
+  k.midiIn({ type: 'off', note: 61, velocity: 0 }, 0);
+  check(rms(k, 1) < 0.05, 'a Gate slice releases on note-off');
+}
+{
+  // One-Shot still ignores note-off — that is what makes it a hit.
+  const k = sampler({ mode: 'slice', slicehold: 'One-Shot', slices: JSON.stringify([1 / 3, 2 / 3]) });
+  k.midiIn({ type: 'on', note: 61, velocity: 1 }, 0);
+  k.process({}, ctx);
+  k.midiIn({ type: 'off', note: 61, velocity: 0 }, 0);
+  check(rms(k, 1) > 0.4, 'a One-Shot slice ignores note-off');
+}
+{
+  // The release finishes BY the slice end rather than starting at it: with a
+  // 300 ms release on a 1 s slice, the last sample before the boundary is
+  // near-silent instead of full-scale. Measured as the peak of the final 20 ms,
+  // which is where a hard cut would still be at full level.
+  const k = sampler({
+    mode: 'slice',
+    slicehold: 'One-Shot',
+    slices: JSON.stringify([1 / 3, 2 / 3]),
+    release: 0.3,
+  });
+  k.midiIn({ type: 'on', note: 61, velocity: 1 }, 0);
+  const out = k.out('out');
+  let tail = 0;
+  const total = Math.round(SR * 0.98); // the slice runs 1/3..2/3 = 1 s
+  for (let done = 0; done < total; done += N) {
+    k.process({}, ctx);
+    if (done > total - SR * 0.02) for (let i = 0; i < N; i++) tail = Math.max(tail, Math.abs(out[0][i]));
+  }
+  check(tail < 0.25, `the release completes by the slice end (tail peak ${tail.toFixed(3)})`);
+}
+{
+  // Pitched map: the note picks the slice with the NEAREST detected key and
+  // transposes it. Only the middle slice holds the tone, so declaring it as
+  // key 72 must make notes near 72 loud and leave the far ones on the silent
+  // slices — the opposite of the chromatic deal-out.
+  const pts = JSON.stringify([1 / 3, 2 / 3]);
+  const keys = JSON.stringify([48, 72, 96]);
+  const lvl = (note) => {
+    const k = sampler({ mode: 'slice', slicemap: 'Pitched', slices: pts, slicekeys: keys });
+    k.midiIn({ type: 'on', note, velocity: 1 }, 0);
+    return rms(k, 0.6);
+  };
+  check(lvl(72) > 0.4, 'Pitched: a note on a slice’s detected key plays that slice');
+  check(lvl(70) > 0.4, 'Pitched: a note between keys plays the nearest slice, transposed');
+  check(lvl(50) < 0.01, 'Pitched: a note nearer another slice plays that one instead');
+  // Every key sounds something — that is the point of the map. A key far above
+  // the top slice still reaches it rather than falling off the end of the kit.
+  const k = sampler({ mode: 'slice', slicemap: 'Pitched', slices: pts, slicekeys: keys });
+  k.midiIn({ type: 'on', note: 120, velocity: 1 }, 0);
+  check(k.out('out') !== null, 'Pitched: no key falls off the end of the kit');
+}
+{
+  // Transposition really happens: the same slice played an octave up reads
+  // twice as fast, so it lasts half as long.
+  const dur = (note) => {
+    const k = sampler({
+      mode: 'slice',
+      slicemap: 'Pitched',
+      slices: JSON.stringify([1 / 3, 2 / 3]),
+      slicekeys: JSON.stringify([48, 60, 96]),
+      slicehold: 'One-Shot',
+    });
+    k.midiIn({ type: 'on', note, velocity: 1 }, 0);
+    const w = windows(k, 1.4);
+    return w.reduce((acc, v, i) => (v > 0.1 ? i : acc), -1);
+  };
+  const at60 = dur(60);
+  const at72 = dur(72);
+  check(at72 >= 1 && at72 <= at60 / 2 + 1, `an octave up plays the slice twice as fast (${at60} → ${at72})`);
+}
+
+// ---------------------------------------------------------------------------
+// The loop seam crossfade. It is capped only by half the loop — it overlaps
+// the loop's own head, so it does not need run-up before the loop start. It
+// used to be clamped to that run-up, which is zero on the loop the Clip tab
+// hands you, so the control silently did nothing in the common case.
+// ---------------------------------------------------------------------------
+{
+  // The loop starts AT the region start, so there is no run-up before it —
+  // the case the old cap reduced to no crossfade at all. Its length is a
+  // deliberately non-integer number of cycles of the 800 Hz tone, so splicing
+  // it produces a real step to measure. (A whole number of cycles would loop
+  // seamlessly on its own and prove nothing.)
+  const loop = (fade) => {
+    const k = sampler({
+      mode: 'classic',
+      start: 1 / 3,
+      end: 2 / 3,
+      loop: true,
+      loopStart: 1 / 3,
+      // 0.3003125 s = 240.25 cycles: the loop ends at the crest of the sine
+      // and restarts at zero, which is the worst splice there is.
+      loopLen: 0.3003125 / DUR,
+      loopFade: fade,
+      attack: 0.001,
+      decay: 0.01,
+      sustain: 1,
+    });
+    k.midiIn({ type: 'on', note: 60, velocity: 1 }, 0);
+    const out = k.out('out');
+    // Largest sample-to-sample jump over several laps. A pure 800 Hz sine at
+    // 48 k moves at most 2π·800/48000 ≈ 0.105 per sample, so anything much
+    // above that is the seam.
+    let maxStep = 0;
+    let prev = 0;
+    let started = false;
+    for (let done = 0; done < SR * 2; done += N) {
+      k.process({}, ctx);
+      for (let i = 0; i < N; i++) {
+        if (started) maxStep = Math.max(maxStep, Math.abs(out[0][i] - prev));
+        prev = out[0][i];
+        started = true;
+      }
+    }
+    return maxStep;
+  };
+  const hard = loop(0);
+  const faded = loop(0.03); // 0.09 s, well inside the half-loop ceiling
+  console.log(`seam step  no fade ${hard.toFixed(4)}  faded ${faded.toFixed(4)}`);
+  check(hard > 0.5, 'the unfaded seam really is a step (the probe is measuring something)');
+  check(faded < hard * 0.4, 'a seam fade works on a loop with NO run-up before it');
+  check(faded < 0.2, 'the crossfaded seam is continuous (within the tone’s own slope)');
+}
+
 process.exit(ok ? 0 : 1);

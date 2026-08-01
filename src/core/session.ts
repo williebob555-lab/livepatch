@@ -78,6 +78,13 @@ export interface CustomBlockRecord {
   color?: string;
   template: any; // Block snapshot (see customblocks.ts)
   createdAt: number;
+  /**
+   * A built-in preset (`src/core/factory/`), merged in on read and never
+   * written to storage. It cannot be renamed, deleted or saved over — Save on
+   * a modified instance forks a user copy instead. See `core/factory/index.ts`
+   * for why these are merged rather than seeded.
+   */
+  factory?: boolean;
 }
 
 export function loadCustomBlocks(): CustomBlockRecord[] {

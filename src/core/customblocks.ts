@@ -6,6 +6,7 @@
 // ============================================================================
 import { Block } from './types';
 import { CustomBlockRecord, loadCustomBlocks, saveCustomBlocks } from './session';
+import { factoryBlocks, isFactoryBlockKey } from './factory';
 
 let registry: CustomBlockRecord[] = loadCustomBlocks();
 const listeners = new Set<() => void>();
@@ -19,12 +20,19 @@ function notify(): void {
   for (const fn of listeners) fn();
 }
 
+/**
+ * The user's saved blocks **plus the built-in ones**, merged on read rather
+ * than seeded into storage (see `core/factory/index.ts` for why). The user's
+ * come first so a block they made is never buried under the presets.
+ */
 export function getCustomBlocks(): CustomBlockRecord[] {
-  return registry;
+  return [...registry, ...factoryBlocks()];
 }
 export function getCustomBlock(key: string): CustomBlockRecord | undefined {
-  return registry.find((r) => r.key === key);
+  return registry.find((r) => r.key === key) ?? factoryBlocks().find((r) => r.key === key);
 }
+/** A built-in preset: not renameable, not deletable, not saveable-over. */
+export const isFactoryBlock = (key: string): boolean => isFactoryBlockKey(key);
 
 const slug = (s: string): string =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'block';
@@ -75,7 +83,9 @@ export function saveCustomBlock(
  * is how you branch a new entry.
  */
 export function updateCustomBlock(key: string, block: Block): CustomBlockRecord | undefined {
-  const rec = registry.find((r) => r.key === key);
+  // A factory preset is never overwritten — the caller falls back to Save As,
+  // which is the whole guarantee that taking one apart cannot lose it.
+  const rec = isFactoryBlockKey(key) ? undefined : registry.find((r) => r.key === key);
   if (!rec) return undefined;
   rec.template = snapshot(block, rec.title, key);
   rec.color = block.style.fill;
@@ -85,11 +95,13 @@ export function updateCustomBlock(key: string, block: Block): CustomBlockRecord 
 }
 
 export function deleteCustomBlock(key: string): void {
+  if (isFactoryBlockKey(key)) return;
   registry = registry.filter((r) => r.key !== key);
   notify();
 }
 
 export function renameCustomBlock(key: string, title: string): void {
+  if (isFactoryBlockKey(key)) return;
   const r = registry.find((x) => x.key === key);
   if (r) {
     r.title = title;

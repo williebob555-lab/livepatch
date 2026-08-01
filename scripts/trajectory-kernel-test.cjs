@@ -23,7 +23,7 @@ const { kernelFactory } = require('../dist-engine/dsp.js');
 const tmp = path.join(os.tmpdir(), 'lp-traj-' + process.pid + '.cjs');
 esbuild.buildSync({
   stdin: {
-    contents: `export { parsePoints, samplePath } from '../src/core/trajectory';`,
+    contents: `export { parsePoints, samplePath, insertIndexFor, simplifyPath, MAX_PATH_POINTS } from '../src/core/trajectory';`,
     resolveDir: __dirname,
     loader: 'ts',
   },
@@ -33,7 +33,7 @@ esbuild.buildSync({
   format: 'cjs',
   logLevel: 'silent',
 });
-const { parsePoints, samplePath } = require(tmp);
+const { parsePoints, samplePath, insertIndexFor, simplifyPath, MAX_PATH_POINTS } = require(tmp);
 fs.unlinkSync(tmp);
 
 let ok = true;
@@ -128,6 +128,77 @@ const square = '[{"x":-0.7,"y":0.7,"z":0},{"x":0.7,"y":0.7,"z":0},{"x":0.7,"y":-
   let zero = true;
   for (let i = 0; i < N; i++) if (k.out('x')[0][i] !== 0) zero = false;
   check(zero, 'empty path outputs silence');
+}
+
+// ---------------------------------------------------------------------------
+// 6. The EDITING helpers. Pure functions, but they are the whole reason the
+//    block is usable: a new waypoint used to be appended, which on a closed
+//    path always lands on the last→first leg however far away it is, and a
+//    Record gesture used to stop taking points at the ceiling mid-draw.
+// ---------------------------------------------------------------------------
+{
+  // A unit square, corners in the order top-left, top-right, bottom-right,
+  // bottom-left. Its four legs are top, right, bottom and the closing left.
+  const sq = parsePoints(square);
+  // Clicking just outside the middle of each leg must insert into THAT leg.
+  const cases = [
+    { x: 0, y: 0.75, leg: 0, name: 'top' },
+    { x: 0.75, y: 0, leg: 1, name: 'right' },
+    { x: 0, y: -0.75, leg: 2, name: 'bottom' },
+    { x: -0.75, y: 0, leg: 3, name: 'closing (4→1)' },
+  ];
+  let all = true;
+  for (const c of cases) {
+    const at = insertIndexFor(sq, c.x, c.y, false, true);
+    const want = c.leg + 1;
+    if (at !== want) {
+      all = false;
+      console.log(`  ${c.name} leg: expected insert at ${want}, got ${at}`);
+    }
+  }
+  check(all, 'a new waypoint lands in the leg the click is nearest, not always at the end');
+  // The old behaviour, stated as its own check so a regression is unambiguous.
+  check(
+    insertIndexFor(sq, 0, 0.75, false, true) !== sq.length,
+    'clicking near the FIRST leg does not append to the end of the path',
+  );
+}
+{
+  // An open path grows at its ends: a click past the tail appends, past the
+  // head prepends. (Once mode is the open one.)
+  const line = parsePoints('[{"x":-0.5,"y":0,"z":0},{"x":0,"y":0,"z":0},{"x":0.5,"y":0,"z":0}]');
+  check(insertIndexFor(line, 0.9, 0, false, false) === 3, 'an open path appends past its tail');
+  check(insertIndexFor(line, -0.9, 0, false, false) === 0, 'an open path prepends before its head');
+  check(insertIndexFor(line, -0.25, 0.05, false, false) === 1, 'a click on an open path still splits the leg');
+}
+{
+  // A drawn circle sampled far past the ceiling must come back as a circle
+  // that fits — not as the first N points of one. Both halves matter: the
+  // count, and the shape.
+  const raw = [];
+  for (let i = 0; i < 3000; i++) {
+    const a = (i / 3000) * Math.PI * 2;
+    raw.push({ x: Math.cos(a) * 0.8, y: Math.sin(a) * 0.8, z: 0 });
+  }
+  const out = simplifyPath(raw, MAX_PATH_POINTS);
+  check(out.length <= MAX_PATH_POINTS, `a long gesture fits the ceiling (${out.length} ≤ ${MAX_PATH_POINTS})`);
+  check(out.length > MAX_PATH_POINTS * 0.4, 'and spends the budget it has (it is not over-simplified)');
+  // Every original point is still close to the simplified curve, and the
+  // gesture still goes all the way round — truncation would fail the second.
+  let maxErr = 0;
+  const probe = { x: 0, y: 0, z: 0 };
+  for (const p of raw) {
+    let best = Infinity;
+    for (let s = 0; s <= 512; s++) {
+      samplePath(out, s / 512, false, true, probe);
+      best = Math.min(best, Math.hypot(probe.x - p.x, probe.y - p.y));
+    }
+    maxErr = Math.max(maxErr, best);
+  }
+  check(maxErr < 0.05, `the simplified path still traces the gesture (max error ${maxErr.toFixed(4)})`);
+  const angles = out.map((p) => Math.atan2(p.y, p.x));
+  check(Math.max(...angles) > 2.5 && Math.min(...angles) < -2.5, 'the WHOLE gesture survives, not just its start');
+  check(simplifyPath(raw.slice(0, 10), MAX_PATH_POINTS).length === 10, 'a short gesture is left alone');
 }
 
 console.log(ok ? '\nAll trajectory checks passed.' : '\nFAILURES above.');

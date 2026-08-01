@@ -1,6 +1,6 @@
 # 05 — Native Engine
 
-_Last verified: 2026-07-27. Files: `engine/src/*`, `src/engine/native.ts`,
+_Last verified: 2026-08-01. Files: `engine/src/*`, `src/engine/native.ts`,
 `electron/main.cjs`, `electron/preload.cjs`._
 
 The native engine is a **separate OS process** that runs the DSP graph on real
@@ -98,6 +98,38 @@ keep it in sync with `src/core/types.ts` when the IR changes.
   renderer is showing** (`watch-visuals`) at ~15 Hz.
 - So wire colors and visuals cost the audio thread almost nothing.
 
+### Renderer state does not survive an engine process (2026-08-01)
+
+**Anything the renderer memoizes as "already sent" is a lie the moment the
+engine restarts**, and the engine restarts more often than it looks: the audio
+toggle spawns a new process, so does an engine switch, and `electron/main.cjs`
+auto-respawns a crashed one behind the user's back.
+
+`NativeEngineClient.poll` sends `watch-visuals` only when the *set* of on-screen
+nodes changes. After a restart the same blocks are still on screen, so the key
+was unchanged, nothing was re-sent, and `GraphExec.watched` stayed empty for the
+rest of the session — the engine then emits no `visuals` at all. The report was
+"the Speaker Rig and Spatial Scope stop displaying levels after rebooting the
+audio engine, and possibly more blocks": it was **all** of them — scope,
+spectrum, sequencer playhead, tape transport, recorder waveform, MIDI monitor —
+with audio still running perfectly, which is what makes it read as a display bug
+rather than a protocol one. `forgetEngineState()` drops those memos (and the
+cached frames, which otherwise show a *frozen* meter instead of an empty one).
+
+Two more things the new process does not have, both handled on the same hook:
+
+- **The graph.** Only the renderer has it. main.cjs re-sends `config` and
+  `start` to a respawned engine but cannot send `set-graph`, so a crash-restart
+  came back **silent** until the user next edited something.
+- **The audio settings.** `config` from main.cjs carries the cassettes dir and
+  the VST addon path; `sampleRate`/`frames` live in renderer storage, so a
+  respawn quietly reverted to the driver default.
+
+A second `engine ready` is the signal — it is the first thing a fresh engine
+says, so seeing it twice means the process was replaced without this client
+asking. **A new message that carries renderer→engine state belongs on that
+hook.**
+
 ## `GraphExec` (`engine/src/graph.ts`)
 
 Turns a `CompiledGraph` into reconciled kernels + a flat topological schedule,
@@ -135,6 +167,7 @@ interface Kernel {
   process?(ins: Ins, ctx: {sr, n}): void;
   midiIn?; midiOut?; externalMidi?;   // midi
   tapeIn?; tapeOut?; tapeAssetId?;     // tape
+  assetChanged?(id);                   // same id, new samples (punch / live take)
   visualTime?: Float32Array; visualLevel?(): [number, number];
   visualChans?(): number[];            // per-channel RMS (spatial scope, speaker meters)
   liveParams?(): Record<string, number>; // params the kernel drives itself
@@ -188,6 +221,23 @@ the wire plugged into it already says the binding exists.
   fixed by their own params ignore it. Width-*transparent* kernels (`pass`,
   i.e. every portal) must implement it, or a wide bus collapses to stereo the
   moment it crosses a subgraph boundary (docs/02 `propagateWidth`).
+  - **An effect that does not implement it does not "collapse to stereo" — it
+    SILENCES the rest of the bus.** `computeNet` writes `min(out.length,
+    net.width)` channels, so a kernel holding a fixed `stereo()` buffer leaves
+    channels 2..N untouched, i.e. at zero. On a 7.1 bus that is six dead
+    speakers with the front pair still playing, which does not read as a width
+    bug at all — `eq-curve` shipped that way and the report was *"the parametric
+    EQ is completely garbled"* (2026-08-01). Nothing in the audio is wrong; most
+    of the rig is simply gone.
+  - So: **any effect that processes per channel is width-transparent**, and the
+    per-channel state banks are (re)built in `setWidth`, never in `process`. The
+    pattern `eq-curve` uses is worth copying — `bq[channel][band]`, one filter
+    *design* shared across channels, one *state* per channel, and channels 0/1
+    keeping whatever stereo meaning the block has (Mid-Side encodes across
+    exactly that pair; every channel above it is another bus-A channel).
+  - `scripts/width-kernel-test.cjs` has the assertion template: width out ==
+    width in, every channel actually *filtered* (not merely passed), and the
+    stereo case bit-unchanged.
 - `computeNet` keeps a **`width === 2` fast path**. It is the hottest loop in
   the engine; the stereo case must not pay a channel loop for channels it
   doesn't have. Wire level on a wide net is the **loudest channel**, not a fold
@@ -204,7 +254,9 @@ the wire plugged into it already says the binding exists.
   `pushAsioOut`/`pushOutputCh`, mapped through the Rig), `multi-in`
   (multichannel capture onto one wide bus), `upmix` (stereo → rig; see below),
   `sampler`
-  (region + fades snapshotted per voice), `tape-recorder` (ScriptProcessor-free:
+  (region + fades snapshotted per voice; the seam crossfade and the slice
+  ADSR/pitch mapping are native-side too — see below), `tape-recorder`
+  (ScriptProcessor-free:
   accumulates in `process`, writes WAV to the cassette dir on stop → sends
   `tape-created`), `cassette` (tape source), analyser taps (`meter`/`scope`/
   `spectrum`/`spectrogram` feed `visualTime`/`visualLevel`), `vst` = real VST3
@@ -347,6 +399,41 @@ happens per clock pulse**. `tilt` lifts the orbit into z (uses the height
 speakers); `height` offsets z; output clamped to −1..1. Patch x/y/z straight
 into a `panner3d` and a source rotates through the rig.
 
+### `tempo-follow` — a clock extracted from music
+
+`clock-tempo` measures a clock you already have; this makes one where there
+wasn't one. Audio in, out come a square `clock` locked to the beat, `bpm`
+(BPM/240, same convention as `clock-tempo`, so the two are interchangeable), a
+`phase` ramp per beat, and a `conf` confidence. Every clocked block in the
+library takes a CV clock, so this is the wire that makes Orbit, Trajectory, the
+arp and the sequencer follow the music.
+
+Three stages, and the split between them is what keeps the expensive one off the
+audio deadline:
+
+1. **Onset envelope** — energy in a low and a high band, one figure per ~5 ms
+   hop, half-wave-rectified into a flux value. Two bands because a kick and a
+   hat are the same event to broadband energy and their alternation *is* the
+   beat. Normalized by a slow running mean, so a fade does not change the tempo.
+2. **Autocorrelation, spread across quanta** — the flux ring correlated with
+   itself at every lag in the BPM window. That is ~100 lags × 1024 terms, which
+   is cheap per *second* and impossible in one callback, so the sweep walks four
+   lags a quantum and comes round several times a second — far faster than a
+   tempo actually moves. **Do not raise the four "to make it respond faster":**
+   responsiveness is bounded by the flux window, not by the sweep.
+3. **Phase lock** — a free-running beat phase at the detected tempo, pulled
+   toward detected onsets. The pull **fades out with distance and is zero a
+   quarter-beat away**: an onset halfway between beats is an offbeat, and
+   pulling toward "the nearest beat" from there drags the phase backwards every
+   time. On anything with hats that fights the downbeats to a draw — the tempo
+   stays right while the phase judders, which showed up as a divided clock
+   dropping pulses.
+
+Octave errors are inherent to autocorrelation; the lag search is weighted toward
+mid-tempo, which fixes most of them, and `minbpm`/`maxbpm`/`div` fix the rest by
+hand. `lock` freezes the estimate. Native-only (`stubbed`) — the preview engine
+has no place to do this analysis.
+
 ### Distance / Decorrelate / Chaos
 
 - **`distance`** — inverse-distance gain, an air-absorption low-pass that closes
@@ -476,6 +563,16 @@ rms/peak pair, so without per-channel telemetry a surround patch is a black box.
   rules); this is how you take 7 and 8. A channel the bus does not carry reads
   as silence rather than wrapping — inventing content on a monitoring path
   defeats the point.
+- **`matrix`** — a crosspoint router, `in1..inN` × `out1..outM`, with a gain at
+  every crossing. Routing stops being topology: "which sources reach which
+  destinations, and how much of each" is a grid you rewrite rather than N×M
+  wires you re-draw. The port counts are params (docs/08, "Add a block whose
+  port count is a parameter"); the grid is one JSON string param
+  (`src/core/matrix.ts`, mirrored here). Two things it must keep doing:
+  crosspoint gains **ramp across the quantum** (toggling a crossing on running
+  audio is otherwise a click), and the port names it reads `ins` with are built
+  once at construction — `ins['in' + (i + 1)]` in the loop is a string
+  allocation per port per quantum.
 
 `speaker-rig` publishes `chans` too, so the output block's own face shows what
 each speaker is being sent.
@@ -526,11 +623,102 @@ you cannot see is the same bug in a different costume.
 count; it is re-read once per quantum (a map lookup) so a stream that opens
 narrower than the rig is noticed the quantum it happens.
 
+### `speaker-rig` — speaker correction (2026-07-31)
+
+A calibrated speaker (Rig tab ▸ Calibrate — see
+[`07-ui.md`](07-ui.md) for the flow and
+[`06-audio-io-and-latency.md`](06-audio-io-and-latency.md) for the measurement)
+carries a `cal` blob on its `Speaker` record, which reaches the kernel inside
+the ordinary `__rig` param. `speaker-rig` turns it into audio.
+
+**Three corrections, one impulse response.** `buildCalIR` (dsp.ts) folds all of
+them into a single FIR per speaker, which is why this costs no delay line, no
+gain smoothing and no state beyond the convolver:
+
+| stored | becomes |
+|---|---|
+| `corr` (dB at 1/12-octave grid) | the filter's magnitude |
+| `gain` (linear, ≤ 1) | a scalar on the taps |
+| `delay` (seconds) | where in the buffer the taps start |
+
+- **Minimum phase, via the real cepstrum.** A linear-phase inversion costs half
+  the filter length in latency *and* pre-rings ahead of transients — the one
+  artefact a room never produces and the ear is unusually good at hearing.
+  Minimum phase front-loads the energy (measured: >99 % in the first eighth of
+  the IR), so the correction's own delay is negligible and the alignment delay
+  stays the honest measured number.
+- **Filter length is 10.7 ms at every rate** (512 taps at 48 kHz, scaled),
+  design FFT 4096 (8192 above 60 kHz). Fixing a filter length in *samples* is
+  the rate bug in docs/10 rule 3.
+- **Either every speaker is convolved or none is.** An uncalibrated speaker in
+  a calibrated rig gets a **unit impulse**, not a bypass. The convolver costs
+  one hop (~5.3 ms), and running it on the calibrated speakers only would put
+  them a hop behind their neighbours — 1.7 m of imaging error, introduced by the
+  thing that was supposed to fix the imaging. A rig with nothing calibrated
+  allocates none of it and runs exactly the code it always did.
+- **`calHash` gates the rebuild.** A rig push arrives on *every pointer-move of
+  a speaker drag*, so "did this speaker's filter change" is asked ~60×/s per
+  speaker. It is an FNV-ish integer over the curve — comparing by `join(',')`
+  would mint kilobytes of string per frame on the engine's loop. Measured: an
+  unchanged push on a 2-speaker calibrated rig is 0.014 ms.
+- **A rate change rebuilds from `process`.** That allocates, which is normally
+  forbidden — but a rate change *is* a stream reopen (an audible gap already),
+  it happens once, and `process` is the only place that learns the rate. `conv`
+  resolves the identical problem the identical way (`irDirty`).
+- **A non-finite curve is refused, not built.** A NaN in an FIR's *taps* is not
+  the recoverable case `trapNonFinite` handles: flushing the convolver's history
+  reinstates it from the filter on the next sample. `parseCal` (engine
+  `rig.ts`) rejects the blob and `buildCalIR` returns null, leaving the speaker
+  uncorrected — wrong, rather than dead. Same reasoning as `conv`'s `buildIR`
+  scrub (docs/10 rule 4).
+- The face meters are taken **before** the correction. They answer "is signal
+  reaching this speaker", and a calibrated speaker metering a few dB low purely
+  because its trim is working would read as a routing fault.
+
+`node --expose-gc scripts/speaker-cal-test.cjs` covers all of it, including the
+latency-parity invariant and zero allocation in the corrected path.
+
+### The Sampler's loop seam, and the slice kit
+
+- **The seam crossfade overlaps the loop's own head.** Over the last `loopFade`
+  samples before the loop end the tail fades out while `[loopA, loopA+xfade)`
+  fades in, and playback then wraps to `loopA + xfade` where the head read left
+  off — so every sample is still heard once a lap and the seam is continuous.
+  The textbook version instead reads the material *before* the loop start,
+  which preserves the lap length exactly but can only fade with as much run-up
+  as exists before `loopA` — and the loop the Clip tab hands you starts at the
+  region start, where there is none. So the crossfade silently clamped to zero
+  in the one case everybody reaches, and the control looked broken. An overlap
+  needs nothing but the loop; the cost is that a lap is `xfade` shorter than
+  the bracket, bounded at half. Equal power (√t), not linear: two uncorrelated
+  halves crossfaded linearly dip ~3 dB in the middle, which on a sustain loop
+  is an audible lurch once a lap.
+- **Every mode runs the ADSR, and the release finishes *by* the end of the
+  material.** A non-looping voice enters release `envA / rel` output frames
+  early, so the envelope reaches zero exactly as the material runs out. The old
+  rule flipped an ungated voice into release when it was already within one
+  sample of the end — a release in name only, so every slice ended on a step
+  and the R knob did nothing you could hear. Slices are gated by default
+  (`slicehold`); One-Shot still ignores note-off, and still gets the early
+  release.
+- **Slice → key is a mapping, not a deal-out.** `slicemap` Chromatic is the
+  original behaviour (slice `note − root`, no transposition). Pitched answers
+  any key with the slice whose *detected* key (`slicekeys`, written by the Clip
+  tab's ♪ Keys) is nearest, transposed onto it — so a sliced phrase becomes a
+  playable instrument instead of a kit whose keys mean nothing. A slice with no
+  detected key falls back to `root + index` but **loses every tie**: a
+  placeholder must not steal a note from a slice that was actually heard to
+  play it. The resolution mirrors `sliceForNote` in `src/core/sampler.ts` —
+  change one, change both.
+
 ### Intentional cross-engine divergences (not bugs)
 
 - `reverb`: native Schroeder comb/allpass vs web ConvolverNode + synthesized IR.
 - `compressor`: native feed-forward vs Web Audio `DynamicsCompressor` (soft
   knee/lookahead).
+- `sampler` `loopFade`: native only, so a lap is also `loopFade` shorter on
+  native than on web when one is set (see above).
+- `tempo-follow`: native only (`stubbed`).
 
 These will not sound identical. Everything else (CV math, logic, filters, osc,
 sampler regions) is A/B verified to match — see the parity harness in

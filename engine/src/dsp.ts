@@ -8,8 +8,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { MidiEvent, ParamValue, send } from './protocol';
 import { AssetStore } from './assets';
-import { DecodedAudio, writeWav } from './wav';
-import { outChannel, parseRig, speakerVec } from './rig';
+import { DecodedAudio, encodePcm16, wavHeader, writeWav } from './wav';
+import { CAL_F0, CAL_N, CAL_PPO, SpeakerCal, outChannel, parseRig, speakerVec } from './rig';
 
 /** Compiler-injected speaker layout param. Mirrors `RIG_PARAM` in
  *  `src/core/compile.ts` — the two must stay identical. */
@@ -213,9 +213,38 @@ class Smooth {
   }
 }
 
+/**
+ * A sample rate a filter designer can actually use. Anything non-finite or
+ * ≤ 0 would turn `2πf/sr` into ±Infinity and every coefficient below into NaN
+ * — and a NaN coefficient run through a *recursive* filter is not a transient:
+ * see `Biquad.process`. Callers keep their previous (good) coefficients when
+ * this returns false.
+ */
+const usableSr = (sr: number): boolean => Number.isFinite(sr) && sr > 0;
+
 class Biquad {
   b0 = 1; b1 = 0; b2 = 0; a1 = 0; a2 = 0;
   private x1 = 0; private x2 = 0; private y1 = 0; private y2 = 0;
+  /**
+   * Direct-form-I biquad, with a **non-finite trap** on the state.
+   *
+   * A biquad feeds its own output back: `y = … − a1·y1 − a2·y2`. So a single
+   * NaN or Infinity — one bad input sample, one quantum of garbage, one
+   * coefficient computed from a bad sample rate — lands in `y1` and every
+   * subsequent output is NaN *forever*. The filter never recovers on its own,
+   * and a driver renders NaN as silence, so the symptom is not a click: it is a
+   * block that has permanently "stopped passing audio through", surviving the
+   * condition that caused it. It cost a whole debugging session: a 4096-frame
+   * buffer setting (> MAXQ) made the graph read past its buffers, `undefined`
+   * arithmetic produced NaN, and EQ Curve — 32 biquads in series, the most
+   * exposed block in the app — went dead and stayed dead through further
+   * sample-rate and buffer changes.
+   *
+   * So: check the state once per buffer (not per sample — this is the audio
+   * path) and, if it has gone non-finite, zero the block and reset. The cost
+   * when healthy is one `Number.isFinite` per quantum; the worst case is one
+   * quantum of silence instead of a permanently dead block.
+   */
   process(buf: Float32Array, n: number): void {
     let { x1, x2, y1, y2 } = this;
     const { b0, b1, b2, a1, a2 } = this;
@@ -225,9 +254,15 @@ class Biquad {
       x2 = x1; x1 = x; y2 = y1; y1 = y;
       buf[i] = y;
     }
+    if (!Number.isFinite(y1) || !Number.isFinite(y2) || !Number.isFinite(x1)) {
+      buf.fill(0, 0, n);
+      this.reset();
+      return;
+    }
     this.x1 = x1; this.x2 = x2; this.y1 = y1; this.y2 = y2;
   }
   peaking(sr: number, f: number, gDb: number, q: number): void {
+    if (!usableSr(sr)) return;
     const A = Math.pow(10, gDb / 40);
     const w = (2 * Math.PI * Math.max(10, Math.min(sr / 2 - 10, f))) / sr;
     const al = Math.sin(w) / (2 * Math.max(0.05, q));
@@ -239,6 +274,7 @@ class Biquad {
     this.a2 = (1 - al / A) / a0;
   }
   shelf(sr: number, f: number, gDb: number, high: boolean): void {
+    if (!usableSr(sr)) return;
     const A = Math.pow(10, gDb / 40);
     const w = (2 * Math.PI * Math.max(10, Math.min(sr / 2 - 10, f))) / sr;
     const cw = Math.cos(w);
@@ -254,6 +290,7 @@ class Biquad {
     this.a2 = (A + 1 + sgn * (A - 1) * cw - sq) / a0;
   }
   lowpass(sr: number, f: number, q = 0.7071): void {
+    if (!usableSr(sr)) return;
     const w = (2 * Math.PI * Math.max(10, Math.min(sr / 2 - 10, f))) / sr;
     const al = Math.sin(w) / (2 * q);
     const cw = Math.cos(w);
@@ -273,6 +310,7 @@ class Biquad {
    * (`type='bell', gDb=0` → truly flat).
    */
   setType(type: string, sr: number, f: number, gDb: number, q: number): void {
+    if (!usableSr(sr)) return;
     const w = (2 * Math.PI * Math.max(1, Math.min(sr / 2 - 1, f))) / sr;
     const cw = Math.cos(w);
     const sw = Math.sin(w);
@@ -306,6 +344,43 @@ class Biquad {
     this.x1 = this.x2 = this.y1 = this.y2 = 0;
   }
 }
+
+/**
+ * The `Biquad.process` non-finite trap, generalised to any kernel that carries
+ * state across quanta.
+ *
+ * `Biquad` fixed itself, and that is exactly why this exists. Trapping the NaN
+ * in one class only moved the symptom: the next block downstream with recursive
+ * state became the one that "stopped passing audio", and the report came back
+ * as *Upmix* instead of *EQ Curve*. Any kernel that feeds its own state back —
+ * a delay line, an allpass, a comb, a one-pole — turns one bad input sample
+ * into permanent silence, because a driver renders NaN as nothing. There is no
+ * user action that recovers it: the state survives param changes, rewiring and
+ * scene loads, so the block is dead for the rest of the session.
+ *
+ * **The ring buffers are the part that matters.** Clearing only the scalar
+ * state is not enough — a NaN sitting in a delay line comes back around every
+ * time the read pointer reaches it, so the block appears to recover and then
+ * dies again on a cycle. `reset` must purge the kernel's *whole* history.
+ *
+ * Detection is a sum, not a per-sample `Number.isFinite`: NaN and ±Infinity
+ * both poison a running total, so one check per quantum replaces `n × channels`
+ * branches in the audio path. The sum accumulates in a JS double over audio-
+ * range values, so it cannot overflow to Infinity on its own.
+ *
+ * Cost when healthy is one add per sample over data already in cache; the worst
+ * case is one quantum of silence instead of a block that never comes back.
+ */
+const trapNonFinite = (out: Buf, n: number, reset: () => void): void => {
+  let s = 0;
+  for (let c = 0; c < out.length; c++) {
+    const b = out[c];
+    for (let i = 0; i < n; i++) s += b[i];
+  }
+  if (Number.isFinite(s)) return;
+  for (let c = 0; c < out.length; c++) out[c].fill(0, 0, n);
+  reset();
+};
 
 // Width rules for the mixing helpers (docs/02-core-ir.md "Connection rules"):
 // they operate on min(dst, src) channels. A narrower source never fans out into
@@ -541,6 +616,26 @@ registerKernel('upmix', (params) => {
   // shared factors would put the same comb notches on several speakers.
   const PRIMES = [113, 179, 251, 313, 397, 461, 541, 619, 701, 787, 863, 941, 1013, 1097, 1181, 1259];
 
+  /**
+   * Purge every scrap of history (see `trapNonFinite`). The decorrelation lines
+   * hold 2048 frames each: leaving them would re-inject the bad sample one lap
+   * later, so the block would stutter back to life and die again on a cycle.
+   * The gains are re-seeded from their targets rather than zeroed, so recovery
+   * is silent-for-one-quantum, not a fade-in.
+   */
+  const purge = (): void => {
+    for (let i = 0; i < MAXCH; i++) lines[i].fill(0);
+    apZ1.fill(0);
+    writeIdx.fill(0);
+    lpZ = 0;
+    gDirL.set(tDirL);
+    gDirR.set(tDirR);
+    gMid.set(tMid);
+    gAmb.set(tAmb);
+    gLfe.set(tLfe);
+    ramping = false;
+  };
+
   let rig = parseRig(params[RIG_PARAM]);
   const p: Record<string, ParamValue> = { ...params };
   // Mid / side / low-passed mid for the whole quantum, shared by every speaker
@@ -613,6 +708,18 @@ registerKernel('upmix', (params) => {
         tAmb[i] *= trim;
         tLfe[i] *= trim;
       }
+    }
+    // A non-finite param — a CV line that went bad, a malformed rig angle —
+    // would otherwise bake NaN into the targets, and from there the ramp
+    // carries it into the live gains permanently. Control rate, so the check is
+    // free; note `worst > 1` above is false for NaN, so the trim cannot catch
+    // this on its own.
+    for (let i = 0; i < count; i++) {
+      if (!Number.isFinite(tDirL[i])) tDirL[i] = 0;
+      if (!Number.isFinite(tDirR[i])) tDirR[i] = 0;
+      if (!Number.isFinite(tMid[i])) tMid[i] = 0;
+      if (!Number.isFinite(tAmb[i])) tAmb[i] = 0;
+      if (!Number.isFinite(tLfe[i])) tLfe[i] = 0;
     }
     ramping = true;
   };
@@ -717,6 +824,7 @@ registerKernel('upmix', (params) => {
         gAmb[c] = tAmb[c];
       }
       ramping = false;
+      trapNonFinite(buf, n, purge);
     },
   };
 });
@@ -893,6 +1001,12 @@ registerKernel('decorrelate', (params) => {
   const apL = [mk(487), mk(937), mk(1523), mk(2111)];
   const apR = [mk(631), mk(1187), mk(1789), mk(2371)];
 
+  /** Purge both allpass chains — buffers included (see `trapNonFinite`). */
+  const purge = (): void => {
+    for (const ap of apL) { ap.b.fill(0); ap.w = 0; }
+    for (const ap of apR) { ap.b.fill(0); ap.w = 0; }
+  };
+
   const runAP = (ap: { b: Float32Array; w: number; len: number; g: number }, x: number, size: number): number => {
     const d = Math.max(1, Math.min(MAXD - 1, Math.round(ap.len * (0.3 + 0.7 * size))));
     const ri = (ap.w - d + MAXD) % MAXD;
@@ -924,6 +1038,9 @@ registerKernel('decorrelate', (params) => {
         oL[i] = l * (1 - amt) + dl * amt;
         oR[i] = r * (1 - amt) + dr * amt;
       }
+      // Eight allpass chains, the longest 2371 frames: a bad sample would
+      // otherwise keep re-entering for ~50 ms at a time, forever.
+      trapNonFinite(buf, n, purge);
     },
   };
 });
@@ -1016,7 +1133,7 @@ registerKernel('chaos', (params) => {
 // `samplePathInto` here and `samplePath` there drift, the playhead on screen
 // and the source in the room disagree. Kept allocation-free: caller owns the
 // point arrays and the three out-refs.
-const MAX_PATH_POINTS = 64;
+const MAX_PATH_POINTS = 256;
 const catmullAxis = (p0: number, p1: number, p2: number, p3: number, t: number): number => {
   const t2 = t * t;
   const t3 = t2 * t;
@@ -2217,6 +2334,16 @@ registerKernel('binaural', (params) => {
   };
   recompute();
 
+  /** Purge the ITD rings and the shadow-filter state (see `trapNonFinite`). */
+  const purge = (): void => {
+    for (let i = 0; i < MAXCH; i++) rings[i].fill(0);
+    wr.fill(0);
+    xL.fill(0);
+    yL.fill(0);
+    xR.fill(0);
+    yR.fill(0);
+  };
+
   /** Linear-interpolated read `d` frames back from write cursor `w`. */
   const tap = (ring: Float32Array, w: number, d: number): number => {
     let pos = w - d;
@@ -2299,6 +2426,9 @@ registerKernel('binaural', (params) => {
         oL[i] *= gl;
         oR[i] *= gl;
       }
+      // Per-speaker shadow filters are recursive (`- a1n * y1`) and every
+      // speaker has a 256-frame ITD ring behind it, so both have to go.
+      trapNonFinite(out, n, purge);
     },
   };
 });
@@ -3008,6 +3138,73 @@ registerKernel('speaker-rig', (params, sv) => {
   /** Limiter gain state, one per fold channel (1 = not limiting). */
   const limG = new Float32Array(FOLD_CH).fill(1);
 
+  // ---- speaker correction (the Rig tab's Calibrate) ----
+  /**
+   * One convolver per speaker, carrying that speaker's measured correction,
+   * level trim and alignment delay as a single minimum-phase FIR
+   * (`buildCalIR`). Built on the control path — a rig change or a rate change —
+   * and never in `process`, which only runs them.
+   *
+   * **Either every speaker is convolved or none is**, and that is the whole
+   * reason `calOn` is one flag for the block rather than a test per speaker.
+   * The convolver costs one hop of latency; running it on the calibrated
+   * speakers only would put the corrected ones ~5 ms behind the rest, which is
+   * a metre and a half of imaging error introduced by the thing that was
+   * supposed to fix the imaging. An uncalibrated speaker in a calibrated rig
+   * therefore gets a unit impulse: same latency, no correction.
+   *
+   * A rig with nothing calibrated allocates none of this and runs exactly the
+   * code it always did — the correction is opt-in down to the last cycle.
+   */
+  let calOn = false;
+  let calSr = 0;
+  let calDirty = false;
+  let calFftLocal: ConvFFT | null = null;
+  let calHop = 0;
+  const calChans: Array<ConvChannel | null> = [];
+  const calOut: Float32Array[] = [];
+  const calSigs = new Int32Array(MAXCH);
+  /** Single-sample identity IR, for a speaker in a calibrated rig that has no
+   *  calibration of its own. Shared: `ConvChannel.setIR` copies it. */
+  const calUnit = new Float32Array(1);
+  calUnit[0] = 1;
+
+  const buildCal = (): void => {
+    const want = !!rig && rig.speakers.some((s) => !!s.cal);
+    if (!want || calSr <= 0) {
+      calOn = false;
+      calChans.length = 0;
+      calOut.length = 0;
+      calSigs.fill(0);
+      return;
+    }
+    // The hop scales with the sample rate for the same reason `conv`'s does:
+    // fixing it in samples makes the block's cost quadratic in the rate
+    // (docs/10). 256 at 48 kHz ≈ 5.3 ms of latency on the monitor path.
+    const hop = hopFor(calSr);
+    if (!calFftLocal || calHop !== hop) {
+      calHop = hop;
+      calFftLocal = new ConvFFT(hop * 2);
+      calChans.length = 0;
+      calSigs.fill(0);
+    }
+    const n = Math.min(MAXCH, rig!.speakers.length);
+    while (calChans.length < n) {
+      calChans.push(new ConvChannel(calFftLocal, MAXQ));
+      calSigs[calChans.length - 1] = 0;
+    }
+    while (calOut.length < n) calOut.push(new Float32Array(MAXQ));
+    for (let i = 0; i < n; i++) {
+      const cal = rig!.speakers[i].cal;
+      const sig = calHash(cal) || 1; // 1 = "uncalibrated", distinct from 0 = "never built"
+      if (calSigs[i] === sig) continue;
+      calSigs[i] = sig;
+      const ir = cal ? buildCalIR(cal, calSr) : null;
+      calChans[i]!.setIR(ir ?? calUnit);
+    }
+    calOn = true;
+  };
+
   /**
    * Build the routing plan. Runs at set-graph / param / reconfigure time only.
    *
@@ -3140,6 +3337,12 @@ registerKernel('speaker-rig', (params, sv) => {
       else if (id === RIG_PARAM) {
         rig = parseRig(v);
         buildPlan();
+        // The correction filters live on the rig, so a rig push is also how a
+        // fresh calibration (or a cleared one) arrives. `buildCal` rebuilds
+        // only the speakers whose calibration actually changed — this runs on
+        // every pointer-move of a speaker drag.
+        if (calSr > 0) buildCal();
+        else calDirty = true;
         // A layout edit can change the channel span the device must open.
         sv.hardwareChanged();
       } else if (id === 'device') {
@@ -3169,6 +3372,20 @@ registerKernel('speaker-rig', (params, sv) => {
       // only happens on an actual change.
       const avail = sv.outChannels(device, asio);
       if (avail !== planChans) buildPlan();
+      // Correction filters are designed for a sample rate, so a stream that
+      // reopened at a different one invalidates every one of them. Rebuilding
+      // here allocates, which is normally forbidden — but a rate change *is* a
+      // stream reopen (an audible gap already), it happens once, and there is
+      // nowhere else that learns the rate. `conv` resolves the identical
+      // problem the identical way; see its `irDirty`.
+      if (calSr !== ctx.sr) {
+        calSr = ctx.sr;
+        calDirty = true;
+      }
+      if (calDirty) {
+        calDirty = false;
+        buildCal();
+      }
       const g = level.step(ctx);
       const n = ctx.n;
       const w = Math.min(count, src.length);
@@ -3178,14 +3395,26 @@ registerKernel('speaker-rig', (params, sv) => {
       // below costs exactly what it always did.
       if (folding) for (let c = 0; c < FOLD_CH; c++) foldOut[c].fill(0, 0, n);
       for (let c = 0; c < w; c++) {
-        const s = src[c];
+        let s = src[c];
         // Meter the speaker's own feed, before any fold — this is "what this
-        // speaker is being sent", which is what the face is asking about.
+        // speaker is being sent", which is what the face is asking about. Taken
+        // before the correction too: the meter answers "is signal reaching this
+        // speaker", and a calibrated speaker reading a few dB lower than its
+        // neighbours purely because its trim is doing its job would look like a
+        // routing fault.
         let sum = 0;
         for (let i = 0; i < n; i += 4) sum += s[i] * s[i];
         const rms = Math.sqrt(sum / (n / 4 || 1)) * g;
         lvl[c] = rms > lvl[c] ? rms : lvl[c] * 0.85 + rms * 0.15;
         if (dropped[c]) continue;
+        // Correction, if this rig has been calibrated. The convolver writes to
+        // its own buffer rather than in place: `src[c]` is the net's shared
+        // buffer and every other sink on the bus reads it after this kernel.
+        const cc = calOn ? calChans[c] : null;
+        if (cc) {
+          cc.process(s, calOut[c], n);
+          s = calOut[c];
+        }
         if (foldA[c] >= 0) emit(foldA[c], g * gainA[c], s, n);
         if (foldB[c] >= 0) emit(foldB[c], g * gainB[c], s, n);
       }
@@ -3266,6 +3495,280 @@ registerKernel('chan-pick', (params) => {
       else oL.fill(0, 0, n);
       if (R) for (let i = 0; i < n; i++) oR[i] = R[i] * g;
       else oR.fill(0, 0, n);
+    },
+  };
+});
+
+/** Ceiling on the fanned-port count for chan-split / chan-merge. Mirrors the
+ *  clamp in `src/core/graph.ts` (syncPackPorts); 16 pairs = 32 = MAXCH. */
+const PACK_MAX = 16;
+const packCount = (v: ParamValue | undefined, d: number): number => {
+  const n = Math.round(num(v, d));
+  return n < 1 ? 1 : n > PACK_MAX ? PACK_MAX : n;
+};
+
+/**
+ * Channel Split — unpack one wide bus into `count` narrow outputs. Def in
+ * `src/blocks/defs.ts`.
+ *
+ * Channels mode: output `k` carries input channel `k`, written to BOTH channels
+ * of the stereo output (centred) so it is listenable/processable on its own —
+ * and because a merge only reads channel 0, Split→Merge round-trips regardless.
+ * Pairs mode: output `k` carries input channels `2k, 2k+1` as L/R.
+ *
+ * One stereo buffer per possible output, preallocated: the port count is a
+ * param, so growing it is a set-graph event, never a `process` allocation
+ * (docs/10). A channel the input does not have reads as silence — the honest
+ * truncation behaviour (docs/02), never an implicit fan-out.
+ */
+registerKernel('chan-split', (params) => {
+  let count = packCount(params.count, 8);
+  let pairs = str(params.mode, 'Channels') === 'Pairs';
+  const bufs: Buf[] = [];
+  for (let o = 0; o < PACK_MAX; o++) bufs.push(stereo());
+  const outIndex = new Map<string, number>();
+  for (let k = 0; k < PACK_MAX; k++) outIndex.set('out' + (k + 1), k);
+  const gain = new Smooth(num(params.gain, 1));
+  return {
+    out: (port) => {
+      const o = outIndex.get(port);
+      return o !== undefined && o < count ? bufs[o] : null;
+    },
+    setParam: (id, v) => {
+      if (id === 'gain') gain.set(num(v, 1));
+      else if (id === 'count') count = packCount(v, 8);
+      else if (id === 'mode') pairs = str(v, 'Channels') === 'Pairs';
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const g = gain.step(ctx);
+      const src = ins.in;
+      for (let o = 0; o < count; o++) {
+        const oL = bufs[o][0];
+        const oR = bufs[o][1];
+        if (!src) {
+          oL.fill(0, 0, n);
+          oR.fill(0, 0, n);
+          continue;
+        }
+        if (pairs) {
+          const L = 2 * o < src.length ? src[2 * o] : null;
+          const R = 2 * o + 1 < src.length ? src[2 * o + 1] : null;
+          if (L) for (let i = 0; i < n; i++) oL[i] = L[i] * g;
+          else oL.fill(0, 0, n);
+          if (R) for (let i = 0; i < n; i++) oR[i] = R[i] * g;
+          else oR.fill(0, 0, n);
+        } else {
+          const C = o < src.length ? src[o] : null;
+          if (C)
+            for (let i = 0; i < n; i++) {
+              const v = C[i] * g;
+              oL[i] = v;
+              oR[i] = v;
+            }
+          else {
+            oL.fill(0, 0, n);
+            oR.fill(0, 0, n);
+          }
+        }
+      }
+    },
+  };
+});
+
+/**
+ * Channel Merge — stack `count` narrow inputs onto one wide bus. Def in
+ * `src/blocks/defs.ts`; the inverse of Channel Split.
+ *
+ * Channels mode: output channel `k` = input `k`'s channel 0 (the left). Feeding
+ * a stereo signal in keeps only the left — the explicit-stacking counterpart to
+ * the truncation rules (docs/02). Pairs mode: input `k`'s channels 0,1 land on
+ * output channels `2k, 2k+1`.
+ *
+ * The output's intrinsic width follows count (doubled in Pairs mode); `setWidth`
+ * only ever GROWS the buffer (a wider net downstream), never in `process`. Port
+ * names are built once — `ins['in' + …]` in the loop would allocate a string
+ * per input per quantum (docs/10).
+ */
+registerKernel('chan-merge', (params) => {
+  let count = packCount(params.count, 8);
+  let pairs = str(params.mode, 'Channels') === 'Pairs';
+  const intrinsic = (): number => Math.max(2, Math.min(MAXCH, pairs ? count * 2 : count));
+  let buf = allocBuf(intrinsic());
+  const grow = (): void => {
+    const w = intrinsic();
+    if (w > buf.length) buf = allocBuf(w);
+  };
+  const inNames: string[] = [];
+  for (let k = 0; k < PACK_MAX; k++) inNames.push('in' + (k + 1));
+  const gain = new Smooth(num(params.gain, 1));
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'gain') gain.set(num(v, 1));
+      else if (id === 'count') {
+        count = packCount(v, 8);
+        grow();
+      } else if (id === 'mode') {
+        pairs = str(v, 'Channels') === 'Pairs';
+        grow();
+      }
+    },
+    setWidth: (_port, w) => {
+      if (w > buf.length) buf = allocBuf(w);
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const g = gain.step(ctx);
+      // Every channel starts silent; only the ones we stack onto get written, so
+      // a channel with no input (or beyond the intrinsic width) stays quiet.
+      for (let c = 0; c < buf.length; c++) buf[c].fill(0, 0, n);
+      for (let o = 0; o < count; o++) {
+        const src = ins[inNames[o]];
+        if (!src) continue;
+        if (pairs) {
+          const dL = 2 * o < buf.length ? buf[2 * o] : null;
+          const dR = 2 * o + 1 < buf.length ? buf[2 * o + 1] : null;
+          const L = src[0];
+          const R = src.length > 1 ? src[1] : null;
+          if (dL && L) for (let i = 0; i < n; i++) dL[i] = L[i] * g;
+          if (dR && R) for (let i = 0; i < n; i++) dR[i] = R[i] * g;
+        } else {
+          const d = o < buf.length ? buf[o] : null;
+          const C = src[0];
+          if (d && C) for (let i = 0; i < n; i++) d[i] = C[i] * g;
+        }
+      }
+    },
+  };
+});
+
+/**
+ * Matrix — crosspoint router. Def in `src/blocks/defs.ts`; grid format mirrored
+ * from `src/core/matrix.ts` (the engine process shares no modules with the
+ * renderer, so `MATRIX_MAX` and the row-per-output layout are duplicated here
+ * and must move together).
+ *
+ * Width-transparent per output: each output buffer is sized to the widest net
+ * on it, and an input narrower than that feeds channels 0..k−1 (docs/02
+ * connection rules — never an implicit fan-out).
+ *
+ * **Crosspoint gains ramp across the quantum.** Toggling a crosspoint is a
+ * gain going 0→1 on a running signal, and a step there is a click on every
+ * input the crossing carries — the same reason `speaker-monitor` ramps its
+ * mutes (docs/10 rule 10). One ramp per quantum per crossing, computed from a
+ * single `exp` for the whole block rather than a `Smooth` per crosspoint.
+ */
+const MATRIX_MAX = 16;
+registerKernel('matrix', (params) => {
+  const clampN = (v: ParamValue | undefined, d: number): number => {
+    const n = Math.round(num(v, d));
+    return n < 1 ? 1 : n > MATRIX_MAX ? MATRIX_MAX : n;
+  };
+  let nIn = clampN(params.ins, 4);
+  let nOut = clampN(params.outs, 4);
+  // One buffer per possible output: the port count is a param, and allocating
+  // on a param change is fine (construction/reconfigure), but `process` must
+  // never do it. Sixteen stereo MAXQ pairs is 256 kB — the price of not
+  // branching on "does this output exist yet" in the audio path.
+  const bufs: Buf[] = [];
+  for (let o = 0; o < MATRIX_MAX; o++) bufs.push(stereo());
+  const widths = new Int32Array(MATRIX_MAX).fill(2);
+  // Port names, built once. `ins['in' + (i + 1)]` in the loop would concatenate
+  // a string per input per quantum, and a string is an allocation — this is the
+  // audio path (docs/10). The out-port map is the same trick for `out()`, which
+  // the graph calls once per connected net per quantum.
+  const inNames: string[] = [];
+  const outIndex = new Map<string, number>();
+  for (let k = 0; k < MATRIX_MAX; k++) {
+    inNames.push('in' + (k + 1));
+    outIndex.set('out' + (k + 1), k);
+  }
+  const cur = new Float32Array(MATRIX_MAX * MATRIX_MAX);
+  const tgt = new Float32Array(MATRIX_MAX * MATRIX_MAX);
+  const gain = new Smooth(num(params.gain, 1));
+
+  /** Parse the grid param into `tgt`. Row per output, gain per input. */
+  const loadGrid = (v: ParamValue | undefined): void => {
+    tgt.fill(0);
+    const s = str(v);
+    if (!s) return;
+    let rows: unknown;
+    try {
+      rows = JSON.parse(s);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(rows)) return;
+    for (let o = 0; o < nOut && o < rows.length; o++) {
+      const row = (rows as unknown[])[o];
+      if (!Array.isArray(row)) continue;
+      for (let i = 0; i < nIn && i < row.length; i++) {
+        const g = Number((row as unknown[])[i]);
+        tgt[o * MATRIX_MAX + i] = Number.isFinite(g) ? (g < 0 ? 0 : g > 1 ? 1 : g) : 0;
+      }
+    }
+  };
+  loadGrid(params.grid);
+  cur.set(tgt); // a rebuilt graph starts patched, it does not fade in
+
+  return {
+    out: (port) => {
+      const o = outIndex.get(port);
+      return o !== undefined && o < nOut ? bufs[o] : null;
+    },
+    // Set-graph time only, never from `process` — this reallocates.
+    setWidth: (port, width) => {
+      const o = outIndex.get(port);
+      if (o === undefined) return;
+      widths[o] = Math.max(2, Math.min(MAXCH, width));
+      if (bufs[o].length < widths[o]) bufs[o] = allocBuf(widths[o]);
+    },
+    setParam: (id, v) => {
+      if (id === 'gain') gain.set(num(v, 1));
+      else if (id === 'ins' || id === 'outs') {
+        if (id === 'ins') nIn = clampN(v, 4);
+        else nOut = clampN(v, 4);
+        // The grid is stored at whatever shape it was written; re-reading it
+        // at the new counts is the whole reshape (see core/matrix.ts).
+        loadGrid(params.grid);
+      } else if (id === 'grid') {
+        params.grid = v;
+        loadGrid(v);
+      }
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const g = gain.step(ctx);
+      const inv = 1 / n;
+      for (let o = 0; o < nOut; o++) {
+        const dst = bufs[o];
+        const w = Math.min(dst.length, widths[o]);
+        for (let c = 0; c < dst.length; c++) dst[c].fill(0, 0, n);
+        for (let i = 0; i < nIn; i++) {
+          const k = o * MATRIX_MAX + i;
+          const g0 = cur[k];
+          const g1 = tgt[k];
+          cur[k] = g1;
+          // Nothing to add, and nothing to ramp: skip the crossing entirely.
+          // A 16×16 matrix is 256 crossings and a patch typically uses a
+          // handful, so this branch is most of the block's performance.
+          if (g0 === 0 && g1 === 0) continue;
+          const src = ins[inNames[i]];
+          if (!src) continue;
+          const step = (g1 - g0) * inv;
+          const cw = Math.min(w, src.length);
+          for (let c = 0; c < cw; c++) {
+            const s = src[c];
+            const d = dst[c];
+            for (let j = 0; j < n; j++) d[j] += s[j] * (g0 + step * j) * g;
+          }
+        }
+      }
+      // Crossings outside the live counts still have to settle, or shrinking
+      // the matrix and growing it again would resume mid-ramp.
+      for (let o = nOut; o < MATRIX_MAX; o++)
+        for (let i = 0; i < MATRIX_MAX; i++) cur[o * MATRIX_MAX + i] = tgt[o * MATRIX_MAX + i];
     },
   };
 });
@@ -3600,6 +4103,15 @@ registerKernel('delay', (params, _sv) => {
   const buf = stereo();
   const MAXD = 4;
   let ring: StereoBuf | null = null;
+  /**
+   * Rate the ring was sized for. The ring holds MAXD *seconds*, so its length
+   * is rate-dependent: sized once at 48 kHz and then run at 96 kHz, the same
+   * block silently offers only half its advertised maximum delay (the `dSamp`
+   * clamp below absorbs the rest without complaining). Resize on a rate change
+   * — it allocates, but a rate change has already interrupted the stream, and
+   * the alternative is a Time knob whose top half does nothing.
+   */
+  let ringSr = 0;
   let widx = 0;
   const time = new Smooth(num(params.time, 0.35), 0.05);
   const fb = new Smooth(num(params.feedback, 0.35));
@@ -3612,7 +4124,11 @@ registerKernel('delay', (params, _sv) => {
       else if (id === 'mix') mix.set(num(v, 0.3));
     },
     process: (ins, ctx) => {
-      if (!ring) ring = [new Float32Array(MAXD * ctx.sr + 8), new Float32Array(MAXD * ctx.sr + 8)];
+      if (!ring || ringSr !== ctx.sr) {
+        ringSr = ctx.sr;
+        ring = [new Float32Array(MAXD * ctx.sr + 8), new Float32Array(MAXD * ctx.sr + 8)];
+        widx = 0;
+      }
       const len = ring[0].length;
       const dSamp = Math.min(len - 2, time.step(ctx) * ctx.sr);
       const f = fb.step(ctx);
@@ -3696,6 +4212,23 @@ registerKernel('feedback', (params) => {
     dcY.fill(0);
   };
 
+  /**
+   * The `trapNonFinite` purge: same clearing as `allocRing`, but in place —
+   * this one runs from the audio path, so it must not allocate.
+   *
+   * This block is the most exposed of any: it exists to be wired into a loop,
+   * and with `limit` off an `amount` near 1 lets a loop grow without bound
+   * until it reaches Infinity. That is the "works for a while, then the block
+   * goes dead" path, and it needs no bad input sample at all.
+   */
+  const purge = (): void => {
+    if (ring) for (const c of ring) c.fill(0);
+    widx = 0;
+    lpS.fill(0);
+    dcX.fill(0);
+    dcY.fill(0);
+  };
+
   return {
     out: () => buf,
     setWidth: (_port, w) => {
@@ -3761,6 +4294,7 @@ registerKernel('feedback', (params) => {
         dcY[c] = py;
       }
       widx = w;
+      trapNonFinite(buf, ctx.n, purge);
     },
   };
 });
@@ -3917,6 +4451,19 @@ class ConvFFT {
  * `K = 2H`; the IR is split into `P` partitions of `H` samples. Latency is one
  * hop. `process` bridges the variable quantum to the fixed hop with input/output
  * ring FIFOs and never allocates.
+ *
+ * **The partition sum is spread across the hop, not done at the hop.** The
+ * textbook loop accumulates all `P` partitions in the quantum that happens to
+ * complete a hop and nothing in the others, so the block's *peak* per-quantum
+ * cost is `H / n` times its average — at 96 kHz with a 1 s IR that measured as
+ * `loadMax` 2.0 against an average of 0.5, i.e. every hop quantum overran its
+ * budget twice over while the engine looked 50 % idle. That is the diagnostic
+ * signature this was found by (`load` ~0.08, `loadMax` 2.1–2.8, `late` climbing).
+ *
+ * Only the p = 0 term needs the newest input spectrum, so terms p ≥ 1 are
+ * accumulated into `pendRe/pendIm` a few partitions per quantum during the
+ * preceding hop period, and the hop itself costs one partition plus the two
+ * transforms. Same arithmetic, same output, flat cost.
  */
 class ConvChannel {
   private readonly H: number;
@@ -3926,7 +4473,8 @@ class ConvChannel {
   private irRe: Float32Array[] = [];
   private irIm: Float32Array[] = [];
   private P = 0;
-  // Input-spectrum delay line (circular, P entries of K).
+  // Input-spectrum delay line (circular, P entries of K). `xHead` is the next
+  // write slot.
   private xRe: Float32Array[] = [];
   private xIm: Float32Array[] = [];
   private xHead = 0;
@@ -3936,6 +4484,16 @@ class ConvChannel {
   private accRe: Float32Array;
   private accIm: Float32Array;
   private prevTail: Float32Array; // last H input samples (overlap-save history)
+  // Running sum of partitions p ≥ 1 for the NEXT hop, paid down a few
+  // partitions per quantum (see the class comment).
+  private pendRe: Float32Array;
+  private pendIm: Float32Array;
+  /** Delay-line index of the newest spectrum when this spread phase began. */
+  private spreadHead = 0;
+  /** Next `q` to fold: partition `q + 1` against `X[spreadHead - q]`. */
+  private spreadNext = 0;
+  /** Partitions owed but not yet folded, fractional. */
+  private spreadDebt = 0;
   // FIFOs. Both are linear and compacted to index 0 each call, so there is no
   // modular wrap to get wrong; the sizes bound how far a single call can grow
   // them before the compaction at the end.
@@ -3943,6 +4501,8 @@ class ConvChannel {
   private inFill = 0;
   private outFifo: Float32Array;
   private outFill = 0; // valid samples at outFifo[0 .. outFill)
+  /** Quantum the output lead was primed for; -1 = not primed yet. */
+  private primedFor = -1;
 
   constructor(fft: ConvFFT, maxQuantum: number) {
     this.fft = fft;
@@ -3952,6 +4512,8 @@ class ConvChannel {
     this.blkIm = new Float32Array(this.K);
     this.accRe = new Float32Array(this.K);
     this.accIm = new Float32Array(this.K);
+    this.pendRe = new Float32Array(this.K);
+    this.pendIm = new Float32Array(this.K);
     this.prevTail = new Float32Array(this.H);
     this.inFifo = new Float32Array(2 * this.H + maxQuantum);
     this.outFifo = new Float32Array(4 * this.H + maxQuantum);
@@ -3981,16 +4543,55 @@ class ConvChannel {
     this.xHead = 0;
     this.inFill = 0;
     this.outFill = 0;
+    this.primedFor = -1;
     this.prevTail.fill(0);
+    this.pendRe.fill(0);
+    this.pendIm.fill(0);
+    this.spreadHead = 0;
+    this.spreadNext = this.P;
+    this.spreadDebt = 0;
   }
 
   get latency(): number { return this.H; }
   get active(): boolean { return this.P > 0; }
 
+  /**
+   * Fold up to `count` more of the outstanding p ≥ 1 partitions into `pend`.
+   *
+   * `q` counts from the newest spectrum of the *previous* hop, so partition
+   * `q + 1` pairs with `X[spreadHead - q]` and the sum ends at `q = P - 2`.
+   * The one slot the next hop overwrites is `q = P - 1`, which is never read
+   * here — that is what makes the sum safe to build ahead of time.
+   */
+  private fold(count: number): void {
+    const last = this.P - 1;
+    if (this.spreadNext >= last) return;
+    const K = this.K;
+    const end = Math.min(last, this.spreadNext + count);
+    const pr = this.pendRe;
+    const pm = this.pendIm;
+    for (let q = this.spreadNext; q < end; q++) {
+      let xi = this.spreadHead - q;
+      if (xi < 0) xi += this.P;
+      const xr = this.xRe[xi];
+      const xm = this.xIm[xi];
+      const hr = this.irRe[q + 1];
+      const hm = this.irIm[q + 1];
+      for (let k = 0; k < K; k++) {
+        pr[k] += xr[k] * hr[k] - xm[k] * hm[k];
+        pm[k] += xr[k] * hm[k] + xm[k] * hr[k];
+      }
+    }
+    this.spreadNext = end;
+  }
+
   /** One overlap-save hop: consumes H input samples, produces H output samples. */
   private hop(input: Float32Array, off: number, out: Float32Array, outOff: number): void {
     const H = this.H;
     const K = this.K;
+    // Whatever the spread didn't get to belongs to THIS hop's sum. Normally a
+    // no-op; it is what makes correctness independent of the quantum size.
+    this.fold(this.P);
     const re = this.blk;
     const im = this.blkIm;
     // Block = [prev H tail | new H samples]; zero the imaginary part.
@@ -4001,35 +4602,68 @@ class ConvChannel {
     for (let i = 0; i < H; i++) this.prevTail[i] = input[off + i];
     this.fft.transform(re, im, false);
     // Store into the circular input-spectrum delay line.
-    this.xRe[this.xHead].set(re);
-    this.xIm[this.xHead].set(im);
-    // Accumulate Y = sum_p X[head-p] * IR[p].
-    this.accRe.fill(0);
-    this.accIm.fill(0);
-    for (let p = 0; p < this.P; p++) {
-      let xi = this.xHead - p;
-      if (xi < 0) xi += this.P;
-      const xr = this.xRe[xi];
-      const xm = this.xIm[xi];
-      const hr = this.irRe[p];
-      const hm = this.irIm[p];
-      const ar = this.accRe;
-      const am = this.accIm;
-      for (let k = 0; k < K; k++) {
-        ar[k] += xr[k] * hr[k] - xm[k] * hm[k];
-        am[k] += xr[k] * hm[k] + xm[k] * hr[k];
-      }
+    const head = this.xHead;
+    this.xRe[head].set(re);
+    this.xIm[head].set(im);
+    this.xHead = head + 1 >= this.P ? 0 : head + 1;
+    // Y = (partitions 1..P-1, accumulated over the last hop period) + X*IR[0].
+    const ar = this.accRe;
+    const am = this.accIm;
+    const pr = this.pendRe;
+    const pm = this.pendIm;
+    const hr = this.irRe[0];
+    const hm = this.irIm[0];
+    for (let k = 0; k < K; k++) {
+      ar[k] = pr[k] + re[k] * hr[k] - im[k] * hm[k];
+      am[k] = pm[k] + re[k] * hm[k] + im[k] * hr[k];
     }
-    this.xHead = this.xHead + 1 >= this.P ? 0 : this.xHead + 1;
-    this.fft.transform(this.accRe, this.accIm, true);
+    this.fft.transform(ar, am, true);
     // Overlap-save: the valid linear-convolution output is the last H samples.
-    for (let i = 0; i < H; i++) out[outOff + i] = this.accRe[H + i];
+    for (let i = 0; i < H; i++) out[outOff + i] = ar[H + i];
+    // Restart the spread for the next hop against the spectrum just stored.
+    pr.fill(0);
+    pm.fill(0);
+    this.spreadHead = head;
+    this.spreadNext = 0;
+    this.spreadDebt = 0;
   }
 
   /** Convolve `n` input samples → `dst` (dry not mixed here). */
   process(input: Float32Array, dst: Float32Array, n: number): void {
     if (!this.active) { for (let i = 0; i < n; i++) dst[i] = 0; return; }
     const H = this.H;
+    /**
+     * **Prime the output lead, rather than discovering it by dropping out.**
+     *
+     * Hops arrive `H` samples at a time and quanta leave `n` at a time, so the
+     * output FIFO runs `k·n mod H` samples short — worst case `H - gcd(n, H)`.
+     * The zero-fill at the bottom of this method covers a short read, and when
+     * the quantum divides the hop (128 into 256, the usual case) the whole
+     * shortfall is paid in the first few quanta and never recurs, which is why
+     * this looked fine. When it does NOT divide — a WASAPI endpoint handing
+     * back 300 or 441 frames — the shortfall recurs with a long period, so the
+     * block sprays silence gaps through the audio for ~30 quanta before the
+     * lead converges, and every IR reload does it again. Against a direct
+     * convolution that reads as an rms error of 1.2 (i.e. unrecognisable).
+     *
+     * Priming the exact lead up front makes the first quantum the only one that
+     * is ever short. It is not a new latency: it is the same lead the block
+     * already ended up with, minus the dropouts on the way. For quanta that
+     * divide the hop the figure is identical to before.
+     */
+    if (this.primedFor !== n) {
+      this.primedFor = n;
+      let a = n;
+      let b = H;
+      while (b) { const t = a % b; a = b; b = t; }
+      const lead = H - a; // H - gcd(n, H)
+      if (this.outFill < lead) {
+        const add = lead - this.outFill;
+        this.outFifo.copyWithin(add, 0, this.outFill);
+        this.outFifo.fill(0, 0, add);
+        this.outFill = lead;
+      }
+    }
     // Push input into the FIFO.
     for (let i = 0; i < n; i++) this.inFifo[this.inFill++] = input[i];
     // Drain whole hops, each appending H samples to the (linear) output FIFO.
@@ -4052,7 +4686,186 @@ class ConvChannel {
       this.outFifo.copyWithin(0, take, this.outFill);
       this.outFill -= take;
     }
+    // Pay down the next hop's partition sum in proportion to the samples that
+    // just went by. Rounding up costs nothing (folding early is always safe;
+    // folding late is what `hop` guards against), and a quantum at least a hop
+    // long has nothing to spread over anyway.
+    if (this.P > 1) {
+      this.spreadDebt += (n * (this.P - 1)) / H;
+      const due = this.spreadDebt | 0;
+      if (due > 0) {
+        this.spreadDebt -= due;
+        this.fold(due);
+      }
+    }
   }
+}
+
+/**
+ * **The hop scales with the sample rate.** It used to be a fixed 256 samples,
+ * which makes a partitioned convolver's cost grow with the *square* of the
+ * rate: the IR is resampled up so it needs twice the partitions, and a fixed
+ * hop means twice as many hops per second to spend them on. Measured at n = 128
+ * with a 1 s IR, average load went 0.127 at 48 kHz → 0.513 at 96 kHz — 4× for
+ * 2× the rate, while the per-quantum budget halved. That is the whole of "it
+ * pops more at higher sample rates" for any patch with a Convolution in it.
+ *
+ * Holding the hop *period* fixed instead (256 samples at 48 kHz ≈ 5.3 ms) keeps
+ * the partition count and the hop rate constant, so cost is linear in the
+ * sample rate like every other block. The trade is latency at rates above
+ * 48 kHz: one hop, so 5.3 ms rather than 2.7 ms at 96 kHz — the same figure
+ * 48 kHz has always had, and cheap next to a dropout.
+ *
+ * Module-scoped because `speaker-rig`'s correction filters obey the same rule
+ * for the same reason; two copies of it is how one of them ends up quadratic.
+ */
+const REF_HOP = 256;
+const REF_SR = 48000;
+const hopFor = (rate: number): number => {
+  const want = (rate * REF_HOP) / REF_SR;
+  const pow = Math.round(Math.log2(Math.max(1, want)));
+  return Math.max(128, Math.min(2048, 1 << pow));
+};
+
+// ---- Speaker correction filters (the Rig tab's Calibrate) -----------------
+
+/** Scratch for `buildCalIR`. Module-scoped and reused: a rig rebuild walks
+ *  every speaker in a row, and minting two 8 k float arrays per speaker is
+ *  garbage on the engine's loop (which is the audio pump's loop). */
+let calFft: ConvFFT | null = null;
+let calRe = new Float32Array(0);
+let calIm = new Float32Array(0);
+const calScratch = (n: number): ConvFFT => {
+  if (!calFft || calFft.n !== n) {
+    calFft = new ConvFFT(n);
+    calRe = new Float32Array(n);
+    calIm = new Float32Array(n);
+  }
+  return calFft;
+};
+
+/**
+ * Minimum-phase FIR realising one speaker's calibration, at the engine rate.
+ *
+ * Three separate corrections come out as **one impulse response**, which is
+ * why this block needs no delay line, no per-speaker gain smoothing and no
+ * extra state beyond the convolver itself:
+ *
+ * - the **correction curve** becomes the filter's magnitude;
+ * - the **level trim** is a scalar on the taps;
+ * - the **alignment delay** is where in the buffer the taps start.
+ *
+ * ### Why minimum phase
+ *
+ * A linear-phase inversion of a measured magnitude sounds "correct" and costs
+ * half the filter length in latency — 10 ms on a 1024-tap filter, on the
+ * monitoring path, added to every speaker. Worse, it has a *pre-ringing* skirt
+ * ahead of the transient, which is the one artefact a room never produces and
+ * the ear is unusually good at hearing. Minimum phase puts all the energy at
+ * the front: the filter's own delay is a fraction of a millisecond, so the only
+ * latency the correction costs is the convolver's one hop, and the alignment
+ * delay above stays the honest measured number rather than being tangled up
+ * with the filter's own.
+ *
+ * It is built by the standard real-cepstrum route: take ln|H| on a symmetric
+ * grid, inverse-transform to the cepstrum, fold the anticausal half onto the
+ * causal one (that is what makes it minimum phase), transform back and
+ * exponentiate.
+ *
+ * Returns null if the maths produced anything non-finite. That check is not
+ * decoration: a NaN *in an FIR's taps* is not the recoverable case
+ * `trapNonFinite` handles — flushing the convolver's history reinstates it from
+ * the filter on the very next sample, so the block would go silent and stay
+ * silent (docs/10 rule 4, and the same reasoning as `conv`'s `buildIR` scrub).
+ * Refusing the filter leaves the speaker uncorrected, which is merely wrong
+ * rather than dead.
+ */
+export function buildCalIR(cal: SpeakerCal, sr: number): Float32Array | null {
+  if (!(sr > 0)) return null;
+  // Design grid. Bigger at high rates so the resolution in *hertz* stays put:
+  // 4096 bins at 48 kHz is 11.7 Hz, which is already coarse at the bottom of
+  // the curve, and halving it again at 96 kHz would smear the whole bass.
+  const N = sr > 60000 ? 8192 : 4096;
+  // Tap count scales with the rate, so the filter is the same 10.7 ms at every
+  // rate rather than the same number of samples (docs/10: never fix a filter
+  // length in samples). Bounded by N/4 — the cepstrum needs headroom above the
+  // impulse it is designing, or the fold aliases in time.
+  const taps = Math.max(256, Math.min(N >> 2, Math.round((512 * sr) / 48000)));
+  const shift = Math.max(0, Math.min(N >> 2, Math.round(cal.delay * sr)));
+  const fft = calScratch(N);
+  const re = calRe;
+  const im = calIm;
+  const half = N >> 1;
+  const lastF = CAL_F0 * Math.pow(2, (CAL_N - 1) / CAL_PPO);
+  const corr = cal.corr;
+  // 1. ln|H| on a symmetric grid, interpolated from the log-spaced curve. Held
+  //    flat below the first grid point and above the last: the curve is already
+  //    tapered to 0 dB at both ends, so "flat" here means "unity", i.e. leave
+  //    those bands alone rather than extrapolate a correction into them.
+  for (let k = 0; k <= half; k++) {
+    const f = (k * sr) / N;
+    let db: number;
+    if (f <= CAL_F0) db = corr[0];
+    else if (f >= lastF) db = corr[CAL_N - 1];
+    else {
+      const g = Math.log2(f / CAL_F0) * CAL_PPO;
+      const i0 = g | 0;
+      const t = g - i0;
+      db = corr[i0] + (corr[i0 + 1] - corr[i0]) * t;
+    }
+    const ln = (db / 20) * Math.LN10;
+    re[k] = ln;
+    im[k] = 0;
+    if (k > 0 && k < half) {
+      re[N - k] = ln;
+      im[N - k] = 0;
+    }
+  }
+  // 2. Real cepstrum, folded onto the causal half.
+  fft.transform(re, im, true);
+  for (let k = 1; k < half; k++) {
+    re[k] *= 2;
+    im[k] *= 2;
+  }
+  for (let k = half + 1; k < N; k++) {
+    re[k] = 0;
+    im[k] = 0;
+  }
+  // 3. Back to a spectrum, exponentiate, and down to the impulse.
+  fft.transform(re, im, false);
+  for (let k = 0; k < N; k++) {
+    const m = Math.exp(re[k]);
+    re[k] = m * Math.cos(im[k]);
+    im[k] = m * Math.sin(im[k]);
+  }
+  fft.transform(re, im, true);
+  // 4. Truncate with a fade (a hard cut rings), trim, and place at the delay.
+  const out = new Float32Array(taps + shift);
+  const fadeFrom = (taps * 0.75) | 0;
+  for (let i = 0; i < taps; i++) {
+    const w = i < fadeFrom ? 1 : 0.5 + 0.5 * Math.cos((Math.PI * (i - fadeFrom)) / (taps - fadeFrom));
+    const v = re[i] * w * cal.gain;
+    if (!Number.isFinite(v)) return null;
+    out[shift + i] = v;
+  }
+  return out;
+}
+
+/** Cheap change-detector for a speaker's calibration.
+ *
+ * A rig edit reaches the engine as `set-param` on **every pointer-move of a
+ * drag** (docs/04), so "has this speaker's filter changed" is asked ~60 times a
+ * second per speaker. Comparing the curves by `join(',')` would mint kilobytes
+ * of string per frame on the engine's loop; this is a few hundred multiply-adds
+ * and allocates nothing. Collisions cost a filter that is one calibration
+ * stale, never a wrong-length or non-finite one. */
+function calHash(cal: SpeakerCal | undefined): number {
+  if (!cal) return 0;
+  let h = 0x811c9dc5;
+  h = (h * 16777619) ^ Math.round(cal.gain * 1e4);
+  h = (h * 16777619) ^ Math.round(cal.delay * 1e6);
+  for (let i = 0; i < cal.corr.length; i++) h = (h * 16777619) ^ Math.round(cal.corr[i] * 100);
+  return h | 0;
 }
 
 /**
@@ -4069,10 +4882,12 @@ class ConvChannel {
  */
 registerKernel('conv', (params, sv) => {
   const buf = stereo();
-  const FFT_K = 512;
   const MAX_IR_SEC = 4;
-  const fft = new ConvFFT(FFT_K);
-  const chans = [new ConvChannel(fft, MAXQ), new ConvChannel(fft, MAXQ)];
+  // The hop scales with the sample rate — see `hopFor` above for the
+  // measurements that forced it.
+  let hop = REF_HOP;
+  let fft = new ConvFFT(hop * 2);
+  let chans = [new ConvChannel(fft, MAXQ), new ConvChannel(fft, MAXQ)];
   const wet = [new Float32Array(MAXQ), new Float32Array(MAXQ)];
   const mix = new Smooth(num(params.mix, 0.5));
   const gain = new Smooth(num(params.gain, 1));
@@ -4104,6 +4919,13 @@ registerKernel('conv', (params, sv) => {
   /** (Re)build the per-channel convolvers from the pending IR at the current
    *  engine rate. One-time allocation on IR/sr change, never steady state. */
   const buildIR = (): void => {
+    // Re-size the transform if the engine rate moved us to a different hop.
+    // Same place, and the same one-time cost, as building the partitions.
+    if (sr > 0 && hopFor(sr) !== hop) {
+      hop = hopFor(sr);
+      fft = new ConvFFT(hop * 2);
+      chans = [new ConvChannel(fft, MAXQ), new ConvChannel(fft, MAXQ)];
+    }
     const ir = pendingIR;
     if (!ir || sr <= 0) {
       chans[0].setIR(null);
@@ -4111,13 +4933,19 @@ registerKernel('conv', (params, sv) => {
       return;
     }
     const irCh = ir.channels.map((c) => resample(c, ir.sampleRate, sr));
+    // A non-finite sample in the IR is permanent in a way no audio-path trap
+    // can undo: it is not passing history, it is the filter itself, so every
+    // output for the rest of the session is NaN and resetting the convolver
+    // reinstates it. A truncated download or a malformed WAV is enough. This is
+    // the load path, so the scan is free — do it here, once, where it sticks.
+    for (const c of irCh) for (let i = 0; i < c.length; i++) if (!Number.isFinite(c[i])) c[i] = 0;
     // Energy normalization: keep the wet output near unity regardless of IR
     // length/level. Sum of squares across the (resampled) IR, one scalar.
     let scale = 1;
     if (normalize) {
       let energy = 0;
       for (const c of irCh) for (let i = 0; i < c.length; i++) energy += c[i] * c[i];
-      scale = energy > 1e-9 ? 1 / Math.sqrt(energy) : 1;
+      scale = energy > 1e-9 && Number.isFinite(energy) ? 1 / Math.sqrt(energy) : 1;
     }
     if (scale !== 1) for (const c of irCh) for (let i = 0; i < c.length; i++) c[i] *= scale;
     // Mono IR → both output channels share it; stereo+ → channel-wise.
@@ -4209,6 +5037,17 @@ registerKernel('reverb', (params) => {
     const t = Math.max(0, Math.min(1, Math.log(tone / 400) / Math.log(16000 / 400)));
     damp = 0.85 - t * 0.83;
   };
+  /**
+   * The `trapNonFinite` purge. Eight combs and four allpasses all feed
+   * themselves, and the predelay ring is up to 0.2 s long — the tail is
+   * *entirely* history, so anything left behind comes back.
+   */
+  const purge = (): void => {
+    for (const ch of combs) for (const c of ch) { c.buf.fill(0); c.idx = 0; c.store = 0; }
+    for (const ch of aps) for (const a of ch) { a.buf.fill(0); a.idx = 0; }
+    if (preRing) for (const r of preRing) r.fill(0);
+    preIdx[0] = preIdx[1] = 0;
+  };
   return {
     out: () => buf,
     setParam: (id, v) => {
@@ -4266,6 +5105,7 @@ registerKernel('reverb', (params) => {
         }
         preIdx[ch] = pi;
       }
+      trapNonFinite(buf, ctx.n, purge);
     },
   };
 });
@@ -4345,21 +5185,40 @@ registerKernel('eq-curve', (params) => {
   const TYPES = ['bell', 'lowshelf', 'highshelf', 'highpass', 'lowpass', 'notch', 'bandpass', 'allpass'];
   const usesGain = (t: string): boolean => t === 'bell' || t === 'lowshelf' || t === 'highshelf';
   const P: Record<string, ParamValue> = { ...params };
-  const out = stereo();
-  const A = new Float32Array(MAXQ);
-  const B = new Float32Array(MAXQ);
   const detBuf = new Float32Array(MAXQ);
   const hist = new Float32Array(1024);
-  const bqA = Array.from({ length: NB }, () => new Biquad());
-  const bqB = Array.from({ length: NB }, () => new Biquad());
   const det = Array.from({ length: NB }, () => new Biquad());
   const denv = new Float32Array(NB);
   const dynAdd = new Float32Array(NB);
-  const soloL = new Biquad();
-  const soloR = new Biquad();
-  const tiltLoA = new Biquad(), tiltHiA = new Biquad(), tiltLoB = new Biquad(), tiltHiB = new Biquad();
   let sr0 = 0;
   let level: [number, number] = [0, 0];
+
+  /**
+   * **Bus width.** This kernel was stereo-only: `out` was a 2-channel buffer and
+   * `process` read `ins.in[0]`/`[1]`. The graph writes `min(out.length,
+   * net.width)` channels of a net, so an EQ Curve dropped into a surround chain
+   * did not "collapse to stereo" — it left every channel above the second
+   * **silent**. On a 7.1 bus that is six dead speakers with the front pair still
+   * playing, which is why it reads as the EQ garbling the mix rather than as a
+   * width bug. Golden rule 15's principle: a per-channel effect applies to every
+   * channel of the bus, or to none.
+   *
+   * Channels 0 and 1 are the A/B pair the modes are defined on — Mid-Side
+   * encodes across exactly those two, because M/S is a statement about a stereo
+   * pair and nothing else. **Every channel above them is another bus-A
+   * channel**: same coefficients, its own filter state. So a band left on `both`
+   * (the default) shapes the whole rig identically and the image survives, while
+   * a band routed to `a`/`b` still means the pair.
+   */
+  let width = 2;
+  let out = allocBuf(width);
+  /** Per-channel working buses. Sized at MAXQ, rebuilt only on a width change. */
+  let work: Float32Array[] = [];
+  /** `bq[channel][band]` — one design, per-channel state. */
+  let bq: Biquad[][] = [];
+  let tiltLo: Biquad[] = [];
+  let tiltHi: Biquad[] = [];
+  let soloBq: Biquad[] = [];
 
   const bnum = (id: string, d: number): number => (typeof P[id] === 'number' ? (P[id] as number) : d);
   const bandEn = (n: number): boolean => (P['e' + (n + 1)] === undefined ? n < 4 : P['e' + (n + 1)] === true);
@@ -4368,25 +5227,67 @@ registerKernel('eq-curve', (params) => {
   const fShift = (): number => Math.pow(2, bnum('freqShift', 0));
   const modeIdx = (): number => (P.mode === 'Mid-Side' ? 1 : P.mode === 'Left-Right' ? 2 : 0);
   const bandF = (n: number): number => Math.max(20, Math.min(20000, bnum('f' + (n + 1), DEF_F[n] ?? 1000) * fShift()));
+  /** Which bus a channel answers to. 1 is B; 0 and everything above are A. */
+  const busOf = (c: number): string => (c === 1 ? 'b' : 'a');
+  const onChan = (bn: number, c: number, mode: number): boolean => {
+    if (mode === 0) return true;
+    const ch = bandCh(bn);
+    return ch === 'both' || ch === busOf(c);
+  };
 
   const setBand = (n: number, sr: number): void => {
     const type = bandType(n);
     const f = bandF(n);
     const q = bnum('q' + (n + 1), 1);
     const g = usesGain(type) ? bnum('g' + (n + 1), 0) * bnum('gainScale', 1) + dynAdd[n] : 0;
-    bqA[n].setType(type, sr, f, g, q);
-    bqB[n].setType(type, sr, f, g, q);
+    for (let c = 0; c < bq.length; c++) bq[c][n].setType(type, sr, f, g, q);
     det[n].setType('bandpass', sr, f, 0, Math.max(0.7, q));
   };
   const setTilt = (sr: number): void => {
     const t = bnum('tilt', 0);
-    tiltLoA.setType('lowshelf', sr, 1000, -t, 0.5); tiltHiA.setType('highshelf', sr, 1000, t, 0.5);
-    tiltLoB.setType('lowshelf', sr, 1000, -t, 0.5); tiltHiB.setType('highshelf', sr, 1000, t, 0.5);
+    for (let c = 0; c < tiltLo.length; c++) {
+      tiltLo[c].setType('lowshelf', sr, 1000, -t, 0.5);
+      tiltHi[c].setType('highshelf', sr, 1000, t, 0.5);
+    }
   };
   const reinit = (sr: number): void => { for (let n = 0; n < NB; n++) setBand(n, sr); setTilt(sr); };
+  /**
+   * Sample-rate change: redesign every filter AND drop its state. The state of
+   * a recursive filter is only meaningful against the coefficients that
+   * produced it, so carrying 48 kHz history into 96 kHz coefficients is a
+   * transient with no defined size — and if that history is non-finite (a
+   * driver hiccup, an over-size quantum) it would otherwise survive the very
+   * rate change the user made to escape it. A rate change already interrupts
+   * the stream, so there is no click to protect here.
+   */
+  const rateChanged = (sr: number): void => {
+    for (let n = 0; n < NB; n++) { det[n].reset(); denv[n] = 0; dynAdd[n] = 0; }
+    for (let c = 0; c < width; c++) {
+      for (let n = 0; n < NB; n++) bq[c][n].reset();
+      tiltLo[c].reset(); tiltHi[c].reset(); soloBq[c].reset();
+    }
+    reinit(sr);
+  };
+  /** (Re)build every per-channel bank. Set-graph time only — never `process`. */
+  const build = (): void => {
+    out = allocBuf(width);
+    work = Array.from({ length: width }, () => new Float32Array(MAXQ));
+    bq = Array.from({ length: width }, () => Array.from({ length: NB }, () => new Biquad()));
+    tiltLo = Array.from({ length: width }, () => new Biquad());
+    tiltHi = Array.from({ length: width }, () => new Biquad());
+    soloBq = Array.from({ length: width }, () => new Biquad());
+    if (sr0) reinit(sr0);
+  };
+  build();
 
   return {
     out: () => out,
+    setWidth: (_port, w) => {
+      const nw = Math.max(2, Math.min(MAXCH, Math.round(w)));
+      if (nw === width) return;
+      width = nw;
+      build();
+    },
     visualTime: hist,
     visualLevel: () => level,
     setParam: (id, v) => {
@@ -4400,28 +5301,54 @@ registerKernel('eq-curve', (params) => {
     },
     process: (ins, ctx) => {
       const n = ctx.n;
-      if (sr0 !== ctx.sr) { sr0 = ctx.sr; reinit(ctx.sr); }
-      const inL = ins.in?.[0];
-      const inR = ins.in?.[1] ?? inL;
+      if (sr0 !== ctx.sr) { sr0 = ctx.sr; rateChanged(ctx.sr); }
+      const src = ins.in;
+      const in0 = src?.[0];
+      const in1 = src?.[1] ?? in0;
       const mode = modeIdx();
-      // Encode input into the two working buses.
+      // Encode. Mid-Side is a statement about the front pair, so it encodes
+      // channels 0/1 only; the rest of a wide bus passes into its own bus.
       if (mode === 1) {
-        for (let i = 0; i < n; i++) { const l = inL ? inL[i] : 0, r = inR ? inR[i] : 0; A[i] = 0.5 * (l + r); B[i] = 0.5 * (l - r); }
+        const a = work[0], b = work[1];
+        for (let i = 0; i < n; i++) {
+          const l = in0 ? in0[i] : 0, r = in1 ? in1[i] : 0;
+          a[i] = 0.5 * (l + r);
+          b[i] = 0.5 * (l - r);
+        }
       } else {
-        for (let i = 0; i < n; i++) { A[i] = inL ? inL[i] : 0; B[i] = inR ? inR[i] : 0; }
+        for (let c = 0; c < 2; c++) {
+          const s = c === 0 ? in0 : in1;
+          const w = work[c];
+          if (s) for (let i = 0; i < n; i++) w[i] = s[i];
+          else w.fill(0, 0, n);
+        }
       }
-      // Solo: audition one band as a bandpass of the dry input.
+      for (let c = 2; c < width; c++) {
+        const s = src?.[c];
+        const w = work[c];
+        if (s) for (let i = 0; i < n; i++) w[i] = s[i];
+        else w.fill(0, 0, n);
+      }
+      // Solo: audition one band as a bandpass of the dry input, on every channel
+      // — soloing a band must not also mute the surround channels.
       const solo = Math.round(bnum('solo', 0));
       if (solo > 0 && solo <= NB) {
         const f = bandF(solo - 1);
         const q = bnum('q' + solo, 1);
-        soloL.setType('bandpass', ctx.sr, f, 0, q); soloR.setType('bandpass', ctx.sr, f, 0, q);
-        for (let i = 0; i < n; i++) { out[0][i] = inL ? inL[i] : 0; out[1][i] = inR ? inR[i] : 0; }
-        soloL.process(out[0], n); soloR.process(out[1], n);
+        for (let c = 0; c < width; c++) {
+          soloBq[c].setType('bandpass', ctx.sr, f, 0, q);
+          const s = c === 0 ? in0 : c === 1 ? in1 : src?.[c];
+          const o = out[c];
+          if (s) for (let i = 0; i < n; i++) o[i] = s[i];
+          else o.fill(0, 0, n);
+          soloBq[c].process(o, n);
+        }
         pushHistory(hist, out, n);
         return;
       }
-      // Dynamic EQ: per band, detect band-region energy and move its gain.
+      // Dynamic EQ: per band, detect band-region energy and move its gain. One
+      // detector per band drives every channel — a linked move, so a dynamic
+      // band cannot pull the rig's channels apart from each other.
       const att = 1 - Math.exp(-1 / (Math.max(0.0005, bnum('dynAtt', 0.01)) * ctx.sr));
       const rel = 1 - Math.exp(-1 / (Math.max(0.005, bnum('dynRel', 0.15)) * ctx.sr));
       for (let bn = 0; bn < NB; bn++) {
@@ -4430,8 +5357,8 @@ registerKernel('eq-curve', (params) => {
           if (dynAdd[bn] !== 0) { dynAdd[bn] = 0; setBand(bn, ctx.sr); }
           continue;
         }
-        const src = mode === 0 || bandCh(bn) !== 'b' ? A : B;
-        for (let i = 0; i < n; i++) detBuf[i] = src[i];
+        const dsrc = mode === 0 || bandCh(bn) !== 'b' ? work[0] : work[1];
+        for (let i = 0; i < n; i++) detBuf[i] = dsrc[i];
         det[bn].process(detBuf, n);
         let e = denv[bn];
         for (let i = 0; i < n; i++) { const x = Math.abs(detBuf[i]); e += (x > e ? att : rel) * (x - e); }
@@ -4443,23 +5370,34 @@ registerKernel('eq-curve', (params) => {
       // Bands.
       for (let bn = 0; bn < NB; bn++) {
         if (!bandEn(bn)) continue;
-        const ch = bandCh(bn);
-        if (mode === 0 || ch !== 'b') bqA[bn].process(A, n);
-        if (mode === 0 || ch !== 'a') bqB[bn].process(B, n);
+        for (let c = 0; c < width; c++) if (onChan(bn, c, mode)) bq[c][bn].process(work[c], n);
       }
-      if (bnum('tilt', 0)) { tiltLoA.process(A, n); tiltHiA.process(A, n); tiltLoB.process(B, n); tiltHiB.process(B, n); }
+      if (bnum('tilt', 0)) for (let c = 0; c < width; c++) { tiltLo[c].process(work[c], n); tiltHi[c].process(work[c], n); }
       // Decode → dry/wet mix → output gain.
       const outGain = dB(bnum('output', 0));
       const mix = Math.max(0, Math.min(1, bnum('mix', 100) / 100));
+      const dry = 1 - mix;
+      const wetG = outGain * mix;
+      for (let c = 0; c < width; c++) {
+        const o = out[c];
+        const d = c === 0 ? in0 : c === 1 ? in1 : src?.[c];
+        if (mode === 1 && c < 2) {
+          const a = work[0], b = work[1];
+          const sgn = c === 0 ? 1 : -1;
+          for (let i = 0; i < n; i++) o[i] = (d ? d[i] : 0) * dry + (a[i] + sgn * b[i]) * wetG;
+        } else {
+          const w = work[c];
+          for (let i = 0; i < n; i++) o[i] = (d ? d[i] : 0) * dry + w[i] * wetG;
+        }
+      }
       const oL = out[0], oR = out[1];
       let peak = 0, sum = 0, cnt = 0;
-      for (let i = 0; i < n; i++) {
-        let wl: number, wr: number;
-        if (mode === 1) { wl = A[i] + B[i]; wr = A[i] - B[i]; } else { wl = A[i]; wr = B[i]; }
-        const dl = inL ? inL[i] : 0, drr = inR ? inR[i] : 0;
-        oL[i] = dl * (1 - mix) + wl * outGain * mix;
-        oR[i] = drr * (1 - mix) + wr * outGain * mix;
-        if ((i & 3) === 0) { const x = Math.abs(oL[i]) > Math.abs(oR[i]) ? Math.abs(oL[i]) : Math.abs(oR[i]); sum += x * x; if (x > peak) peak = x; cnt++; }
+      for (let i = 0; i < n; i += 4) {
+        const al = Math.abs(oL[i]), ar = Math.abs(oR[i]);
+        const x = al > ar ? al : ar;
+        sum += x * x;
+        if (x > peak) peak = x;
+        cnt++;
       }
       level = [Math.sqrt(sum / (cnt || 1)), peak];
       pushHistory(hist, out, n);
@@ -4663,6 +5601,365 @@ registerKernel('cv-compare', logicKernel('cmp'));
 registerKernel('logic-not', logicKernel('not'));
 for (const op of ['and', 'or', 'xor', 'nand', 'nor'] as const)
   registerKernel('logic-' + op, logicKernel(op));
+
+// ===========================================================================
+// The modular voice — VCO / ladder VCF / EG / LFO / folder / S+H / slew.
+//
+// Mirrors `MODULAR_WORKLET` in `src/blocks/units.ts` sample-for-sample: same
+// phase accumulator, same polyBLEP, same ladder topology and coefficients,
+// same envelope segment maths. **Change one, change both** — these are meant
+// to be A/B comparable between the engines (docs/08-extending.md), and the two
+// implementations exist only because the web preview cannot run this file.
+//
+// Every exponential CV input is 1 volt per octave with 0 = "the knob", which is
+// the convention `midi-cv`'s pitch output already speaks (docs/02).
+//
+// All of them run per sample, output the same value on both channels the way
+// every other CV kernel here does, and allocate nothing.
+// ===========================================================================
+
+/** polyBLEP step correction — see the worklet copy for why it is here. */
+const blep = (t: number, dt: number): number => {
+  if (t < dt) {
+    const x = t / dt;
+    return x + x - x * x - 1;
+  }
+  if (t > 1 - dt) {
+    const x = (t - 1) / dt;
+    return x * x + x + x + 1;
+  }
+  return 0;
+};
+/** Period-4 triangle that is the identity on [−1, 1] — the folder's transfer. */
+const fold1 = (v: number): number => {
+  const p = (v + 1) * 0.25;
+  return 1 - 4 * Math.abs(p - Math.floor(p) - 0.5);
+};
+/** Padé tanh — the ladder's saturator, ~10× cheaper than Math.tanh. */
+const sat = (x: number): number => {
+  if (x > 3) return 1;
+  if (x < -3) return -1;
+  const x2 = x * x;
+  return (x * (27 + x2)) / (27 + 9 * x2);
+};
+/** One-pole coefficient for a time constant in seconds. 0 s = instant. */
+const lagK = (t: number, sr: number): number => (t > 0 ? 1 - Math.exp(-1 / (t * sr)) : 1);
+/** Write one mono value across every channel of a stereo CV buffer. */
+const cvWrite = (buf: Buf, i: number, v: number): void => {
+  buf[0][i] = v;
+  buf[1][i] = v;
+};
+
+registerKernel('vco', (params) => {
+  const buf = stereo();
+  let freq = num(params.freq, 261.626);
+  let shape = num(params.shape, 0);
+  let pw0 = num(params.pw, 0.5);
+  let level = num(params.level, 0.6);
+  let phase = 0;
+  let syncL = 0;
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'freq') freq = num(v, 261.626);
+      else if (id === 'shape') shape = num(v, 0);
+      else if (id === 'pw') pw0 = num(v, 0.5);
+      else if (id === 'level') level = num(v, 0.6);
+    },
+    process: (ins, ctx) => {
+      const A = ins.pitch;
+      const B = ins.pwm;
+      const C = ins.sync;
+      const fmax = ctx.sr * 0.48;
+      const [l, r] = buf;
+      for (let i = 0; i < ctx.n; i++) {
+        let f = freq * Math.pow(2, A ? A[0][i] : 0);
+        if (!(f > 0)) f = 0;
+        else if (f > fmax) f = fmax;
+        if (C) {
+          const s = C[0][i];
+          if (s > 0.5 && syncL <= 0.5) phase = 0;
+          syncL = s;
+        }
+        let pw = pw0 + (B ? B[0][i] : 0);
+        if (pw < 0.02) pw = 0.02;
+        else if (pw > 0.98) pw = 0.98;
+        const dt = f / ctx.sr;
+        const t = phase;
+        const saw = 2 * t - 1 - blep(t, dt);
+        let tp = t - pw;
+        if (tp < 0) tp += 1;
+        const pul = (t < pw ? 1 : -1) + blep(t, dt) - blep(tp, dt);
+        l[i] = r[i] = ((1 - shape) * saw + shape * pul) * level;
+        phase += dt;
+        if (phase >= 1) phase -= 1;
+      }
+    },
+  };
+});
+
+registerKernel('ladder', (params) => {
+  const buf = stereo();
+  let cutoff = num(params.cutoff, 1200);
+  let res = num(params.res, 0.15);
+  let drive = num(params.drive, 1);
+  // Four cascaded one-poles per channel, plus the half-sample feedback memory.
+  const s = [new Float64Array(4), new Float64Array(4)];
+  const s4p = [0, 0];
+  const reset = (): void => {
+    s[0].fill(0);
+    s[1].fill(0);
+    s4p[0] = s4p[1] = 0;
+  };
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'cutoff') cutoff = num(v, 1200);
+      else if (id === 'res') res = num(v, 0.15);
+      else if (id === 'drive') drive = num(v, 1);
+    },
+    process: (ins, ctx) => {
+      const A = ins.in;
+      const B = ins.cut;
+      const fmax = ctx.sr * 0.45;
+      const mk = 1 + res * 0.6;
+      const fb = res * 4;
+      let g = 1 - Math.exp((-2 * Math.PI * Math.min(fmax, Math.max(20, cutoff))) / ctx.sr);
+      for (let c = 0; c < 2; c++) {
+        const st = s[c];
+        const dst = buf[c];
+        const src = A ? A[Math.min(c, A.length - 1)] : null;
+        const cv = B ? B[0] : null;
+        let p4 = s4p[c];
+        for (let i = 0; i < ctx.n; i++) {
+          if (cv) {
+            let fc = cutoff * Math.pow(2, cv[i]);
+            if (!(fc > 20)) fc = 20;
+            else if (fc > fmax) fc = fmax;
+            g = 1 - Math.exp((-2 * Math.PI * fc) / ctx.sr);
+          }
+          const d = 0.5 * (st[3] + p4);
+          p4 = st[3];
+          const u = sat((src ? src[i] : 0) * drive * mk - fb * d);
+          st[0] += g * (u - st[0]);
+          st[1] += g * (st[0] - st[1]);
+          st[2] += g * (st[1] - st[2]);
+          st[3] += g * (st[2] - st[3]);
+          dst[i] = st[3];
+        }
+        s4p[c] = p4;
+      }
+      // Recursive state: one bad sample is otherwise permanent silence.
+      trapNonFinite(buf, ctx.n, reset);
+    },
+  };
+});
+
+registerKernel('wavefold', (params) => {
+  const buf = stereo();
+  let amount = num(params.amount, 0);
+  let sym = num(params.sym, 0);
+  let level = num(params.level, 1);
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'amount') amount = num(v, 0);
+      else if (id === 'sym') sym = num(v, 0);
+      else if (id === 'level') level = num(v, 1);
+    },
+    process: (ins, ctx) => {
+      const A = ins.in;
+      const B = ins.fold;
+      for (let c = 0; c < 2; c++) {
+        const dst = buf[c];
+        const src = A ? A[Math.min(c, A.length - 1)] : null;
+        const cv = B ? B[0] : null;
+        for (let i = 0; i < ctx.n; i++) {
+          let a = amount + (cv ? cv[i] : 0);
+          if (a < 0) a = 0;
+          else if (a > 1) a = 1;
+          dst[i] = fold1((src ? src[i] : 0) * (1 + a * 7) + sym * a) * level;
+        }
+      }
+    },
+  };
+});
+
+registerKernel('env-adsr', (params) => {
+  const out = stereo();
+  const inv = stereo();
+  let attack = num(params.attack, 0.005);
+  let decay = num(params.decay, 0.35);
+  let sustain = num(params.sustain, 0.6);
+  let release = num(params.release, 0.35);
+  let retrig = on(params.retrig);
+  let env = 0;
+  /** 0 idle · 1 attack · 2 decay/sustain · 3 release. */
+  let stage = 0;
+  let gate = false;
+  // Hoisted, not written inline at the `trapNonFinite` call: an arrow function
+  // defined inside `process` is a closure ALLOCATED ONCE PER QUANTUM — ~370 a
+  // second, straight into the GC that golden rule 1 exists to keep quiet.
+  const reset = (): void => {
+    env = 0;
+    stage = 0;
+  };
+  return {
+    out: (port) => (port === 'inv' ? inv : out),
+    setParam: (id, v) => {
+      if (id === 'attack') attack = num(v, 0.005);
+      else if (id === 'decay') decay = num(v, 0.35);
+      else if (id === 'sustain') sustain = num(v, 0.6);
+      else if (id === 'release') release = num(v, 0.35);
+      else if (id === 'retrig') retrig = on(v);
+    },
+    process: (ins, ctx) => {
+      const A = ins.gate;
+      const ka = lagK(attack, ctx.sr);
+      const kd = lagK(decay, ctx.sr);
+      const kr = lagK(release, ctx.sr);
+      for (let i = 0; i < ctx.n; i++) {
+        const hi = (A ? A[0][i] : 0) > 0.5;
+        if (hi && !gate) {
+          stage = 1;
+          if (retrig) env = 0;
+        } else if (!hi && gate) stage = 3;
+        gate = hi;
+        if (stage === 1) {
+          // Aiming past 1 is what makes an RC attack arrive at all.
+          env += (1.2 - env) * ka;
+          if (env >= 1) {
+            env = 1;
+            stage = 2;
+          }
+        } else if (stage === 2) env += (sustain - env) * kd;
+        else if (stage === 3) {
+          env -= env * kr;
+          if (env < 1e-5) {
+            env = 0;
+            stage = 0;
+          }
+        }
+        cvWrite(out, i, env);
+        cvWrite(inv, i, 1 - env);
+      }
+      trapNonFinite(out, ctx.n, reset);
+    },
+  };
+});
+
+registerKernel('lfo', (params) => {
+  const buf = stereo();
+  let rate = num(params.rate, 2);
+  let shape = num(params.shape, 0);
+  let amp = num(params.amp, 1);
+  let uni = on(params.uni);
+  let phase = 0;
+  let resetL = 0;
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'rate') rate = num(v, 2);
+      else if (id === 'shape') shape = num(v, 0);
+      else if (id === 'amp') amp = num(v, 1);
+      else if (id === 'uni') uni = on(v);
+    },
+    process: (ins, ctx) => {
+      const A = ins.rate;
+      const B = ins.reset;
+      const fmax = ctx.sr * 0.45;
+      for (let i = 0; i < ctx.n; i++) {
+        if (B) {
+          const s = B[0][i];
+          if (s > 0.5 && resetL <= 0.5) phase = 0;
+          resetL = s;
+        }
+        let r = rate * Math.pow(2, A ? A[0][i] : 0);
+        if (!(r > 0)) r = 0;
+        else if (r > fmax) r = fmax;
+        const dt = r / ctx.sr;
+        const t = phase;
+        const tri = 1 - 4 * Math.abs(t - 0.5);
+        let th = t - 0.5;
+        if (th < 0) th += 1;
+        const sq = (t < 0.5 ? -1 : 1) - blep(t, dt) + blep(th, dt);
+        const v = (1 - shape) * tri + shape * sq;
+        cvWrite(buf, i, uni ? (v + 1) * 0.5 * amp : v * amp);
+        phase += dt;
+        if (phase >= 1) phase -= 1;
+      }
+    },
+  };
+});
+
+registerKernel('sh', (params) => {
+  const buf = stereo();
+  let source = str(params.source, 'noise');
+  let mode = str(params.mode, 'hold');
+  let glide = num(params.glide, 0);
+  let held = 0;
+  let lag = 0;
+  let trigL = 0;
+  const reset = (): void => {
+    held = 0;
+    lag = 0;
+  };
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'source') source = str(v, 'noise');
+      else if (id === 'mode') mode = str(v, 'hold');
+      else if (id === 'glide') glide = num(v, 0);
+    },
+    process: (ins, ctx) => {
+      const A = ins.in;
+      const B = ins.trig;
+      const track = mode === 'track';
+      const useIn = source === 'in';
+      const kg = lagK(glide * 0.5, ctx.sr);
+      for (let i = 0; i < ctx.n; i++) {
+        const src = useIn ? (A ? A[0][i] : 0) : Math.random() * 2 - 1;
+        const tg = B ? B[0][i] : 0;
+        if (track) held = src;
+        else if (tg > 0.5 && trigL <= 0.5) held = src;
+        trigL = tg;
+        lag += (held - lag) * kg;
+        cvWrite(buf, i, lag);
+      }
+      trapNonFinite(buf, ctx.n, reset);
+    },
+  };
+});
+
+registerKernel('slew', (params) => {
+  const buf = stereo();
+  let rise = num(params.rise, 0);
+  let fall = num(params.fall, 0);
+  let link = on(params.link);
+  let lag = 0;
+  const reset = (): void => {
+    lag = 0;
+  };
+  return {
+    out: () => buf,
+    setParam: (id, v) => {
+      if (id === 'rise') rise = num(v, 0);
+      else if (id === 'fall') fall = num(v, 0);
+      else if (id === 'link') link = on(v);
+    },
+    process: (ins, ctx) => {
+      const A = ins.in;
+      const ku = lagK(rise, ctx.sr);
+      const kd = lagK(link ? rise : fall, ctx.sr);
+      for (let i = 0; i < ctx.n; i++) {
+        const x = A ? A[0][i] : 0;
+        lag += (x - lag) * (x > lag ? ku : kd);
+        cvWrite(buf, i, lag);
+      }
+      trapNonFinite(buf, ctx.n, reset);
+    },
+  };
+});
 
 // ---------- MIDI ----------
 // The keyboard receives OCTAVE-RELATIVE notes from the editor ('noteon'/'noteoff'
@@ -4885,6 +6182,265 @@ registerKernel('clock-tempo', () => {
         r[i] = v;
       }
       if (sinceEdge > ctx.sr * 3) bpm = 0;
+    },
+  };
+});
+
+/**
+ * Tempo Follow — a clock extracted from music. Def in `src/blocks/defs.ts`.
+ *
+ * Three stages, each of which exists to keep the expensive one off the audio
+ * deadline:
+ *
+ * 1. **Onset envelope.** Energy in a low and a high band, one figure per hop
+ *    (~200 Hz), half-wave-rectified into a flux value: "how much more is
+ *    happening now than a moment ago". Two bands rather than one because a
+ *    kick and a hat are the same event to broadband energy, and their
+ *    alternation *is* the beat. Normalized by a slow running mean, so the
+ *    detector is level-independent — a fade does not change the tempo.
+ * 2. **Autocorrelation, spread over quanta.** The flux ring correlates with
+ *    itself at every lag in the BPM range; the peak is the beat period. That is
+ *    ~100 lags × 1024 terms, which is ~150 k multiplies — perfectly cheap per
+ *    *second* and completely unacceptable in one audio callback, so the pass
+ *    walks a handful of lags per quantum and takes a fraction of a second to
+ *    come round. The estimate updates several times a second, which is far
+ *    faster than a tempo actually moves. **Nothing here allocates** (docs/10).
+ * 3. **Phase lock.** A free-running beat phase at the detected tempo, pulled
+ *    toward each detected onset by `lockrate`. Tempo says how fast, onsets say
+ *    where the downbeat is, and separating them is what keeps the clock steady
+ *    through a bar with no transients in it.
+ *
+ * Octave errors (hearing double or half time) are inherent to the method; the
+ * lag search is weighted toward the middle of the range, which fixes most of
+ * them, and `minbpm`/`maxbpm`/`div` fix the rest by hand.
+ */
+registerKernel('tempo-follow', (params) => {
+  const bufClock = stereo();
+  const bufBpm = stereo();
+  const bufPhase = stereo();
+  const bufConf = stereo();
+  // Channel refs hoisted out of `process`: the buffers never change identity,
+  // and array destructuring goes through the iterator protocol, which is an
+  // allocation the audio path does not have to make (docs/10).
+  const [clkL, clkR] = bufClock;
+  const [bpmL, bpmR] = bufBpm;
+  const [phL, phR] = bufPhase;
+  const [cfL, cfR] = bufConf;
+  const p: Record<string, ParamValue> = { ...params };
+
+  // ---- flux ring (power of two: the index math is a mask, not a modulo) ----
+  const ENV_BITS = 11;
+  const ENV_LEN = 1 << ENV_BITS; // 2048 hops ≈ 10 s at 200 Hz
+  const ENV_MASK = ENV_LEN - 1;
+  const TERMS = 1024; // correlation window, in hops (~5 s)
+  const MAXLAG = 512; // 200 Hz / 512 ≈ 23 BPM floor — well under the param
+  const ENV_HZ = 200;
+  const flux = new Float32Array(ENV_LEN);
+  const corr = new Float32Array(MAXLAG + 1);
+  const weight = new Float32Array(MAXLAG + 1);
+  let head = 0;
+
+  // ---- band split + hop accumulation ----
+  let lp = 0;
+  let accLo = 0;
+  let accHi = 0;
+  let hopPos = 0;
+  let hop = 240;
+  let envRate = 200;
+  let prevLo = 0;
+  let prevHi = 0;
+  let fluxAvg = 0;
+  let sigLevel = 0;
+  /** Last three flux values, for peak-picking an onset. */
+  let f1 = 0;
+  let f2 = 0;
+
+  // ---- estimate ----
+  let lagMin = 66;
+  let lagMax = 172;
+  let lagCur = 66;
+  let bpm = 0;
+  let conf = 0;
+  let beatPhase = 0;
+  /** Onset arrived; the phase correction is applied at the next sample so the
+   *  audio loop stays a straight line. */
+  let pendingPull = 0;
+  let ratesFor = -1; // sr the lag bounds were computed for
+
+  const clampBpm = (v: ParamValue | undefined, d: number): number => {
+    const x = num(v, d);
+    return x < 20 ? 20 : x > 400 ? 400 : x;
+  };
+
+  /** Lag bounds + the mid-tempo preference. Recomputed only when the range or
+   *  the sample rate moves — never per quantum. */
+  const retune = (sr: number): void => {
+    hop = Math.max(1, Math.round(sr / ENV_HZ));
+    envRate = sr / hop;
+    const lo = clampBpm(p.minbpm, 70);
+    const hi = Math.max(lo + 5, clampBpm(p.maxbpm, 180));
+    lagMin = Math.max(2, Math.floor((envRate * 60) / hi));
+    lagMax = Math.min(MAXLAG, Math.ceil((envRate * 60) / lo));
+    if (lagMax <= lagMin) lagMax = lagMin + 1;
+    if (lagCur < lagMin || lagCur > lagMax) lagCur = lagMin;
+    // A log-normal preference around 120 BPM. Autocorrelation peaks just as
+    // hard at half and double the true period, and something has to break the
+    // tie; "nearer to a tempo a person would tap" is the standard answer and
+    // costs one table.
+    for (let L = lagMin; L <= lagMax; L++) {
+      const b = (envRate * 60) / L;
+      const z = Math.log2(b / 120) / 0.7;
+      weight[L] = Math.exp(-0.5 * z * z);
+    }
+    ratesFor = sr;
+  };
+
+  /** One completed correlation sweep: pick the period and rate the estimate. */
+  const finishPass = (): void => {
+    let best = -1;
+    let bestScore = 0;
+    let sum = 0;
+    let cnt = 0;
+    for (let L = lagMin; L <= lagMax; L++) {
+      const s = corr[L] * weight[L];
+      sum += corr[L];
+      cnt++;
+      if (s > bestScore) {
+        bestScore = s;
+        best = L;
+      }
+    }
+    // Nothing periodic, or nothing playing: hold the last tempo and say so.
+    const mean = cnt ? sum / cnt : 0;
+    if (best < 0 || mean <= 1e-9 || sigLevel < 2e-5) {
+      conf *= 0.7;
+      return;
+    }
+    // Peak-to-mean: a real beat towers over the rest of the range, a texture
+    // does not. This is the number the `conf` output reports.
+    const pm = corr[best] / mean;
+    const c = Math.max(0, Math.min(1, (pm - 1.15) / 1.6));
+    conf = conf * 0.6 + c * 0.4;
+    if (on(p.lock)) return; // frozen: keep clocking at the tempo we had
+    if (c < 0.08) return; // too weak to act on
+    const found = (envRate * 60) / best;
+    // A big jump is a new piece of music, not drift — take it whole rather
+    // than crawling to it over ten seconds.
+    if (!bpm || Math.abs(found - bpm) > bpm * 0.2) bpm = found;
+    else bpm = bpm * 0.82 + found * 0.18;
+  };
+
+  /** One hop of envelope: push a flux value and maybe an onset. */
+  const pushHop = (): void => {
+    const eLo = Math.sqrt(accLo / hop);
+    const eHi = Math.sqrt(accHi / hop);
+    accLo = 0;
+    accHi = 0;
+    // Half-wave-rectified flux: onsets are rises. The high band is weighted up
+    // because it carries the articulation while the low band carries the mass.
+    const raw = Math.max(0, eLo - prevLo) + 1.5 * Math.max(0, eHi - prevHi);
+    prevLo = eLo;
+    prevHi = eHi;
+    fluxAvg += (raw - fluxAvg) * 0.002;
+    const fn = fluxAvg > 1e-9 ? Math.min(4, raw / (fluxAvg * 3)) : 0;
+    flux[head] = fn;
+    head = (head + 1) & ENV_MASK;
+    // Peak-pick one hop late: the middle of the three is an onset if it is the
+    // largest and clears the floor.
+    if (f1 > f2 && f1 >= fn && f1 > 0.9) pendingPull = Math.min(1, f1 / 2);
+    f2 = f1;
+    f1 = fn;
+  };
+
+  return {
+    out: (port) =>
+      port === 'clock' ? bufClock : port === 'bpm' ? bufBpm : port === 'phase' ? bufPhase : port === 'conf' ? bufConf : null,
+    visualText: () =>
+      bpm > 0 ? `${bpm.toFixed(1)}\n${Math.round(conf * 100)}` : `--\n${Math.round(conf * 100)}`,
+    setParam: (id, v) => {
+      p[id] = v;
+      if (id === 'minbpm' || id === 'maxbpm') ratesFor = -1; // retune next quantum
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      if (ratesFor !== ctx.sr) retune(ctx.sr);
+      const src = ins['in'];
+      // Pulses per beat. The enum is a ratio, read as a number.
+      const divStr = str(p.div, '1');
+      const div = divStr === '1/4' ? 0.25 : divStr === '1/2' ? 0.5 : divStr === '2' ? 2 : divStr === '4' ? 4 : 1;
+      const width = Math.max(0.02, Math.min(0.95, num(p.width, 0.5)));
+      const track = Math.max(0, Math.min(1, num(p.lockrate, 0.35)));
+      // One-pole split at ~180 Hz: kick side and everything else.
+      const kLow = 1 - Math.exp((-2 * Math.PI * 180) / ctx.sr);
+      const phaseInc = bpm > 0 ? bpm / 60 / ctx.sr : 0;
+      const bpmOut = Math.max(0, Math.min(1, bpm / 240));
+      const confOut = Math.max(0, Math.min(1, conf));
+      const a = src?.[0] ?? null;
+      const b = src?.[1] ?? a;
+      for (let i = 0; i < n; i++) {
+        // ---- analysis ----
+        const x = a && b ? (b === a ? a[i] : (a[i] + b[i]) * 0.5) : 0;
+        lp += (x - lp) * kLow;
+        const hi = x - lp;
+        accLo += lp * lp;
+        accHi += hi * hi;
+        sigLevel += (Math.abs(x) - sigLevel) * 0.0002;
+        if (++hopPos >= hop) {
+          hopPos = 0;
+          pushHop();
+        }
+        // ---- beat phase ----
+        if (pendingPull > 0) {
+          // Pull toward the nearest beat — but only for onsets that are
+          // plausibly ON one. An onset halfway between beats is an offbeat
+          // (the hats, the backbeat), and pulling toward "the nearest beat"
+          // from there drags the phase backwards by a quarter of a beat every
+          // time. On a track with hats that fights the downbeats to a draw:
+          // the tempo stays right and the phase judders, which showed up as a
+          // divided clock dropping pulses. So the correction fades out with
+          // distance and is zero by a quarter beat away.
+          let err = beatPhase;
+          if (err > 0.5) err -= 1;
+          const near = 1 - Math.min(1, Math.abs(err) * 4);
+          if (near > 0) {
+            beatPhase -= err * track * pendingPull * near;
+            if (beatPhase < 0) beatPhase += 1;
+            else if (beatPhase >= 1) beatPhase -= 1;
+          }
+          pendingPull = 0;
+        }
+        beatPhase += phaseInc;
+        if (beatPhase >= 1) beatPhase -= Math.floor(beatPhase);
+        // ---- outputs ----
+        const pulse = beatPhase * div;
+        const frac = pulse - Math.floor(pulse);
+        const gate = bpm > 0 && frac < width ? 1 : 0;
+        clkL[i] = gate;
+        clkR[i] = gate;
+        bpmL[i] = bpmOut;
+        bpmR[i] = bpmOut;
+        phL[i] = beatPhase;
+        phR[i] = beatPhase;
+        cfL[i] = confOut;
+        cfR[i] = confOut;
+      }
+      // ---- a slice of the correlation sweep ----
+      // Four lags a quantum: a full sweep lands several times a second, which
+      // is far quicker than a tempo moves, at a cost that does not show up in
+      // the load figure. Do not raise this to "make it respond faster" —
+      // responsiveness is bounded by the flux window, not by the sweep.
+      const h = (head - 1) & ENV_MASK;
+      for (let c = 0; c < 4; c++) {
+        const L = lagCur;
+        let s = 0;
+        for (let k = 0; k < TERMS; k++) s += flux[(h - k) & ENV_MASK] * flux[(h - k - L) & ENV_MASK];
+        corr[L] = s / TERMS;
+        if (++lagCur > lagMax) {
+          lagCur = lagMin;
+          finishPass();
+          break;
+        }
+      }
     },
   };
 });
@@ -5480,24 +7036,37 @@ registerKernel('file-player', (params, sv) => {
     fiN = Math.min(s1 - s0, Math.floor(Math.max(0, fadeIn) * len));
     foN = Math.min(s1 - s0 - fiN, Math.floor(Math.max(0, fadeOut) * len));
   };
-  const hydrate = (id: string) => {
+  /**
+   * Take (or re-take) the samples for `id`.
+   *
+   * `keepPos` is for the case where the material changed under an unchanged id
+   * *and turned out to be the same object* — which is what a recorder's live
+   * take is, growing in place while it records (see `LiveTake`). Re-seating the
+   * playhead there would restart the deck several times a second; all that
+   * genuinely needs redoing is `recalc`, because the bars are fractions and the
+   * file just got longer. Anything else is a real swap and starts from the bar.
+   */
+  const hydrate = (id: string, keepPos = false) => {
     assetId = id;
-    audio = null;
+    const prev = audio;
+    if (!keepPos) audio = null;
     if (id)
       sv.assets.wait(id, (a) => {
-        if (assetId === id) {
-          audio = a;
-          recalc();
-          pos = s0;
-        }
+        if (assetId !== id) return;
+        const same = keepPos && a === prev && !!a;
+        audio = a;
+        recalc();
+        if (!same) pos = s0;
+        else if (pos < s0) pos = s0;
       });
   };
   hydrate(ownAsset);
   return {
     out: () => buf,
-    // Same id, new samples (a punch-in, or a Clip-tab edit) — take them again.
+    // Same id, new samples (a punch-in, a Clip-tab edit, or a live take that
+    // just got longer) — take them again.
     assetChanged: (id) => {
-      if (id === assetId) hydrate(id);
+      if (id === assetId) hydrate(id, true);
     },
     setParam: (id, v) => {
       const pressed = v === 1 || v === true;
@@ -5601,6 +7170,22 @@ registerKernel('file-player', (params, sv) => {
 });
 
 /**
+ * Velocity → amplitude with a sensitivity depth. **Hand-copy of `velAmp` in
+ * `src/core/sampler.ts`** — the engine process shares no modules with the
+ * renderer, so the two are kept in step by hand, the same arrangement as
+ * `sliceForNote`, the rig and the trajectory math. The doc comment on the
+ * original explains why the blend exists; the short version is that raw
+ * velocity times a 0.8 Gain default handed back a recorded take ~6 dB down at
+ * an ordinary playing velocity, and `depth = 0` is how a loop lifted off the
+ * tape recorder triggers at full level every time.
+ */
+const velAmp = (vel: number, depth: number): number => {
+  const d = depth < 0 ? 0 : depth > 1 ? 1 : depth;
+  const v = vel < 0 ? 0 : vel > 1 ? 1 : vel;
+  return 1 - d + d * v;
+};
+
+/**
  * Sampler — Classic / One-Shot / Slice. Mirrors the Web unit (the parity rule,
  * docs/08), and goes one further: this kernel *does* crossfade the loop seam,
  * which the Web engine cannot do without a second source node per lap.
@@ -5642,6 +7227,30 @@ registerKernel('sampler', (params, sv) => {
     for (let i = 0; i < nSlice; i++) slicePts[i] = sub[i];
   };
   parseSlices(params.slices);
+
+  /** Detected key per slice, −1 = none. Parallel to the slice list; parsed
+   *  here for the same reason the points are (`core/sampler.ts`). */
+  const sliceKeys = new Int16Array(MAXSLICE + 1).fill(-1);
+  let nKeys = 0;
+  const parseKeys = (v: ParamValue): void => {
+    nKeys = 0;
+    sliceKeys.fill(-1);
+    const s = str(v);
+    if (!s) return;
+    let rows: unknown;
+    try {
+      rows = JSON.parse(s);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(rows)) return;
+    for (const x of rows as number[]) {
+      if (nKeys > MAXSLICE) break;
+      const n = Math.round(+x);
+      sliceKeys[nKeys++] = isFinite(n) && n >= 0 && n <= 127 ? n : -1;
+    }
+  };
+  parseKeys(params.slicekeys);
 
   /** ADSR stage. 0 = attack, 1 = decay, 2 = sustain, 3 = release. */
   const A_ATK = 0;
@@ -5692,8 +7301,29 @@ registerKernel('sampler', (params, sv) => {
   let wiredAsset: string | null = null; // inserted via tape wire — wins while plugged
   hydrate(ownAsset);
 
-  /** Linear read with the loop seam crossfaded, so a loop point in the middle
-   *  of a waveform does not tick once per lap. */
+  /**
+   * Linear read with the loop seam crossfaded, so a loop point in the middle of
+   * a waveform does not tick once per lap.
+   *
+   * **The fade overlaps the loop's own material.** Over the last `xfade`
+   * samples before the loop end, the tail fades out while the loop's *head*
+   * ([loopA, loopA+xfade)) fades in; playback then wraps to `loopA + xfade`,
+   * where the head read left off, so every sample is still heard exactly once
+   * per lap and the seam is continuous.
+   *
+   * The first version instead read the material *before* the loop start, which
+   * is the textbook shape and preserves the loop period exactly — but it can
+   * only fade with as much run-up as exists before `loopA`, and the loop the
+   * Clip tab hands you by default starts at the region start, where there is
+   * none. So the crossfade silently clamped to zero in the one case people
+   * actually reach ("Loop" then "⤢ Loop"), and the control looked broken. An
+   * overlap needs nothing but the loop, so it always works; the cost is that
+   * the lap is `xfade` shorter than the bracket, which is bounded at half.
+   *
+   * Equal power (√t / √(1−t)) rather than linear: two uncorrelated halves
+   * crossfaded linearly dip about 3 dB in the middle, which on a sustain loop
+   * is an audible lurch once a lap.
+   */
   const readXf = (ch: Float32Array, v: Voice, at: number): number => {
     const i0 = at | 0;
     const fr = at - i0;
@@ -5701,17 +7331,14 @@ registerKernel('sampler', (params, sv) => {
     const s = ch[i0] * (1 - fr) + ch[i1] * fr;
     if (v.xfade <= 0 || v.loopB <= v.loopA) return s;
     const left = v.loopB - at;
-    if (left >= v.xfade) return s;
-    // Mix in the material *before* the loop start, ramped in as the tail
-    // ramps out — the tail and the head of the next lap trade places.
-    const back = v.loopA - left;
-    if (back < 0) return s;
-    const j0 = back | 0;
-    const jf = back - j0;
+    if (left >= v.xfade || left < 0) return s;
+    const head = v.loopA + (v.xfade - left);
+    const j0 = head | 0;
+    const jf = head - j0;
     const j1 = j0 + 1 >= ch.length ? j0 : j0 + 1;
-    const head = ch[j0] * (1 - jf) + ch[j1] * jf;
+    const h = ch[j0] * (1 - jf) + ch[j1] * jf;
     const t = left / v.xfade; // 1 at the start of the fade, 0 at the seam
-    return s * t + head * (1 - t);
+    return s * Math.sqrt(t) + h * Math.sqrt(1 - t);
   };
 
   return {
@@ -5724,6 +7351,7 @@ registerKernel('sampler', (params, sv) => {
       p[id] = v;
       if (id === 'gain') gain.set(num(v, 0.8));
       else if (id === 'slices') parseSlices(v);
+      else if (id === 'slicekeys') parseKeys(v);
       else if (id === 'asset') {
         ownAsset = str(v);
         if (wiredAsset == null && ownAsset !== assetId) hydrate(ownAsset);
@@ -5756,8 +7384,42 @@ registerKernel('sampler', (params, sv) => {
           // Slice edges: the region, cut at every point strictly inside it.
           // A point the region no longer covers is dropped, not clamped —
           // clamping would pile several onto the edge and hand out silent keys.
-          const i = ev.note - Math.round(num(p.root, 60));
-          if (i < 0) return;
+          // `inner` is the count of surviving cuts, so there are inner+1 slices.
+          const root = Math.round(num(p.root, 60));
+          let inner = 0;
+          for (let k = 0; k < nSlice; k++) {
+            const q = slicePts[k];
+            if (q > rs + 1e-6 && q < re - 1e-6) inner++;
+          }
+          const count = inner + 1;
+          // Which slice this key plays, and by how much it is transposed.
+          // Mirrors `sliceForNote` in core/sampler.ts — keep the two in step.
+          let i: number;
+          let semis = 0;
+          if (str(p.slicemap, 'Chromatic') === 'Pitched') {
+            // Nearest detected key wins, and the slice is stretched to the note
+            // — so the whole keyboard plays, from however few slices exist.
+            let bestD = Infinity;
+            let best = -1;
+            for (let k = 0; k < count; k++) {
+              const known = k < nKeys && sliceKeys[k] >= 0;
+              const key = known ? sliceKeys[k] : root + k;
+              // A fallback key loses every tie — see `sliceForNote`.
+              const d = (key > ev.note ? key - ev.note : ev.note - key) + (known ? 0 : 0.5);
+              if (d < bestD) {
+                bestD = d;
+                best = k;
+              }
+            }
+            if (best < 0) return;
+            i = best;
+            semis = ev.note - (i < nKeys && sliceKeys[i] >= 0 ? sliceKeys[i] : root + i);
+          } else {
+            // Chromatic: a slice is a piece of the recording, not a note to be
+            // transposed, so it plays at its own pitch.
+            i = ev.note - root;
+            if (i < 0 || i >= count) return; // key outside the kit
+          }
           let seen = 0;
           let lo = rs;
           let hi = re;
@@ -5771,11 +7433,9 @@ registerKernel('sampler', (params, sv) => {
             seen++;
             lo = q;
           }
-          if (seen < i) return; // key past the end of the kit
           s = lo;
           e = hi;
-          // A slice plays at its own pitch: it is a piece of the recording,
-          // not a note to be transposed.
+          if (semis) rate *= Math.pow(2, semis / 12);
         } else {
           rate *= Math.pow(2, (ev.note - num(p.root, 60)) / 12);
         }
@@ -5794,9 +7454,9 @@ registerKernel('sampler', (params, sv) => {
           const lb = rawLen > 1e-6 ? Math.min(e, la + rawLen) : e;
           loopA = la * len;
           loopB = Math.max(loopA + 1, lb * len);
-          // The crossfade reaches backwards from the loop start, so it cannot
-          // be longer than the run-up available before it.
-          xfade = Math.min(num(p.loopFade, 0) * len, (loopB - loopA) * 0.5, loopA - s * len);
+          // Half the loop is the ceiling: the fade window and the head it
+          // fades in must not overlap each other (see readXf).
+          xfade = Math.min(num(p.loopFade, 0) * len, (loopB - loopA) * 0.5);
           if (xfade < 1) xfade = 0;
         }
         const A = Math.max(0.0005, num(p.attack, 0.002));
@@ -5808,7 +7468,11 @@ registerKernel('sampler', (params, sv) => {
           // Buffer-samples per output frame; the sample-rate ratio is applied
           // per quantum in process() against the live engine rate.
           inc: rate,
-          vel: ev.velocity,
+          // Velocity through the sensitivity blend, NOT raw. Mirrors `velAmp`
+          // in src/core/sampler.ts — change one, change both. Raw velocity plus
+          // a Gain default of 0.8 is what made a recorded take come back ~6 dB
+          // down at an ordinary playing velocity.
+          vel: velAmp(ev.velocity, num(p.velamp, 0.7)),
           start: s * len,
           end: e * len,
           fadeIn: fi * len,
@@ -5816,7 +7480,10 @@ registerKernel('sampler', (params, sv) => {
           loopA,
           loopB,
           xfade,
-          gated: mode === 'classic',
+          // A slice is gated too unless it is explicitly a one-shot: the ADSR
+          // is the sampler's envelope in every mode, and a slice that ignored
+          // note-off could only ever be a drum hit.
+          gated: mode === 'classic' || (mode === 'slice' && str(p.slicehold, 'Gate') === 'Gate'),
           note: ev.note,
           stage: A_ATK,
           envA: 0,
@@ -5845,6 +7512,21 @@ registerKernel('sampler', (params, sv) => {
       const srScale = audio.sampleRate / ctx.sr;
       for (const v of voices) {
         const inc = v.inc * srScale;
+        /**
+         * Source samples a full-scale release covers at this playback rate.
+         *
+         * A voice that reaches the end of its material with the envelope still
+         * open is **cut off**, and a cut waveform is a click. So a non-looping
+         * voice enters release exactly early enough for the envelope to reach
+         * zero as the material runs out: `envA / rel` output frames of release,
+         * times `inc` source samples per frame.
+         *
+         * This is what the Slice modes were missing. The old rule flipped an
+         * ungated voice into release when it was already within one sample of
+         * the end, which is a release in name only — every slice ended on a
+         * step, and the R knob did nothing you could hear.
+         */
+        const relK = v.rel > 0 ? inc / v.rel : 0;
         // Sub-quantum start: hold playback for the note's arrival offset.
         let first = 0;
         if (v.delay > 0) {
@@ -5856,6 +7538,9 @@ registerKernel('sampler', (params, sv) => {
             v.envA = 0;
             break;
           }
+          // A looping voice never reaches the end, so it only releases on the
+          // key coming up.
+          if (v.stage !== A_REL && v.loopB <= v.loopA && v.end - v.pos <= relK * v.envA) v.stage = A_REL;
           // ---- amp envelope ----
           if (v.stage === A_ATK) {
             v.envA += v.atk;
@@ -5884,11 +7569,10 @@ registerKernel('sampler', (params, sv) => {
           l[i] += readXf(cl, v, v.pos) * a;
           r[i] += readXf(cr, v, v.pos) * a;
           v.pos += inc;
-          if (v.loopB > v.loopA && v.pos >= v.loopB) v.pos -= v.loopB - v.loopA;
+          // Wrap to where the crossfaded head read left off (loopA + xfade),
+          // not to loopA — otherwise the overlap replays it. See readXf.
+          if (v.loopB > v.loopA && v.pos >= v.loopB) v.pos -= v.loopB - v.loopA - v.xfade;
         }
-        // An ungated voice that has run out of material releases itself, so a
-        // one-shot with a hard tail doesn't click when the voice is reaped.
-        if (!v.gated && v.stage !== A_REL && v.pos >= v.end - v.inc * srScale) v.stage = A_REL;
       }
       for (let i = voices.length - 1; i >= 0; i--) {
         const v = voices[i];
@@ -5919,6 +7603,15 @@ class Take {
   private bucketFrames = 4096;
   private dirtyFrom = 0;
   private dirtyTo = 0;
+  /**
+   * Frames written since the live mirror last caught up, as a range. A second,
+   * independent dirty range rather than a reuse of `dirtyFrom/dirtyTo`: the
+   * picture and the mirror are consumed on different schedules (and the
+   * picture only when the node is *watched*), so sharing one range means
+   * whichever ran first silently robbed the other of the update.
+   */
+  mirrorFrom = 0;
+  mirrorTo = 0;
 
   write(pos: number, l: Float32Array, r: Float32Array, n: number): void {
     for (let i = 0; i < n; ) {
@@ -5941,6 +7634,13 @@ class Take {
       if (pos < this.dirtyFrom) this.dirtyFrom = pos;
       if (pos + n > this.dirtyTo) this.dirtyTo = pos + n;
     }
+    if (this.mirrorTo <= this.mirrorFrom) {
+      this.mirrorFrom = pos;
+      this.mirrorTo = pos + n;
+    } else {
+      if (pos < this.mirrorFrom) this.mirrorFrom = pos;
+      if (pos + n > this.mirrorTo) this.mirrorTo = pos + n;
+    }
   }
 
   sample(ch: number, at: number): number {
@@ -5957,6 +7657,7 @@ class Take {
     this.peaks.fill(0);
     this.bucketFrames = 4096;
     this.dirtyFrom = this.dirtyTo = 0;
+    this.mirrorFrom = this.mirrorTo = 0;
   }
 
   /** Bring the picture up to date. Off the audio path (visual timer only). */
@@ -6003,17 +7704,212 @@ class Take {
   }
 }
 
+/** Frames the live mirror copies in one pump pass — ~11 s of audio at 48 kHz,
+ *  a 4 MB memcpy, comfortably under a quantum's worth of time. See LiveTake. */
+const LIVE_SLICE = 1 << 19;
+/** First capacity the mirror reserves (~1.4 s at 48 kHz), then doubling. */
+const LIVE_CAP0 = 1 << 16;
+
+/**
+ * The **live take**: a contiguous, always-current mirror of a `Take`, published
+ * to the asset store so anything wired to a recorder's `tape` out reads the
+ * take *while it is being recorded* — sample what you just played without
+ * pressing ■, without Save As…, without the Library.
+ *
+ * A `Take` stores chunks; a `DecodedAudio` is one array per channel and every
+ * deck and sampler indexes it directly, so the mirror has to be a real copy.
+ * The thing it must never do is copy the take *whole* on a pump pass: the
+ * engine's event loop **is** the audio pump (docs/10 — this is the same fact
+ * that put the take's own disk commit on a WriteStream), and a 230 MB memcpy
+ * when a ten-minute take doubles its capacity is a quarter-second of xruns.
+ * So:
+ *
+ * - **Growth is staged.** Capacity doubles into a second array that is filled a
+ *   `LIVE_SLICE` at a time across pump passes; the old array stays published
+ *   until the new one covers it, then they swap. No pass copies more than a
+ *   slice, and the take never goes backwards or blank while it grows.
+ * - **Steady state copies only what arrived**, from `Take.mirrorFrom/mirrorTo`
+ *   — a punch-in moves that range backwards, so overwritten material is
+ *   repaired rather than left as the pre-punch audio.
+ * - **`channels[ch]` is a `subarray` view**, so a consumer sees exactly the
+ *   frames that exist rather than the whole allocation padded with silence.
+ * - **The published object identity never changes.** A sampler that hydrated
+ *   the take holds this one object and sees it lengthen under it, which is what
+ *   makes "the region is the take, and the take is still growing" work without
+ *   re-hydrating per note.
+ */
+class LiveTake {
+  readonly audio: DecodedAudio = {
+    sampleRate: 48000,
+    channels: [new Float32Array(0), new Float32Array(0)],
+  };
+  private cap: Float32Array[] = [new Float32Array(0), new Float32Array(0)];
+  private filled = 0;
+  private next: Float32Array[] | null = null;
+  private nextFilled = 0;
+
+  reset(): void {
+    this.cap = [new Float32Array(0), new Float32Array(0)];
+    this.filled = 0;
+    this.next = null;
+    this.nextFilled = 0;
+    this.audio.channels[0] = this.cap[0];
+    this.audio.channels[1] = this.cap[1];
+  }
+
+  /** Copy `[from, to)` of the take's chunks into a flat destination. */
+  private static fill(take: Take, dst: Float32Array[], from: number, to: number): void {
+    for (let i = from; i < to; ) {
+      const ci = (i / TAKE_CHUNK) | 0;
+      const off = i - ci * TAKE_CHUNK;
+      const n = Math.min(to - i, TAKE_CHUNK - off);
+      for (let ch = 0; ch < 2; ch++) {
+        const src = take.chans[ch][ci];
+        if (src) dst[ch].set(src.subarray(off, off + n), i);
+        else dst[ch].fill(0, i, i + n);
+      }
+      i += n;
+    }
+  }
+
+  private publish(): void {
+    this.audio.channels[0] = this.cap[0].subarray(0, this.filled);
+    this.audio.channels[1] = this.cap[1].subarray(0, this.filled);
+  }
+
+  /**
+   * One pump pass. Returns true when the published view changed, which is the
+   * signal to re-announce the asset (and so to tell held-onto decks about it).
+   */
+  refresh(take: Take, sr: number): boolean {
+    this.audio.sampleRate = sr;
+    if (!take.frames) {
+      if (!this.filled && !this.next) return false;
+      this.reset();
+      return true;
+    }
+    // ---- staged growth ----
+    if (this.next) {
+      const to = Math.min(take.frames, this.nextFilled + LIVE_SLICE);
+      LiveTake.fill(take, this.next, this.nextFilled, to);
+      this.nextFilled = to;
+      // Swap only once the new array covers everything already on show —
+      // publishing it early would shorten the take under a sampler mid-note.
+      if (to < this.audio.channels[0].length) return false;
+      this.cap = this.next;
+      this.filled = to;
+      this.next = null;
+      this.nextFilled = 0;
+      this.publish();
+      return true;
+    }
+    if (take.frames > this.cap[0].length) {
+      let capF = Math.max(LIVE_CAP0, this.cap[0].length);
+      while (capF < take.frames) capF *= 2;
+      this.next = [new Float32Array(capF), new Float32Array(capF)];
+      this.nextFilled = 0;
+      // Nothing published this pass; the fill starts on the next one so the
+      // allocation and the copy never land in the same pump slot.
+      return false;
+    }
+    // ---- steady state ----
+    const from = Math.max(0, take.mirrorFrom);
+    const to = Math.min(take.mirrorTo, take.frames);
+    if (to <= from) return false;
+    const end = Math.min(to, from + LIVE_SLICE);
+    LiveTake.fill(take, this.cap, from, end);
+    if (end >= to) take.mirrorFrom = take.mirrorTo = 0;
+    else take.mirrorFrom = end;
+    if (end > this.filled) this.filled = end;
+    this.publish();
+    return true;
+  }
+}
+
+/**
+ * Stream a take to disk without stopping the audio.
+ *
+ * **The engine's event loop IS the audio pump** (docs/10), so the old commit —
+ * `writeWav(chans)` into one Buffer, then `fs.writeFileSync` — blocked it for
+ * the entire length of both. Measured on a 153 s stereo 96 kHz take (56 MB):
+ * 181 ms to encode, 54 ms to write, plus ~90 ms to flatten. The field log shows
+ * exactly that: pressing ■ produced `jitterQ 244.7` (a 325 ms gap between audio
+ * callbacks), `late 5`, 253 xruns in one status window, 29600 frames overwritten
+ * in a capture ring and 123 dropped ASIO quanta — a third of a second of
+ * wreckage, every time a take is saved. This is the same fact that put the ASIO
+ * bridge on a socket and the calibration capture into chunks: on Windows,
+ * `writeFileSync` is synchronous for pipes *and* files, and nothing else runs
+ * while it happens.
+ *
+ * So: encode a slice at a time and hand each one to a WriteStream, yielding to
+ * the loop between slices (and waiting on `drain` when the stream is full).
+ * 32768 frames is ~0.4 ms of encoding — a fraction of one quantum — and the
+ * write itself moves to libuv's threadpool.
+ *
+ * The caller passes a **snapshot** (`Take.flatten()`), not the live take: the
+ * user can punch in again while this is still streaming, and the bytes on disk
+ * must be the take that was stopped, not a half-overwritten one.
+ */
+const WAV_SLICE = 1 << 15;
+function writeWavChunked(
+  chans: Float32Array[],
+  sampleRate: number,
+  file: string,
+  done: (err: Error | null) => void,
+): void {
+  const nCh = Math.max(1, chans.length);
+  const frames = chans[0]?.length ?? 0;
+  let ws: fs.WriteStream;
+  try {
+    ws = fs.createWriteStream(file);
+  } catch (err) {
+    done(err as Error);
+    return;
+  }
+  let failed = false;
+  ws.on('error', (err) => {
+    if (failed) return;
+    failed = true;
+    done(err);
+  });
+  ws.write(wavHeader(nCh, sampleRate, frames));
+  const slice = Buffer.allocUnsafe(WAV_SLICE * nCh * 2);
+  let at = 0;
+  const step = (): void => {
+    if (failed) return;
+    if (at >= frames) {
+      ws.end(() => {
+        if (!failed) done(null);
+      });
+      return;
+    }
+    const count = Math.min(WAV_SLICE, frames - at);
+    const bytes = encodePcm16(chans, at, count, slice);
+    at += count;
+    // Respect backpressure — writing faster than the disk drains would just
+    // rebuild the same 56 MB in memory that this exists to avoid.
+    if (ws.write(slice.subarray(0, bytes))) setImmediate(step);
+    else ws.once('drain', step);
+  };
+  step();
+}
+
+/** How often the live take is republished. Fast enough that "record a phrase,
+ *  hit a key" feels immediate; slow enough that the copy is noise. */
+const LIVE_MS = 60;
+
 /**
  * Tape recorder — a deck that writes. Mirrors the Web unit exactly (the
  * parity rule, docs/08): ● punches in at the playhead, ▶ auditions the take
  * through the audio out, ■ commits it to a cassette (the same id after a
  * punch, so every deck holding it follows the edit), Clear drops the take but
- * never the cassette.
+ * never the cassette — and `tape` hands the take out **live** (see LiveTake).
  */
 registerKernel('tape-recorder', (params, sv) => {
   const buf = stereo();
   const outBuf = stereo();
   const take = new Take();
+  const live = new LiveTake();
   let recording = false;
   let playing = false;
   /** Write / audition head, in frames of the take. */
@@ -6027,31 +7923,78 @@ registerKernel('tape-recorder', (params, sv) => {
   let regStart = num(params.regStart, 0);
   let regEnd = num(params.regEnd, 1);
   const gain = new Smooth(num(params.gain, 1));
-  const MAX_FRAMES = 48000 * 600;
+  /** Safety cap on a single take, in SECONDS — the frame count that means is a
+   *  function of the rate. As a fixed 48000·600 it was a 10-minute limit at
+   *  48 kHz but a silent 5-minute one at 96 kHz and 2.5 at 192 kHz: recording
+   *  simply stopped mid-take with nothing said. The web unit already caps in
+   *  seconds (`env.ctx.sampleRate * 600` in src/blocks/units.ts); match it. */
+  const MAX_SECONDS = 600;
+  const maxFrames = (): number => MAX_SECONDS * (sr0 || 48000);
 
   const winA = (): number => Math.max(0, Math.min(take.frames, regStart * take.frames));
   const winB = (): number => Math.max(winA() + 1, Math.min(take.frames, regEnd * take.frames));
+
+  // ---- the live take ----------------------------------------------------
+  // Its own id namespace, never the committed cassette's: the two are not the
+  // same thing (the take is ahead of the file between punches) and the live one
+  // must never reach the document or the Library. It is derived from the node
+  // id so a rebuild that keeps the node keeps the id, and nothing else in the
+  // app can mint it.
+  const liveId = (): string => 'live_' + (k.nodeId ?? 'rec');
+  /** What `tape` is currently presenting. A recorder holding a take presents
+   *  the live buffer; an empty one falls back to whatever it last committed,
+   *  which is what a freshly loaded scene has. */
+  const tapeId = (): string => (take.frames ? liveId() : takeId);
+  let pushed = '';
+  const pushTape = (): void => {
+    const id = tapeId();
+    if (id === pushed || !id) return;
+    pushed = id;
+    k.tapeOut?.(id);
+  };
+  /**
+   * The pump pass that keeps the live take current.
+   *
+   * A timer rather than a hook off `process`, because the copy allocates and
+   * the audio callback may not (docs/10) — and rather than off the visuals
+   * timer, because sampling a take you are recording has to work whether or not
+   * the block happens to be on screen and watched. The work is skipped entirely
+   * while nothing is wired to `tape`, so an unwired recorder pays one comparison
+   * every 60 ms.
+   */
+  const timer = setInterval(() => {
+    if (!k.tapeOut) return;
+    if (live.refresh(take, sr0)) sv.assets.setLive(liveId(), live.audio);
+    pushTape();
+  }, LIVE_MS);
+  // Never a reason to hold the process open — the audio stream does that.
+  timer.unref();
 
   const commit = (): void => {
     if (!take.frames || !dirtySinceCommit) return;
     dirtySinceCommit = false;
     try {
+      // A snapshot, deliberately: the streaming write below outlives this call
+      // and the user may punch in again while it is still running.
       const chans = take.flatten();
-      const bytes = writeWav(chans, sr0);
       const fresh = !takeId;
       if (fresh) takeId = 'cas_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
       if (!takeName) takeName = 'Take ' + new Date().toTimeString().slice(0, 8);
       const dir = sv.cassettesDir();
-      fs.writeFileSync(path.join(dir, takeId + '.wav'), bytes);
-      fs.writeFileSync(
-        path.join(dir, takeId + '.json'),
-        JSON.stringify({
-          id: takeId,
-          name: takeName,
+      // Everything the completion needs, captured now — `takeId`/`takeName` are
+      // mutable and a later punch would rename a file that is already written.
+      const id = takeId;
+      const name = takeName;
+      const rewrote = !fresh;
+      const rate = sr0;
+      const frames = take.frames;
+      const meta = JSON.stringify({
+          id,
+          name,
           ext: 'wav',
-          size: bytes.length,
-          durationSec: take.frames / sr0,
-          sampleRate: sr0,
+          size: 44 + frames * 2 * 2,
+          durationSec: frames / rate,
+          sampleRate: rate,
           channels: 2,
           createdAt: Date.now(),
           origin: 'recording',
@@ -6060,12 +8003,30 @@ registerKernel('tape-recorder', (params, sv) => {
           // the user asks for one — "Save As…" copies it into a cassette.
           // Without this, every ■ litters the Cassettes tab with a file.
           scratch: true,
-        }),
-      );
-      k.tapeOut?.(takeId);
-      // `rewrote` tells the renderer its decoded buffer and waveform scans for
-      // this id are stale — a punch changed the bytes underneath them.
-      send({ op: 'tape-created', id: takeId, name: takeName, node: k.nodeId, rewrote: !fresh });
+        });
+      // The announcement waits for the bytes: the renderer decodes the file as
+      // soon as it hears about it, and the old synchronous write is what made
+      // "the file is there when the message arrives" true. Keep that true.
+      writeWavChunked(chans, rate, path.join(dir, id + '.wav'), (err) => {
+        if (err) {
+          send({ op: 'status', error: 'recorder save failed: ' + String(err) });
+          return;
+        }
+        fs.writeFile(path.join(dir, id + '.json'), meta, (err2) => {
+          if (err2) {
+            send({ op: 'status', error: 'recorder save failed: ' + String(err2) });
+            return;
+          }
+          // Through `pushTape`, not straight out: while the recorder still
+          // holds the take, `tape` keeps presenting the LIVE one, which is the
+          // truth between punches. This only reaches a sink once the take is
+          // gone (Clear), and then it is the right thing to hand over.
+          pushTape();
+          // `rewrote` tells the renderer its decoded buffer and waveform scans
+          // for this id are stale — a punch changed the bytes underneath them.
+          send({ op: 'tape-created', id, name, node: k.nodeId, rewrote });
+        });
+      });
     } catch (err) {
       send({ op: 'status', error: 'recorder save failed: ' + String(err) });
     }
@@ -6074,7 +8035,11 @@ registerKernel('tape-recorder', (params, sv) => {
   const k: Kernel = {
     out: (port) => (port === 'out' ? outBuf : null),
     tapeOut: null,
-    tapeAssetId: () => takeId,
+    tapeAssetId: () => tapeId(),
+    dispose: () => {
+      clearInterval(timer);
+      sv.assets.setLive(liveId(), null);
+    },
     setParam: (id, v) => {
       const pressed = v === 1 || v === true;
       if (id === 'gain') return gain.set(num(v, 1));
@@ -6112,7 +8077,14 @@ registerKernel('tape-recorder', (params, sv) => {
         head = 0;
         dirtySinceCommit = false;
         // The cassette itself survives — dropping a take must not silently
-        // delete a recording that may already be in use elsewhere.
+        // delete a recording that may already be in use elsewhere. The live
+        // buffer does go, and `tape` falls back to that cassette: a sampler
+        // wired here keeps playing what was committed rather than a take that
+        // no longer exists.
+        live.reset();
+        sv.assets.setLive(liveId(), null);
+        pushed = '';
+        pushTape();
       }
     },
     process: (ins, ctx) => {
@@ -6126,7 +8098,7 @@ registerKernel('tape-recorder', (params, sv) => {
         if (x > peak) peak = x;
       }
       level = [Math.sqrt(sum / ctx.n), peak];
-      if (recording && head < MAX_FRAMES) {
+      if (recording && head < maxFrames()) {
         take.write(head, buf[0], buf[1], ctx.n);
         head += ctx.n;
         dirtySinceCommit = true;

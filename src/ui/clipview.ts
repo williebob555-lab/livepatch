@@ -34,9 +34,12 @@ import {
 } from '../core/cassettes';
 import { encodeAudio } from '../core/encode';
 import {
+  detectSliceKeys,
   detectTransients,
   divideEvenly,
+  parseSliceKeys,
   parseSlicePoints,
+  serializeSliceKeys,
   serializeSlicePoints,
   sliceCount,
   sliceEdges,
@@ -49,6 +52,7 @@ import { DockTabHandle, registerDockTab } from './dockpanel';
 import { resolveAssetFor } from './tape';
 import { MenuItem, hideBanner, promptModal, showBanner, showContextMenu } from './menus';
 import { fitCanvasBacking, onUiScaleChange } from './uiscale';
+import { TwoPointerGesture, capture, isCoarse, wheelIntent } from './input';
 
 /** Shorthand for the toolbar's button factory (see rebuildBar). */
 type BarBtn = (label: string, title: string, fn: () => void, cls?: string) => HTMLButtonElement;
@@ -214,8 +218,9 @@ function build(body: HTMLElement): DockTabHandle {
     if (tape) {
       if (tape.id !== targetId) {
         // Hand the old target its bars back before letting go of it — a parked
-        // pair belongs to the block it was parked on.
+        // pair belongs to the block it was parked on, and so does a parked Loop.
         endAudition();
+        endSpaceOnce();
         targetId = tape.id;
         targetPath = doc.pathOf(tape.id);
         view = { t0: 0, t1: 1 };
@@ -373,6 +378,54 @@ function build(body: HTMLElement): DockTabHandle {
     invalidate();
   };
 
+  /**
+   * What Space parked, so it can be handed back. Same shape and the same
+   * lifetime rules as `selParked` — see `playSelection`.
+   */
+  let spaceLoop: { block: Block; loopId: string; was: boolean; playing: boolean } | null = null;
+
+  /** Put a Loop toggle that Space turned off back on. Safe at any time. */
+  const endSpaceOnce = (): void => {
+    const p = spaceLoop;
+    spaceLoop = null;
+    if (p) setParam(p.block, p.loopId, p.was);
+  };
+
+  /**
+   * Space: **toggle**, and play **once**.
+   *
+   * Two things were wrong with the old one-liner. It asked
+   * `pl.params.playing ? 'stop' : 'start'`, and `midi-player` has no `playing`
+   * param at all — so the test was always `undefined`, Space always pressed ▶,
+   * and pressing it a second time restarted from the top instead of stopping.
+   * The transport state lives in the *engine*, not in a param, so that is where
+   * this asks (`runtime.transportFor`), exactly as the playhead already does.
+   *
+   * And Space is an **audition**, not the block's own transport: it plays the
+   * roll through and stops. `loop` is the block's setting for the patch and
+   * defaults on, so a bare ▶ ran forever. Rather than write over the user's
+   * toggle, Space *parks* it for the duration, the same way `playSelection`
+   * parks the play bars — restored on the next Space, on ■, when playback runs
+   * out on its own (`onFrame`), and when the target changes. There is no state
+   * in which the user is left with Loop off because they pressed Space once.
+   */
+  const toggleTransport = (b: Block, playId: string, stopId?: string, loopId?: string): void => {
+    const tp = runtime.transportFor(nodeIdOf(b));
+    if (tp?.playing) {
+      endSpaceOnce();
+      if (stopId) pressAction(b, stopId);
+      invalidate();
+      return;
+    }
+    endSpaceOnce(); // a previous audition that never got its Loop back
+    if (loopId && isOn(b, loopId)) {
+      spaceLoop = { block: b, loopId, was: true, playing: false };
+      setParam(b, loopId, false);
+    }
+    pressAction(b, playId);
+    invalidate();
+  };
+
   // ---- sampler helpers ----------------------------------------------------
 
   const samplerMode = (b: Block | null): string =>
@@ -388,17 +441,34 @@ function build(body: HTMLElement): DockTabHandle {
     const a = Math.max(reg.start, Math.min(reg.end - 1e-5, num(b, 'loopStart', 0) || reg.start));
     const rawLen = num(b, 'loopLen', 0);
     const z = rawLen > 1e-6 ? Math.min(reg.end, a + rawLen) : reg.end;
-    const fade = Math.min(num(b, 'loopFade', 0), (z - a) * 0.5, a - reg.start);
+    // Half the loop is the only ceiling — the seam fade overlaps the loop's
+    // own material, so it needs no run-up before the loop start (dsp.ts
+    // `readXf`). Capping it at that run-up is what made the fade silently zero
+    // on the loop the Loop button hands you.
+    const fade = Math.min(num(b, 'loopFade', 0), (z - a) * 0.5);
     return { a, b: Math.max(a + 1e-5, z), fade: Math.max(0, fade) };
   };
 
   const slicesOf = (b: Block | null): number[] =>
     b && roleOf(b).sampler ? parseSlicePoints(b.params.slices) : [];
 
+  const sliceMapOf = (b: Block | null): string =>
+    b && typeof b.params.slicemap === 'string' ? b.params.slicemap : 'Chromatic';
+  const sliceKeysOf = (b: Block | null): number[] => (b ? parseSliceKeys(b.params.slicekeys) : []);
+
+  /**
+   * Write the slice points — and drop any detected keys with them.
+   *
+   * The key list is positional: key `i` describes slice `i`. Re-cutting the
+   * region means slice `i` is now a different piece of audio, so keeping the
+   * old keys would map notes to material that was never listened to. Losing
+   * them is honest; the ♪ Keys button is one press away.
+   */
   const setSlices = (pts: number[]): void => {
     const b = target();
     if (!b) return;
     setParam(b, 'slices', serializeSlicePoints(pts));
+    if (sliceKeysOf(b).length) setParam(b, 'slicekeys', '');
     rebuildBar();
     invalidate();
   };
@@ -912,11 +982,19 @@ function build(body: HTMLElement): DockTabHandle {
       gg.stroke();
     }
     if (lp.fade > 0) {
+      // Two ramps, because the seam fade is an OVERLAP: the tail ramps out
+      // over the last `fade` of the loop while the loop's own head ramps in
+      // over the first `fade`, and the lap then resumes at the end of that
+      // head (dsp.ts `readXf`). Drawing only the tail ramp would say the head
+      // is untouched, and the first thing anyone does is wonder why the loop
+      // got shorter.
       gg.strokeStyle = 'rgba(127,214,168,0.85)';
       gg.lineWidth = 1.2;
       gg.beginPath();
       gg.moveTo(fx(lp.b), p.y + p.h);
       gg.lineTo(fx(lp.b - lp.fade), p.y + FADE_STRIP);
+      gg.moveTo(fx(lp.a), p.y + p.h);
+      gg.lineTo(fx(lp.a + lp.fade), p.y + FADE_STRIP);
       gg.stroke();
       diamond(gg, fx(lp.b - lp.fade), p.y + FADE_STRIP / 2 + 1, LOOP_COLOR);
     }
@@ -938,6 +1016,8 @@ function build(body: HTMLElement): DockTabHandle {
     if (!reg) return;
     const edges = sliceEdges(slicesOf(b), reg.start, reg.end);
     const root = Math.round(num(b, 'root', 60));
+    const pitched = sliceMapOf(b) === 'Pitched';
+    const keys = sliceKeysOf(b);
     gg.font = '9px Segoe UI, sans-serif';
     gg.textBaseline = 'top';
     for (let i = 0; i < edges.length; i++) {
@@ -957,11 +1037,17 @@ function build(body: HTMLElement): DockTabHandle {
       if (i < edges.length - 1) {
         const w = fx(edges[i + 1]) - x;
         if (w > 26) {
+          // The key this slice answers to. In Pitched mode that is the key it
+          // was *detected* to sound, which is the whole point of detecting it —
+          // labelling every slice with root+index there would describe a
+          // mapping the engines are not using.
+          const detected = pitched ? keys[i] ?? -1 : -1;
+          const label = pitched ? (detected >= 0 ? noteLabel(detected) : '—') : noteLabel(root + i);
           gg.fillStyle = 'rgba(0,0,0,0.5)';
           gg.fillRect(x + 2, p.y + p.h - 14, 24, 12);
-          gg.fillStyle = SLICE_COLOR;
+          gg.fillStyle = pitched && detected < 0 ? 'rgba(210,216,226,0.45)' : SLICE_COLOR;
           gg.textAlign = 'left';
-          gg.fillText(noteLabel(root + i), x + 4, p.y + p.h - 13);
+          gg.fillText(label, x + 4, p.y + p.h - 13);
         }
       }
     }
@@ -1124,6 +1210,7 @@ function build(body: HTMLElement): DockTabHandle {
       btn('■', 'Stop', () => {
         pressAction(b, role.transport!.stop!);
         endAudition(); // whatever ▶ parked, ■ hands back
+        endSpaceOnce(); // …and whatever Space did
       });
     if (role.transport?.clear)
       btn('Clear', 'Drop the take (anything already saved as a cassette is kept)', () =>
@@ -1233,7 +1320,7 @@ function build(body: HTMLElement): DockTabHandle {
         invalidate();
       });
       l.classList.toggle('on', on);
-      if (on)
+      if (on) {
         btn('⤢ Loop', 'Set the loop to the whole region', () => {
           const reg = region();
           if (!reg) return;
@@ -1242,20 +1329,92 @@ function build(body: HTMLElement): DockTabHandle {
           setParam(b, 'loopLen', Math.round((reg.end - reg.start) * 1e5) / 1e5);
           invalidate();
         });
+        // The seam crossfade — the fade BETWEEN laps, as opposed to the region's
+        // fade in/out, which only bound the first and last one. It has always
+        // been draggable (the diamond on the loop-end ramp), and nobody ever
+        // found it: a handle you must already know about is not a control. One
+        // press gives it a useful length, another takes it away.
+        const lp = loopSpan();
+        const fade = lp?.fade ?? 0;
+        const xf = btn('⤫ Seam Fade', 'Crossfade between loop laps — the loop tail is mixed into its own head, so a loop point mid-waveform stops ticking once a lap. Drag the diamond on the loop-end ramp for a precise length. Native engine only.', () => {
+          const cur = loopSpan();
+          if (!cur) return;
+          doc.pushHistory();
+          // A quarter of the loop: enough to hear on a sustained tone, well
+          // inside the half-loop ceiling.
+          setParam(b, 'loopFade', fade > 0 ? 0 : Math.round((cur.b - cur.a) * 0.25 * 1e5) / 1e5);
+          rebuildBar();
+          invalidate();
+        });
+        xf.classList.toggle('on', fade > 0);
+        if (lp) {
+          const dur = getCassette(assetOf(b) ?? '')?.durationSec ?? 0;
+          const info = document.createElement('span');
+          info.className = 'clip-info';
+          info.textContent = dur
+            ? `loop ${fmtDuration((lp.b - lp.a - fade) * dur)}${fade > 0 ? ` · fade ${Math.round(fade * dur * 1000)} ms` : ''}`
+            : fade > 0
+              ? 'seam fade on'
+              : '';
+          info.title = 'A lap is the bracket minus the crossfade: the fade overlaps the loop’s own head, so the tail and head trade places instead of butting together.';
+          bar.appendChild(info);
+        }
+      }
     } else if (mode === 'slice') {
       const reg = region();
       const pts = slicesOf(b);
       const count = reg ? sliceCount(pts, reg.start, reg.end) : 1;
       const root = Math.round(num(b, 'root', 60));
+      const pitched = sliceMapOf(b) === 'Pitched';
+      const keys = sliceKeysOf(b);
       btn('÷ Divide…', 'Cut the region into equal slices', () => void divideSlices());
       btn('⌁ Detect', 'Place a slice on each transient in the region', () => void detectSlices(b));
+      // The mapping half of the job. Cutting a phrase up is useless on a
+      // keyboard if the pieces are dealt out in the order they happen to
+      // appear; this listens to each one and gives it the key it sounds.
+      btn('♪ Keys', 'Detect the pitch of every slice and map each one to the key it actually plays (switches to the Pitched map)', () =>
+        void detectSliceNotes(b),
+      );
       btn('⨯ Clear', 'Remove every slice', () => {
         doc.pushHistory();
         setSlices([]);
       });
+      const map = btn(
+        pitched ? '♪ Pitched' : '⌸ Chromatic',
+        pitched
+          ? 'Pitched: a key plays the slice whose detected pitch is nearest, transposed onto it — every key sounds. Click for Chromatic.'
+          : 'Chromatic: slices are dealt out from Root upward and play at their own pitch. Click for Pitched.',
+        () => {
+          doc.pushHistory();
+          setParam(b, 'slicemap', pitched ? 'Chromatic' : 'Pitched');
+          rebuildBar();
+          invalidate();
+        },
+      );
+      map.classList.toggle('on', pitched);
+      const held = String(b.params.slicehold ?? 'Gate') === 'Gate';
+      const hold = btn(
+        held ? '⌁ Gate' : '⌁ One-Shot',
+        held
+          ? 'Gate: the slice runs the full ADSR and note-off releases it. Click to make slices one-shots.'
+          : 'One-Shot: note-off is ignored and the slice plays out (still under the ADSR, with the release finishing at the slice end). Click for Gate.',
+        () => {
+          doc.pushHistory();
+          setParam(b, 'slicehold', held ? 'One-Shot' : 'Gate');
+          rebuildBar();
+        },
+      );
+      hold.classList.toggle('on', held);
       const lbl = document.createElement('span');
       lbl.className = 'clip-info';
-      lbl.textContent = `${count} slice${count === 1 ? '' : 's'} · ${noteLabel(root)}–${noteLabel(root + count - 1)}`;
+      if (pitched) {
+        const known = keys.filter((k) => k >= 0);
+        const lo = known.length ? Math.min(...known) : root;
+        const hi = known.length ? Math.max(...known) : root + count - 1;
+        lbl.textContent = `${count} slice${count === 1 ? '' : 's'} · ${known.length}/${count} pitched · ${noteLabel(lo)}–${noteLabel(hi)}`;
+      } else {
+        lbl.textContent = `${count} slice${count === 1 ? '' : 's'} · ${noteLabel(root)}–${noteLabel(root + count - 1)}`;
+      }
       lbl.title = 'Ctrl-click the waveform to add a slice; drag a marker to move it; right-click to delete';
       bar.appendChild(lbl);
     }
@@ -1558,6 +1717,40 @@ function build(body: HTMLElement): DockTabHandle {
     }
   };
 
+  /**
+   * Give every slice the key it actually sounds, and switch the block to the
+   * Pitched map so those keys are what the engines use.
+   *
+   * This needs the *samples*, not the peak picture the rest of the tab draws
+   * from — periodicity is exactly what a min/max envelope throws away — so it
+   * decodes the cassette. That is the same buffer the web engine plays and it
+   * is cached, so the cost is a decode the first time and nothing after.
+   */
+  const detectSliceNotes = async (b: Block): Promise<void> => {
+    const assetId = assetOf(b);
+    const reg = region();
+    if (!assetId || !reg) return;
+    const buf = await getCassetteBuffer(assetId);
+    if (!buf || target() !== b) return;
+    const live = region();
+    if (!live) return;
+    const edges = sliceEdges(slicesOf(b), live.start, live.end);
+    const keys = detectSliceKeys(buf.getChannelData(0), buf.sampleRate, edges);
+    doc.pushHistory();
+    setParam(b, 'slicekeys', serializeSliceKeys(keys));
+    setParam(b, 'slicemap', 'Pitched');
+    rebuildBar();
+    invalidate();
+    const found = keys.filter((k) => k >= 0).length;
+    showBanner(
+      found === 0
+        ? 'No pitched slices found — nothing here holds a steady note. The kit stays on its chromatic keys.'
+        : `Mapped ${found} of ${keys.length} slice${keys.length === 1 ? '' : 's'} to detected keys. Unpitched ones keep their chromatic slot.`,
+      { accent: found ? undefined : doc.scene.theme.wireClipColor },
+    );
+    setTimeout(hideBanner, 3200);
+  };
+
   // ---- roll operations ----------------------------------------------------
 
   /** The player that will sound this roll: itself if it is one, else the first
@@ -1829,93 +2022,62 @@ function build(body: HTMLElement): DockTabHandle {
     return best;
   };
 
-  // ---- multi-touch (pinch-zoom + two-finger pan) --------------------------
+  // ---- multi-touch (two-finger pan, then pinch) ---------------------------
   // Single-finger already works through the pointer events below; this adds
-  // the second finger for both surfaces. Same shape as the workspace canvas's
-  // gesture handler, scoped to whichever surface is showing.
-  const pointers = new Map<number, Vec>();
-  let gesture: {
-    dist: number;
-    /** Per-axis finger separations, for the roll's independent x/y zoom. */
-    spanX: number;
-    spanY: number;
-    midX: number;
-    midY: number;
-    view: typeof view;
-    rollView: RollView;
-  } | null = null;
+  // the second finger for both surfaces, through the shared gesture tracker in
+  // `src/ui/input.ts`. Everything about pan-first and the deadzone lives there
+  // — this file only maps a frame onto whichever view is showing.
+  const gesture = new TwoPointerGesture();
 
   /**
-   * Floor for a pinch's per-axis separation.
+   * Apply one gesture frame, incrementally.
    *
-   * Two fingers side by side have a vertical separation near zero, and a ratio
-   * of two near-zero numbers is noise — it would make the pitch axis explode
-   * the instant the fingers levelled out. Below this the axis simply stops
-   * zooming, which is also the intuitive reading of a horizontal pinch.
+   * This used to work from a snapshot of the view taken at gesture *start* and
+   * recompute the whole transform from the fingers' absolute positions each
+   * frame. That is what made the roll feel uncontrollable: with no deadzone,
+   * every attempted two-finger pan also rescaled both axes from the start
+   * baseline, so notes slid under the fingers and the error accumulated instead
+   * of settling. Per-frame deltas mean a pan is a pan — `zoomX`/`zoomY` are
+   * exactly 1 until the pinch clears the deadzone.
    */
-  const PINCH_FLOOR = 40;
-
-  const beginGesture = (): void => {
-    const pts = [...pointers.values()];
-    if (pts.length < 2) return;
-    // A gesture supersedes any single-finger drag in progress.
-    drag = { kind: 'none' };
-    roll.cancelDrag();
-    const dx = pts[0].x - pts[1].x;
-    const dy = pts[0].y - pts[1].y;
-    gesture = {
-      dist: Math.max(1, Math.hypot(dx, dy)),
-      spanX: Math.max(PINCH_FLOOR, Math.abs(dx)),
-      spanY: Math.max(PINCH_FLOOR, Math.abs(dy)),
-      midX: (pts[0].x + pts[1].x) / 2,
-      midY: (pts[0].y + pts[1].y) / 2,
-      view: { ...view },
-      rollView: { ...roll.view },
-    };
-  };
-
   const applyGesture = (): void => {
-    const pts = [...pointers.values()];
-    if (!gesture || pts.length < 2) return;
-    const dx = pts[0].x - pts[1].x;
-    const dy = pts[0].y - pts[1].y;
-    const dist = Math.max(1, Math.hypot(dx, dy));
-    const midX = (pts[0].x + pts[1].x) / 2;
-    const midY = (pts[0].y + pts[1].y) / 2;
-    const zoom = gesture.dist / dist; // spreading fingers (>start) zooms in
+    const f = gesture.frame();
+    if (!f) return;
     const b = target();
     if (b && isRollBlock(b.type)) {
-      const g0 = gesture.rollView;
       const rr = roll.gridRect(canvas.clientWidth, canvas.clientHeight);
+      const v = roll.view;
       // The roll is a genuinely 2D editor, so its pinch is per-axis: a
       // horizontal spread zooms time, a vertical one zooms PITCH. Without the
-      // vertical half there was no way to zoom pitch by touch at all — rows sat
-      // at whatever `rows` happened to be, often near the 5 px floor, and a
-      // note row that small cannot be hit however generous the slop is.
-      const zoomX = gesture.spanX / Math.max(PINCH_FLOOR, Math.abs(dx));
-      const zoomY = gesture.spanY / Math.max(PINCH_FLOOR, Math.abs(dy));
-      const span = Math.max(0.5, Math.min(256, g0.beats * zoomX));
-      const rows = Math.max(6, Math.min(96, Math.round(g0.rows * zoomY)));
-      // Anchor the beat under the start midpoint; pan by the midpoint move.
-      const frac = (gesture.midX - rr.x) / Math.max(1, rr.w);
-      const anchorBeat = g0.t0 + frac * g0.beats;
-      roll.view.beats = span;
-      roll.view.rows = rows;
-      roll.view.t0 = Math.max(0, anchorBeat - frac * span - ((midX - gesture.midX) / rr.w) * span);
-      // Keep the note under the vertical midpoint put while `rows` changes,
-      // then apply the midpoint's own travel as a pan.
-      const vFrac = (gesture.midY - rr.y) / Math.max(1, rr.h);
-      const anchorNote = g0.lo + (1 - vFrac) * g0.rows;
-      const lo = anchorNote - (1 - vFrac) * rows - (midY - gesture.midY) / roll.rowH(canvas.clientHeight);
-      roll.view.lo = Math.max(0, Math.min(127 - rows, Math.round(lo)));
+      // vertical half there is no way to zoom pitch by touch at all — rows sit
+      // at whatever `rows` happens to be, often near the 5 px floor, and a note
+      // row that small cannot be hit however generous the slop is.
+      const beats = Math.max(0.5, Math.min(256, v.beats * f.zoomX));
+      const rows = Math.max(6, Math.min(96, Math.round(v.rows * f.zoomY)));
+      // Anchor the beat under the midpoint through the zoom, then pan by the
+      // midpoint's own travel.
+      const frac = (f.mid.x - rr.x) / Math.max(1, rr.w);
+      const anchorBeat = v.t0 + frac * v.beats;
+      v.beats = beats;
+      v.t0 = Math.max(0, anchorBeat - frac * beats - (f.dx / Math.max(1, rr.w)) * beats);
+      const vFrac = (f.mid.y - rr.y) / Math.max(1, rr.h);
+      const anchorNote = v.lo + (1 - vFrac) * v.rows;
+      v.rows = rows;
+      // `+ f.dy`, matching the `- f.dx` above: both are the **grab** sign, which
+      // is what a finger on the surface means — the note under the fingers stays
+      // under them. It reads as `+` only because the pitch axis is drawn
+      // inverted against screen y (`ny` puts `lo` at the bottom), so dragging
+      // down reveals the higher notes that were above the top edge. This was `-`
+      // — scroll-style on the pitch axis and grab-style on time, in one gesture.
+      v.lo = Math.max(0, Math.min(127 - rows, Math.round(anchorNote - (1 - vFrac) * rows + f.dy / roll.rowH(canvas.clientHeight))));
     } else {
-      const g0 = gesture.view;
-      const span0 = g0.t1 - g0.t0;
       const pr = plot();
-      const frac = (gesture.midX - pr.x) / Math.max(1, pr.w);
-      const anchor = g0.t0 + frac * span0;
-      const span = Math.max(0.00005, Math.min(1, span0 * zoom));
-      view = { t0: Math.max(0, anchor - frac * span - ((midX - gesture.midX) / pr.w) * span), t1: 0 };
+      const span0 = view.t1 - view.t0;
+      const frac = (f.mid.x - pr.x) / Math.max(1, pr.w);
+      const anchor = view.t0 + frac * span0;
+      // The waveform has one axis; a pinch in any direction scales time.
+      const span = Math.max(0.00005, Math.min(1, span0 / f.zoom));
+      view = { t0: anchor - frac * span - (f.dx / Math.max(1, pr.w)) * span, t1: 0 };
       view.t1 = view.t0 + span;
       clampView();
     }
@@ -1931,16 +2093,19 @@ function build(body: HTMLElement): DockTabHandle {
     if (!b) return;
     // Every grab tolerance in the roll widens for a fingertip — see
     // `TOUCH_SLOP` in pianoroll.ts. Set before any hit test runs.
-    roll.touch = e.pointerType !== 'mouse';
-    try {
-      canvas.setPointerCapture(e.pointerId);
-    } catch {}
+    roll.touch = isCoarse(e);
+    capture(canvas, e.pointerId);
     canvas.focus();
 
-    if (e.pointerType === 'touch') {
-      pointers.set(e.pointerId, p);
-      if (pointers.size >= 2) {
-        beginGesture();
+    // Pen counts as a gesture pointer too — a tablet user with two styluses is
+    // not the case this guards, but a palm-plus-pen is, and dropping the
+    // second pointer entirely is what leaves a stuck drag behind.
+    if (isCoarse(e)) {
+      gesture.add(e.pointerId, p);
+      if (gesture.count >= 2) {
+        // A gesture supersedes any single-finger drag in progress.
+        drag = { kind: 'none' };
+        roll.cancelDrag();
         return;
       }
     }
@@ -2029,17 +2194,14 @@ function build(body: HTMLElement): DockTabHandle {
 
   canvas.addEventListener('pointermove', (e) => {
     const p = toSurface(e);
-    roll.touch = e.pointerType !== 'mouse';
+    roll.touch = isCoarse(e);
     noSnap = e.altKey;
     // Ctrl held = "this drag selects" — the cursor has to say so before the
     // button goes down, or the modifier is invisible.
     noSnapCtrl = e.ctrlKey;
-    if (e.pointerType === 'touch' && pointers.has(e.pointerId)) {
-      pointers.set(e.pointerId, p);
-      if (gesture) {
-        applyGesture();
-        return;
-      }
+    if (gesture.update(e.pointerId, p) && gesture.active) {
+      applyGesture();
+      return;
     }
     const tb = target();
     if (tb && isRollBlock(tb.type)) {
@@ -2096,12 +2258,12 @@ function build(body: HTMLElement): DockTabHandle {
   });
 
   const endDrag = (e?: PointerEvent): void => {
-    if (e && pointers.has(e.pointerId)) {
-      pointers.delete(e.pointerId);
-      // Dropping below two fingers ends the pinch; a lone remaining finger
-      // does not resume a single-drag mid-gesture (it would jump).
-      if (gesture && pointers.size < 2) gesture = null;
-      if (pointers.size >= 1) return;
+    if (e && gesture.count) {
+      const wasActive = gesture.active;
+      gesture.remove(e.pointerId);
+      // A lone remaining finger does not resume a single-finger drag
+      // mid-gesture — it would jump to wherever that finger happens to be.
+      if (wasActive || gesture.count >= 1) return;
     }
     const tb = target();
     if (tb && isRollBlock(tb.type)) {
@@ -2164,10 +2326,10 @@ function build(body: HTMLElement): DockTabHandle {
     } else if (handle === 'end') {
       setParam(b, 'loopLen', r5(Math.max(1e-4, f - lp.a)));
     } else {
-      // The crossfade reaches backwards from the loop end into the run-up
-      // before the loop start, so it cannot outrun either.
+      // The crossfade overlaps the loop's own head, so half the loop is the
+      // only bound (plus the param's own 0.25-of-file range).
       const want = Math.max(0, lp.b - f);
-      setParam(b, 'loopFade', r5(Math.min(want, (lp.b - lp.a) * 0.5, lp.a - reg.start, 0.25)));
+      setParam(b, 'loopFade', r5(Math.min(want, (lp.b - lp.a) * 0.5, 0.25)));
     }
     invalidate();
   };
@@ -2217,6 +2379,16 @@ function build(body: HTMLElement): DockTabHandle {
     invalidate();
   };
 
+  /**
+   * Wheel / trackpad scroll.
+   *
+   * The roll declares itself `'2d'`, so Ctrl scales time and Shift scales
+   * pitch; a bare trackpad scroll pans both axes. Before this it called
+   * `roll.wheel(e.deltaY, …)` — `deltaX` was dropped on the floor and a plain
+   * scroll *zoomed time*, so a two-finger pan on a trackpad rescaled the
+   * editor instead of moving it, and there was no way to scroll pitch at all.
+   * That is the bulk of "interacting with the Roll is near impossible".
+   */
   canvas.addEventListener(
     'wheel',
     (e) => {
@@ -2225,22 +2397,23 @@ function build(body: HTMLElement): DockTabHandle {
       e.preventDefault();
       const p = toSurface(e);
       if (isRollBlock(b.type)) {
-        roll.wheel(e.deltaY, p, canvas.clientWidth, canvas.clientHeight, e);
+        roll.applyWheel(wheelIntent(e, { axes: '2d', zoomRate: 0.004 }), p, canvas.clientWidth, canvas.clientHeight);
         invalidate();
         return;
       }
       const pr = plot();
       const at = Math.max(0, Math.min(1, (p.x - pr.x) / Math.max(1, pr.w)));
-      if (e.shiftKey) {
-        // Shift-wheel scrolls; plain wheel zooms at the cursor (waveform views
-        // are zoom-first surfaces).
+      const it = wheelIntent(e, { zoomRate: 0.004 });
+      if (it.kind === 'zoom') {
+        zoomBy(1 / it.factor, at);
+      } else {
+        // A waveform is one-dimensional: both scroll axes move time, so a
+        // diagonal trackpad flick still does the obvious thing.
         const span = view.t1 - view.t0;
-        const dt = (e.deltaY / 400) * span;
+        const dt = ((it.dx + it.dy) / Math.max(1, pr.w)) * span;
         view = { t0: view.t0 + dt, t1: view.t1 + dt };
         clampView();
         invalidate();
-      } else {
-        zoomBy(e.deltaY > 0 ? 1.25 : 0.8, at);
       }
     },
     { passive: false },
@@ -2338,16 +2511,19 @@ function build(body: HTMLElement): DockTabHandle {
       } else if (e.key === ' ') {
         e.preventDefault();
         const pl = playerFor(b);
-        if (pl) pressAction(pl, pl.params.playing ? 'stop' : 'start');
+        if (pl) toggleTransport(pl, 'start', 'stop', 'loop');
       }
       return;
     }
     const role = roleOf(b);
     if (e.key === ' ') {
       e.preventDefault();
-      // Space follows the same rule as ▶: a selection is what plays.
-      if (selSpan()) playSelection(b);
-      else if (role.transport?.play) pressAction(b, role.transport.play);
+      // Space follows the same rule as ▶: a selection is what plays. Stopping
+      // comes first either way — Space is a toggle before it is anything else.
+      const tp = runtime.transportFor(nodeIdOf(b));
+      if (tp?.playing && role.transport?.stop) toggleTransport(b, role.transport.play!, role.transport.stop, role.loop);
+      else if (selSpan()) playSelection(b);
+      else if (role.transport?.play) toggleTransport(b, role.transport.play, role.transport.stop, role.loop);
     } else if (e.key === 'f' || e.key === 'F') {
       view = { t0: 0, t1: 1 };
       invalidate();
@@ -2383,6 +2559,13 @@ function build(body: HTMLElement): DockTabHandle {
         const tp = b ? runtime.transportFor(nodeIdOf(b)) : null;
         if (tp?.playing) selParked.playing = true;
         else if (selParked.playing) endAudition();
+      }
+      // Same latch for the Loop that Space parked: when the one-shot runs out,
+      // hand the toggle back without the user having to press anything.
+      if (spaceLoop) {
+        const tp = runtime.transportFor(nodeIdOf(spaceLoop.block));
+        if (tp?.playing) spaceLoop.playing = true;
+        else if (spaceLoop.playing) endSpaceOnce();
       }
       // The playhead only moves while audio runs; otherwise repaint on demand.
       if (dirty || (audioOn && target())) {

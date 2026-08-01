@@ -761,10 +761,16 @@ VstInstance* instanceGet(int32_t handle) {
 void instanceDestroy(int32_t handle) {
   auto it = registry().find(handle);
   if (it == registry().end()) return;
-  // Close the editor and release the plugin on the thread that created it,
-  // then drop the object here.
-  UiThread::instance().destroyInstance(it->second.get());
+  // Close the editor and release the plugin on the thread that created it —
+  // and do NOT wait for it. This runs on the JS thread, which is the audio
+  // pump, and a plugin's shutdown is unbounded work (module unload, GUI
+  // teardown); the old blocking form froze audio for up to 5 s every time a
+  // plugin block was deleted or a different plugin picked. Ownership moves to
+  // the UI thread with the command, and the handle leaves the registry now, so
+  // nothing here can reach the instance again.
+  auto inst = std::move(it->second);
   registry().erase(it);
+  UiThread::instance().destroyInstanceAsync(std::move(inst));
 }
 
 }  // namespace lp

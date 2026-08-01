@@ -8,7 +8,15 @@
       "Bash(grep -n \"  private \\\\|  [a-zA-Z]*\\(.*\\)[:{ ]*$\\\\|drawVisual\\\\|paintWidget\\\\|modOf\\\\|class Renderer\" src/ui/render.ts)",
       "Bash(npm run *)",
       "Bash(python -c ' *)",
-      "Bash(node -e ' *)"
+      "Bash(node -e ' *)",
+      "Bash(python -)",
+      "PowerShell(git -C \"C:\\\\SurroundApp 2\" log --oneline -5)",
+      "PowerShell(git -C \"C:\\\\SurroundApp 2\" status --short)",
+      "Bash(wc -l \"C:\\\\Users\\\\willi\\\\AppData\\\\Roaming\\\\LivePatch\\\\diagnostics\\\\livepatch-2026-07-31T17-52-26-412Z.log\")",
+      "Bash(ls -la \"C:\\\\Users\\\\willi\\\\AppData\\\\Roaming\\\\LivePatch\\\\diagnostics\\\\\" | tail -20)",
+      "PowerShell(npm run typecheck 2>&1)",
+      "Bash(node -e \"for\\(const k of ['GH_TOKEN','GITHUB_TOKEN','GH_TOKEN_FILE']\\)console.log\\(k, process.env[k]?'SET':'unset'\\)\")",
+      "Bash(gh auth *)"
     ]
   }
 }

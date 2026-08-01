@@ -64,6 +64,7 @@ registerBlock({
   title: 'Multi In',
   category: 'I/O & Hardware',
   group: 'Capture',
+  alsoIn: [{ category: 'Surround', group: 'Capture' }],
   desc: 'Multichannel capture onto one wide wire — WASAPI or ASIO (native engine)',
   inputs: [],
   outputs: [{ id: 'out', name: 'channels', kind: 'audio', dir: 'out', chans: 8 }],
@@ -102,13 +103,13 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
-    knob('width', 'Width', 0, 2, 1),
+    knob('width', 'Width', 0, 2, 1, { mark: 'width' }),
     knob('center', 'Center', 0, 1, 0.7),
     knob('surround', 'Surround', 0, 1, 0.5),
     knob('height', 'Height', 0, 1, 0.35),
     knob('spread', 'Spread', 0, 1, 0.6),
-    knob('lfe', 'LFE', 0, 1, 0.5),
-    knob('lfeFreq', 'LFE Freq', 40, 200, 80, { unit: 'Hz', curve: 'log', face: false }),
+    knob('lfe', 'LFE', 0, 1, 0.5, { affects: ['lfeFreq'] }),
+    knob('lfeFreq', 'LFE Freq', 40, 200, 80, { mark: 'lowpass', unit: 'Hz', curve: 'log', face: false }),
     knob('front', 'Front arc', 15, 90, 40, { unit: '°', face: false }),
   ],
   needsRig: true,
@@ -129,6 +130,7 @@ registerBlock({
   title: 'Distance',
   category: 'Surround',
   group: 'Spatial',
+  alsoIn: [{ category: 'Effects', group: 'Gain & Mix' }],
   desc: 'Distance cues for a source: gain rolloff, air-absorption low-pass, and Doppler',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
@@ -136,10 +138,10 @@ registerBlock({
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('distance', 'Distance', 0, 50, 3, { unit: 'm' }),
-    knob('air', 'Air', 0, 1, 0.4),
+    knob('distance', 'Distance', 0, 50, 3, { mark: 'distance', affects: ['air', 'rolloff'], unit: 'm' }),
+    knob('air', 'Air', 0, 1, 0.4, { mark: 'air' }),
     knob('doppler', 'Doppler', 0, 1, 0.5),
-    knob('rolloff', 'Rolloff', 0, 2, 1, { face: false }),
+    knob('rolloff', 'Rolloff', 0, 2, 1, { mark: 'rolloff', face: false }),
   ],
   stubbed: true,
   style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
@@ -154,10 +156,11 @@ registerBlock({
   title: 'Decorrelate',
   category: 'Surround',
   group: 'Spatial',
+  alsoIn: [{ category: 'Effects', group: 'Shape' }],
   desc: 'Phase-decorrelate a signal into a wide, diffuse stereo pair',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
-  params: [knob('amount', 'Amount', 0, 1, 0.7), knob('size', 'Size', 0, 1, 0.5, { face: false })],
+  params: [knob('amount', 'Amount', 0, 1, 0.7, { mark: 'spread' }), knob('size', 'Size', 0, 1, 0.5, { face: false })],
   stubbed: true,
   style: { shape: 'chamfer', fill: '#2f2c3b', stroke: '#9a7fe0' },
 });
@@ -180,8 +183,8 @@ registerBlock({
     { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'out' },
   ],
   params: [
-    knob('rate', 'Rate', 0.05, 4, 1),
-    knob('scale', 'Scale', 0, 1, 0.9),
+    knob('rate', 'Rate', 0.05, 4, 1, { mark: 'rate' }),
+    knob('scale', 'Scale', 0, 1, 0.9, { mark: 'depth' }),
     { id: 'system', name: 'System', type: 'enum', def: 'Lorenz', widget: 'select', options: ['Lorenz', 'Rössler'] },
   ],
   stubbed: true,
@@ -215,7 +218,7 @@ registerBlock({
     { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'out' },
   ],
   params: [
-    knob('rate', 'Rate', 0.01, 10, 0.2, { unit: 'Hz', curve: 'log' }),
+    knob('rate', 'Rate', 0.01, 10, 0.2, { mark: 'rate', unit: 'Hz', curve: 'log' }),
     { id: 'mode', name: 'Mode', type: 'enum', def: 'Loop', widget: 'select', options: ['Loop', 'Once', 'Ping-pong'] },
     { id: 'interp', name: 'Interp', type: 'enum', def: 'Smooth', widget: 'select', options: ['Linear', 'Smooth'], face: false },
     // A gentle default so a freshly-dropped block already traces something: a
@@ -251,10 +254,10 @@ registerBlock({
     { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'out' },
   ],
   params: [
-    knob('rate', 'Rate', 0.01, 10, 0.25, { unit: 'Hz', curve: 'log' }),
-    knob('radius', 'Radius', 0, 1, 0.8),
-    { id: 'path', name: 'Path', type: 'enum', def: 'Circle', widget: 'select', options: ['Circle', 'Lissajous', 'Spiral'] },
-    knob('tilt', 'Tilt', -1, 1, 0, { face: false }),
+    knob('rate', 'Rate', 0.01, 10, 0.25, { mark: 'rate', unit: 'Hz', curve: 'log' }),
+    knob('radius', 'Radius', 0, 1, 0.8, { mark: 'distance' }),
+    { id: 'path', name: 'Path', type: 'enum', def: 'Circle', widget: 'select', options: ['Circle', 'Lissajous', 'Spiral'], affects: ['ratio'] },
+    knob('tilt', 'Tilt', -1, 1, 0, { mark: 'tilt', face: false }),
     knob('height', 'Height', -1, 1, 0, { face: false }),
     knob('ratio', 'Y ratio', 1, 8, 2, { step: 1, face: false }),
     knob('phase', 'Phase', 0, 1, 0, { face: false }),
@@ -293,8 +296,8 @@ registerBlock({
     { id: 'xsrc', name: 'X from', type: 'enum', def: 'Pitch', widget: 'select', options: NOTE_SPACE_SRC },
     { id: 'ysrc', name: 'Y from', type: 'enum', def: 'Velocity', widget: 'select', options: NOTE_SPACE_SRC },
     { id: 'zsrc', name: 'Z from', type: 'enum', def: 'Off', widget: 'select', options: NOTE_SPACE_SRC },
-    knob('spread', 'Spread', 0, 1, 0.9),
-    knob('slew', 'Slew', 0, 2, 0.05, { unit: 's' }),
+    knob('spread', 'Spread', 0, 1, 0.9, { mark: 'spread' }),
+    knob('slew', 'Slew', 0, 2, 0.05, { mark: 'glide-up', unit: 's' }),
     { id: 'low', name: 'Low note', type: 'int', min: 0, max: 127, def: 36, step: 1, widget: 'knob', face: false },
     { id: 'high', name: 'High note', type: 'int', min: 0, max: 127, def: 96, step: 1, widget: 'knob', face: false },
     { id: 'voices', name: 'Round-robin', type: 'int', min: 2, max: 16, def: 4, step: 1, widget: 'knob', face: false },
@@ -329,10 +332,10 @@ registerBlock({
     { id: 'x', name: 'X', type: 'float', min: -1, max: 1, def: 0, widget: 'xy', yParam: 'y' },
     { id: 'y', name: 'Y', type: 'float', min: -1, max: 1, def: 0, widget: 'select' },
     knob('z', 'Z (height)', -1, 1, 0),
-    knob('spread', 'Spread', 0, 1, 0.15),
-    knob('rolloff', 'Rolloff', 3, 12, 6, { unit: 'dB', face: false }),
+    knob('spread', 'Spread', 0, 1, 0.15, { mark: 'spread' }),
+    knob('rolloff', 'Rolloff', 3, 12, 6, { mark: 'rolloff', unit: 'dB', face: false }),
     knob('gain', 'Gain', 0, 1.5, 1),
-    { id: 'mode', name: 'Mode', type: 'enum', def: 'DBAP', widget: 'select', options: ['DBAP', 'VBAP'], face: false },
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'DBAP', widget: 'select', options: ['DBAP', 'VBAP'], face: false, affects: ['spread', 'rolloff'] },
   ],
   needsRig: true,
   stubbed: true,
@@ -358,6 +361,7 @@ registerBlock({
   title: 'Room',
   category: 'Surround',
   group: 'Spatial',
+  alsoIn: [{ category: 'Effects', group: 'Time' }],
   desc: 'Geometric early reflections (image-source), each panned onto the rig — pair with Reverb for the tail',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
@@ -369,7 +373,7 @@ registerBlock({
     knob('width', 'Width', 2, 30, 7, { unit: 'm' }),
     knob('depth', 'Depth', 2, 30, 9, { unit: 'm' }),
     knob('height', 'Height', 2, 12, 3.2, { unit: 'm', face: false }),
-    knob('absorb', 'Absorb', 0, 0.95, 0.4),
+    knob('absorb', 'Absorb', 0, 0.95, 0.4, { mark: 'absorb' }),
     { id: 'order', name: 'Order', type: 'int', min: 1, max: 2, def: 2, step: 1, widget: 'knob' },
     { id: 'srcx', name: 'Src X', type: 'float', min: -1, max: 1, def: 0, widget: 'xy', yParam: 'srcy' },
     { id: 'srcy', name: 'Src Y', type: 'float', min: -1, max: 1, def: -0.3, widget: 'select' },
@@ -412,10 +416,10 @@ registerBlock({
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
     { id: 'bands', name: 'Bands', type: 'int', min: 2, max: 16, def: 8, step: 1, widget: 'knob' },
-    { id: 'mode', name: 'Pattern', type: 'enum', def: 'Rising', widget: 'select',
+    { id: 'mode', name: 'Pattern', type: 'enum', def: 'Rising', widget: 'select', affects: ['spin'],
       options: ['Rising', 'Falling', 'Alternate', 'Random'] },
-    knob('spin', 'Spin', -2, 2, 0, { unit: 'Hz' }),
-    knob('width', 'Width', 0, 1, 0.85),
+    knob('spin', 'Spin', -2, 2, 0, { mark: 'spin', unit: 'Hz' }),
+    knob('width', 'Width', 0, 1, 0.85, { mark: 'width' }),
     knob('elev', 'Elevation', -1, 1, 0),
     knob('low', 'Low', 40, 800, 120, { curve: 'log', unit: 'Hz', face: false }),
     knob('high', 'High', 1000, 16000, 9000, { curve: 'log', unit: 'Hz', face: false }),
@@ -437,6 +441,7 @@ registerBlock({
   title: 'Spatial Scope',
   category: 'Surround',
   group: 'Monitor',
+  alsoIn: [{ category: 'Visual', group: 'Monitor' }],
   desc: 'Top-down radar of the speaker layout, each speaker lit by its live level',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [],
@@ -572,6 +577,7 @@ registerBlock({
   title: 'Channel Pick',
   category: 'Surround',
   group: 'Monitor',
+  alsoIn: [{ category: 'Structure & Custom', group: 'Routing' }],
   desc: 'Take any two channels off a wide bus as a stereo pair — choose WHICH speakers survive the narrowing instead of always getting 1 and 2',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [{ id: 'out', name: 'L/R', kind: 'audio', dir: 'out' }],
@@ -590,6 +596,96 @@ registerBlock({
   style: { shape: 'chamfer', fill: '#22272f', stroke: '#4fd0c0' },
 });
 
+// Channel Split — unpack ONE wide speaker wire into its individual channels (or
+// stereo pairs). The "decode the format" half of the pair below.
+//
+// A wide net carries N channels on one wire; a stereo sink silently takes only
+// 1 and 2 (docs/02 truncation), and `chan-pick` takes any *one* pair. This is
+// the block that takes ALL of them at once: drop it after a Speaker Rig feed and
+// you have one narrow output per speaker, ready for a per-channel effect, scope
+// or headphone check. In Pairs mode each output is a stereo pair (channels 1-2,
+// 3-4, …) instead of a mono channel.
+//
+// `Count` is a port COUNT, not a width — the same variable-port-list problem as
+// the Matrix, re-derived in `GraphDoc.syncRigPorts`. The input's width follows
+// Count (and doubles in Pairs mode), so the wire chip tells you how many
+// channels it is reading.
+registerBlock({
+  type: 'chan-split',
+  title: 'Channel Split',
+  category: 'Surround',
+  group: 'Routing',
+  alsoIn: [{ category: 'Structure & Custom', group: 'Routing' }],
+  desc: 'Unpack a wide speaker wire into its individual channels — one narrow output per channel (or per stereo pair). The inverse of Channel Merge.',
+  // Real ports are `out1..outN`, synthesized per instance from Count. These are
+  // the defaults a fresh block starts with (see GraphDoc.syncRigPorts).
+  inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
+  outputs: [
+    { id: 'out1', name: '1', kind: 'audio', dir: 'out' },
+    { id: 'out2', name: '2', kind: 'audio', dir: 'out' },
+    { id: 'out3', name: '3', kind: 'audio', dir: 'out' },
+    { id: 'out4', name: '4', kind: 'audio', dir: 'out' },
+    { id: 'out5', name: '5', kind: 'audio', dir: 'out' },
+    { id: 'out6', name: '6', kind: 'audio', dir: 'out' },
+    { id: 'out7', name: '7', kind: 'audio', dir: 'out' },
+    { id: 'out8', name: '8', kind: 'audio', dir: 'out' },
+  ],
+  params: [
+    { id: 'count', name: 'Outputs', type: 'int', min: 1, max: 16, def: 8, step: 1, widget: 'knob' },
+    // Channels: output k = channel k (mono, centred so it's listenable on its
+    // own). Pairs: output k = channels 2k-1,2k as L/R, and the input reads twice
+    // as many channels.
+    { id: 'mode', name: 'Unit', type: 'enum', def: 'Channels', widget: 'select', options: ['Channels', 'Pairs'], face: false },
+    knob('gain', 'Gain', 0, 2, 1, { face: false }),
+  ],
+  stubbed: true,
+  minW: 120,
+  minH: 96,
+  style: { shape: 'chamfer', fill: '#25313d', stroke: '#68a6d8' },
+});
+
+// Channel Merge — pack several narrow wires into ONE wide speaker wire. The
+// "encode the format" half: the inverse of Channel Split.
+//
+// Branching a net sums signals onto one wire; it never *stacks* them onto
+// separate channels. This does: input k becomes channel k of the output bus, so
+// eight mono feeds become one 8-channel speaker wire you can hand to a Speaker
+// Rig or a Matrix. In Pairs mode input k is a stereo pair landing on channels
+// 2k-1,2k. It reads channel 1 (the left) of each mono input — feed it stereo and
+// only the left survives, which is the honest counterpart to the truncation
+// rules (docs/02): merging is explicit stacking, never an implicit fold.
+//
+// `Count` is a port COUNT (see Channel Split); the output's width follows it.
+registerBlock({
+  type: 'chan-merge',
+  title: 'Channel Merge',
+  category: 'Surround',
+  group: 'Routing',
+  alsoIn: [{ category: 'Structure & Custom', group: 'Routing' }],
+  desc: 'Stack several narrow wires onto one wide speaker wire — input k becomes channel k (or stereo pair k) of the output bus. The inverse of Channel Split.',
+  // Real ports are `in1..inN`, synthesized per instance from Count.
+  inputs: [
+    { id: 'in1', name: '1', kind: 'audio', dir: 'in' },
+    { id: 'in2', name: '2', kind: 'audio', dir: 'in' },
+    { id: 'in3', name: '3', kind: 'audio', dir: 'in' },
+    { id: 'in4', name: '4', kind: 'audio', dir: 'in' },
+    { id: 'in5', name: '5', kind: 'audio', dir: 'in' },
+    { id: 'in6', name: '6', kind: 'audio', dir: 'in' },
+    { id: 'in7', name: '7', kind: 'audio', dir: 'in' },
+    { id: 'in8', name: '8', kind: 'audio', dir: 'in' },
+  ],
+  outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
+  params: [
+    { id: 'count', name: 'Inputs', type: 'int', min: 1, max: 16, def: 8, step: 1, widget: 'knob' },
+    { id: 'mode', name: 'Unit', type: 'enum', def: 'Channels', widget: 'select', options: ['Channels', 'Pairs'], face: false },
+    knob('gain', 'Gain', 0, 2, 1, { face: false }),
+  ],
+  stubbed: true,
+  minW: 120,
+  minH: 96,
+  style: { shape: 'chamfer', fill: '#25313d', stroke: '#68a6d8' },
+});
+
 // Binaural — fold the whole rig down to headphones.
 //
 // Convolves each speaker's feed with a head model for that speaker's
@@ -603,6 +699,7 @@ registerBlock({
   title: 'Binaural',
   category: 'Surround',
   group: 'Monitor',
+  alsoIn: [{ category: 'Visual', group: 'Monitor' }, { category: 'Effects', group: 'Space' }],
   desc: 'Headphone monitor: folds the speaker layout to stereo with a head model (native engine)',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [{ id: 'out', name: 'L/R', kind: 'audio', dir: 'out' }],
@@ -646,6 +743,7 @@ registerBlock({
   title: 'Speaker Rig',
   category: 'I/O & Hardware',
   group: 'Playback',
+  alsoIn: [{ category: 'Surround', group: 'Output' }],
   desc: 'Multichannel output to the scene’s speaker layout — one channel per speaker, with per-speaker meters (native engine)',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [],
@@ -694,6 +792,7 @@ registerBlock({
   title: 'Speaker Monitor',
   category: 'Surround',
   group: 'Monitor',
+  alsoIn: [{ category: 'Visual', group: 'Monitor' }],
   desc: 'Per-speaker bar meters with click-to-mute and shift-click-to-solo — hear and see one speaker at a time',
   inputs: [{ id: 'in', name: 'speakers', kind: 'audio', dir: 'in', chans: 8 }],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
@@ -738,6 +837,7 @@ registerBlock({
   title: 'ASIO Out',
   category: 'I/O & Hardware',
   group: 'ASIO',
+  alsoIn: [{ category: 'Surround', group: 'Output' }],
   desc: 'ASIO hardware output — channel-addressed, mono or stereo pair (native engine)',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [],
@@ -754,6 +854,7 @@ registerBlock({
   title: 'VST Plugin',
   category: 'I/O & Hardware',
   group: 'Plugins',
+  alsoIn: [{ category: 'Effects', group: 'Plugins' }, { category: 'MIDI & Instruments', group: 'Instruments' }],
   desc: 'Hosts a VST3 plugin. Its parameters appear as a control surface on the block face — pin more, right-click for CV/MIDI. (native engine; passes through on web engine)',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
@@ -790,7 +891,7 @@ registerBlock({
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'wave', name: 'Wave', type: 'enum', def: 'sine', widget: 'select', options: ['sine', 'triangle', 'sawtooth', 'square'] },
-    knob('freq', 'Freq', 0.05, 40000, 220, { curve: 'log', unit: 'Hz' }),
+    knob('freq', 'Freq', 0.05, 40000, 220, { mark: 'freq', curve: 'log', unit: 'Hz' }),
     knob('level', 'Level', 0, 1, 0.4),
   ],
 });
@@ -804,7 +905,7 @@ registerBlock({
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'wave', name: 'Waveform', type: 'string', def: '', widget: 'wavedraw' },
-    knob('freq', 'Freq', 0.05, 4000, 220, { curve: 'log', unit: 'Hz' }),
+    knob('freq', 'Freq', 0.05, 4000, 220, { mark: 'freq', curve: 'log', unit: 'Hz' }),
     knob('level', 'Level', 0, 1, 0.4),
   ],
 });
@@ -820,6 +921,197 @@ registerBlock({
     { id: 'color', name: 'Color', type: 'enum', def: 'white', widget: 'select', options: ['white', 'pink', 'brown'] },
     knob('level', 'Level', 0, 1, 0.25),
   ],
+});
+
+// ===========================================================================
+// The modular voice — analog primitives (VCO / ladder VCF / EG / LFO / folder
+// / S+H / slew).
+//
+// These are the seven things a patchable synth voice is made of, and none of
+// them existed: the library could *route* control voltage beautifully and had
+// nothing to build an instrument out of. `synth` is a finished polysynth, not a
+// module; `osc` has no 1V/octave input, so it cannot be played by a pitch CV.
+//
+// **The convention every one of them shares: an exponential CV input is 1 volt
+// per octave, and 0 means "the knob".** `midi-cv`'s pitch out is already ±1 per
+// octave around middle C, so a MIDI keyboard, an LFO, a sequencer and a Sample
+// & Hold all plug into `pitch`, `cut` and `rate` and do the musical thing with
+// no scaling block in between. That is the whole reason these take dedicated
+// audio-rate ports rather than relying on the automatic `cv:<param>` path,
+// which modulates in *normalized param space* and would make a pitch CV mean
+// something different at every knob setting.
+//
+// Every one is implemented on both engines: an AudioWorklet on the web preview
+// (`MODULAR_WORKLET` in `src/blocks/units.ts`) and a per-sample kernel on
+// native. They are audio-rate all the way down, so an "LFO" at 500 Hz is an
+// oscillator and a filter cutoff can be modulated by audio — which is where the
+// interesting accidents live.
+// ===========================================================================
+registerBlock({
+  type: 'vco',
+  title: 'VCO',
+  category: 'Sources',
+  group: 'Oscillators',
+  alsoIn: [{ category: 'Control & CV', group: 'Modular' }],
+  desc: 'Analog-style oscillator: saw↔pulse blend, pulse width, 1V/oct pitch CV, PWM and hard sync. Anti-aliased (polyBLEP).',
+  inputs: [
+    { id: 'pitch', name: '1v/oct', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'pwm', name: 'pwm', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'sync', name: 'sync', kind: 'audio', dir: 'in', role: 'cv' },
+  ],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  params: [
+    // 8 Hz–8 kHz is the Mavis VCO's documented range, and it is a good one:
+    // the bottom of it is a repeating click, i.e. an LFO you can hear.
+    knob('freq', 'Pitch', 8, 8000, 261.626, { mark: 'freq', curve: 'log', unit: 'Hz', cv: true }),
+    knob('shape', 'Wave', 0, 1, 0, { mark: 'saw-pulse', affects: ['pw'], cv: true }),
+    knob('pw', 'PW', 0.02, 0.98, 0.5, { mark: 'pulse-narrow', cv: true }),
+    knob('level', 'Level', 0, 1, 0.6, { cv: true }),
+  ],
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#2b2f3d', stroke: '#7f9dff' },
+});
+
+registerBlock({
+  type: 'ladder',
+  title: 'Ladder Filter',
+  category: 'Effects',
+  group: 'Filter',
+  alsoIn: [{ category: 'Control & CV', group: 'Modular' }, { category: 'Sources', group: 'Modular' }],
+  desc: 'Four-pole (−24 dB/oct) transistor-ladder low pass with resonance to self-oscillation, drive, and a 1V/oct cutoff CV',
+  inputs: [
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
+    { id: 'cut', name: 'cutoff', kind: 'audio', dir: 'in', role: 'cv' },
+  ],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  params: [
+    knob('cutoff', 'Cutoff', 20, 20000, 1200, { mark: 'lowpass', curve: 'log', unit: 'Hz', cv: true }),
+    // Past ~0.95 the loop sustains on its own — that is the point, not a bug.
+    knob('res', 'Res', 0, 1.15, 0.15, { mark: 'reso', affects: ['cutoff'], cv: true }),
+    knob('drive', 'Drive', 0.1, 6, 1, { mark: 'drive', cv: true }),
+  ],
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#33283a', stroke: '#c07fe0' },
+});
+
+registerBlock({
+  type: 'wavefold',
+  title: 'Wave Folder',
+  category: 'Effects',
+  group: 'Shape',
+  alsoIn: [{ category: 'Control & CV', group: 'Modular' }, { category: 'Sources', group: 'Modular' }],
+  desc: 'Folds a signal back on itself instead of clipping it — adds harmonics that track the level, not the pitch',
+  inputs: [
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
+    { id: 'fold', name: 'fold', kind: 'audio', dir: 'in', role: 'cv' },
+  ],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  params: [
+    knob('amount', 'Fold', 0, 1, 0, { mark: 'fold', affects: ['sym'], cv: true }),
+    // Offsetting before the fold moves which part of the triangle the signal
+    // rides, so the fold stops being symmetric and even harmonics appear.
+    knob('sym', 'Sym', -1, 1, 0, { mark: 'bipolar', cv: true }),
+    knob('level', 'Level', 0, 2, 1, { cv: true }),
+  ],
+  minW: 104,
+  style: { shape: 'chamfer', fill: '#3a3326', stroke: '#e0a94f' },
+});
+
+registerBlock({
+  type: 'env-adsr',
+  title: 'Envelope',
+  category: 'Control & CV',
+  group: 'Generators',
+  alsoIn: [{ category: 'Sources', group: 'Modular' }],
+  desc: 'ADSR envelope fired by a gate CV — the articulation source for a patched voice. Exponential segments, like an RC envelope.',
+  inputs: [{ id: 'gate', name: 'gate', kind: 'audio', dir: 'in', role: 'cv' }],
+  outputs: [
+    { id: 'out', name: 'env', kind: 'audio', dir: 'out', role: 'cv' },
+    // The complement (1 − env), free: patch it to a cutoff for a filter that
+    // closes as the amplitude opens. It is 1−env rather than −env deliberately
+    // — the negation is what an Invert block is for, and the *useful* second
+    // output of an envelope is the one that stays in the same 0..1 range.
+    { id: 'inv', name: '1-env', kind: 'audio', dir: 'out', role: 'cv' },
+  ],
+  params: [
+    knob('attack', 'A', 0.0008, 5.5, 0.005, { mark: 'attack', curve: 'log', unit: 's', cv: true }),
+    knob('decay', 'D', 0.003, 18, 0.35, { mark: 'decay', curve: 'log', unit: 's', cv: true }),
+    knob('sustain', 'S', 0, 1, 0.6, { mark: 'sustain', affects: ['decay'], cv: true }),
+    knob('release', 'R', 0.003, 18, 0.35, { mark: 'release', curve: 'log', unit: 's', cv: true }),
+    // Off = a gate re-opening during release resumes from where the envelope
+    // already is (analog behaviour, no click). On = every gate restarts at 0.
+    { id: 'retrig', name: 'Retrig', type: 'bool', def: false, widget: 'toggle', face: false },
+  ],
+  minW: 118,
+  style: { shape: 'chamfer', fill: '#26333b', stroke: '#4fc0e0' },
+});
+
+registerBlock({
+  type: 'lfo',
+  title: 'LFO',
+  category: 'Control & CV',
+  group: 'Generators',
+  alsoIn: [{ category: 'Sources', group: 'Modular' }],
+  desc: 'Triangle↔square blend, 0.05–550 Hz, 1V/oct rate CV and a reset input. Runs into the audio range on purpose.',
+  inputs: [
+    { id: 'rate', name: 'rate', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'reset', name: 'reset', kind: 'audio', dir: 'in', role: 'cv' },
+  ],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
+  params: [
+    knob('rate', 'Rate', 0.05, 550, 2, { mark: 'rate', curve: 'log', unit: 'Hz', cv: true }),
+    knob('shape', 'Wave', 0, 1, 0, { mark: 'tri-square', cv: true }),
+    knob('amp', 'Amp', 0, 1, 1, { mark: 'depth', cv: true }),
+    // Unipolar puts the whole swing above zero, which is what a level or a
+    // filter that must never go negative wants.
+    { id: 'uni', name: 'Unipolar', type: 'bool', def: false, widget: 'toggle' },
+  ],
+  minW: 110,
+  isControl: true,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
+registerBlock({
+  type: 'sh',
+  title: 'Sample & Hold',
+  category: 'Control & CV',
+  group: 'Math',
+  alsoIn: [{ category: 'Sources', group: 'Modular' }, { category: 'Logic', group: 'Sample & Hold' }],
+  desc: 'Grabs its source on each rising edge of the trigger and holds it. Source defaults to internal noise, so it is a random voltage generator with one wire.',
+  inputs: [
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'trig', name: 'trig', kind: 'audio', dir: 'in', role: 'cv' },
+  ],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
+  params: [
+    // An explicit switch rather than "noise when nothing is patched in". The
+    // hardware this imitates decides that with a normalled jack; a graph has no
+    // equivalent the *web* engine can see — an AudioWorklet cannot reliably tell
+    // an unconnected input from a silent one — so making it a param is what
+    // keeps the two engines doing the same thing.
+    { id: 'source', name: 'Source', type: 'enum', def: 'noise', widget: 'select', options: ['noise', 'in'] },
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'hold', widget: 'select', options: ['hold', 'track'], affects: ['glide'] },
+    knob('glide', 'Glide', 0, 1, 0, { mark: 'glide-up', cv: true }),
+  ],
+  minW: 104,
+});
+
+registerBlock({
+  type: 'slew',
+  title: 'Slew · Glide',
+  category: 'Control & CV',
+  group: 'Math',
+  alsoIn: [{ category: 'Sources', group: 'Modular' }],
+  desc: 'Limits how fast a signal may move — portamento on a pitch CV, a lag on a gate, a smoother on anything steppy',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv' }],
+  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
+  params: [
+    knob('rise', 'Rise', 0, 9, 0, { mark: 'glide-up', curve: 'lin', unit: 's', cv: true }),
+    knob('fall', 'Fall', 0, 9, 0, { mark: 'glide-down', curve: 'lin', unit: 's', cv: true }),
+    // On, Fall follows Rise — one knob, which is what "glide" means.
+    { id: 'link', name: 'Link', type: 'bool', def: true, widget: 'toggle', affects: ['fall'] },
+  ],
+  minW: 104,
 });
 
 // ---------- Effects ----------
@@ -844,7 +1136,7 @@ registerBlock({
     { id: 'b', name: 'B', kind: 'audio', dir: 'in' },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
-  params: [knob('ratio', 'A↔B', 0, 1, 0.5), knob('gain', 'Out', 0, 2, 1)],
+  params: [knob('ratio', 'A↔B', 0, 1, 0.5, { mark: 'mix' }), knob('gain', 'Out', 0, 2, 1)],
 });
 registerBlock({
   type: 'subtract',
@@ -867,7 +1159,7 @@ registerBlock({
   desc: 'Stereo panner',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
-  params: [knob('pan', 'Pan', -1, 1, 0)],
+  params: [knob('pan', 'Pan', -1, 1, 0, { mark: 'bipolar' })],
 });
 registerBlock({
   type: 'eq3',
@@ -879,12 +1171,12 @@ registerBlock({
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     knob('lowFreq', 'Lo Hz', 30, 600, 120, { curve: 'log' }),
-    knob('lowGain', 'Lo dB', -18, 18, 0),
+    knob('lowGain', 'Lo dB', -18, 18, 0, { mark: 'shelf-low', affects: ['lowFreq'] }),
     knob('midFreq', 'Mid Hz', 120, 8000, 1000, { curve: 'log' }),
-    knob('midGain', 'Mid dB', -18, 18, 0),
-    knob('midQ', 'Mid Q', 0.2, 8, 1),
+    knob('midGain', 'Mid dB', -18, 18, 0, { mark: 'bell', affects: ['midFreq', 'midQ'] }),
+    knob('midQ', 'Mid Q', 0.2, 8, 1, { mark: 'bandwidth' }),
     knob('hiFreq', 'Hi Hz', 1500, 16000, 6000, { curve: 'log' }),
-    knob('hiGain', 'Hi dB', -18, 18, 0),
+    knob('hiGain', 'Hi dB', -18, 18, 0, { mark: 'shelf-high', affects: ['hiFreq'] }),
   ],
 });
 registerBlock({
@@ -959,10 +1251,10 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('threshold', 'Thresh', -60, 0, -24, { unit: 'dB' }),
-    knob('ratio', 'Ratio', 1, 20, 4),
-    knob('attack', 'Att', 0.001, 0.3, 0.01, { unit: 's' }),
-    knob('release', 'Rel', 0.02, 1, 0.25, { unit: 's' }),
+    knob('threshold', 'Thresh', -60, 0, -24, { mark: 'threshold', affects: ['ratio'], unit: 'dB' }),
+    knob('ratio', 'Ratio', 1, 20, 4, { mark: 'ratio' }),
+    knob('attack', 'Att', 0.001, 0.3, 0.01, { mark: 'attack', unit: 's' }),
+    knob('release', 'Rel', 0.02, 1, 0.25, { mark: 'release', unit: 's' }),
   ],
 });
 registerBlock({
@@ -974,10 +1266,10 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('threshold', 'Thresh', -80, 0, -40, { unit: 'dB' }),
-    knob('attack', 'Att', 0.0005, 0.1, 0.005, { unit: 's' }),
-    knob('release', 'Rel', 0.01, 1, 0.15, { unit: 's' }),
-    knob('range', 'Range', -80, 0, -60, { unit: 'dB' }),
+    knob('threshold', 'Thresh', -80, 0, -40, { mark: 'threshold', affects: ['range'], unit: 'dB' }),
+    knob('attack', 'Att', 0.0005, 0.1, 0.005, { mark: 'attack', unit: 's' }),
+    knob('release', 'Rel', 0.01, 1, 0.15, { mark: 'release', unit: 's' }),
+    knob('range', 'Range', -80, 0, -60, { mark: 'range', unit: 'dB' }),
   ],
   visual: 'meter',
 });
@@ -990,9 +1282,9 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('time', 'Time', 0.01, 2, 0.35, { unit: 's' }),
-    knob('feedback', 'F/B', 0, 0.95, 0.35),
-    knob('mix', 'Mix', 0, 1, 0.3),
+    knob('time', 'Time', 0.01, 2, 0.35, { mark: 'echo', unit: 's' }),
+    knob('feedback', 'F/B', 0, 0.95, 0.35, { mark: 'feedback' }),
+    knob('mix', 'Mix', 0, 1, 0.3, { mark: 'mix', affects: ['time', 'feedback'] }),
   ],
 });
 // Feedback — the block that makes a loop a patchable thing.
@@ -1017,11 +1309,11 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('amount', 'Amount', 0, 1.2, 0.85),
-    knob('time', 'Time', 0, 2, 0, { unit: 's' }),
-    knob('damp', 'Damp', 200, 18000, 8000, { curve: 'log', unit: 'Hz' }),
-    knob('ceiling', 'Ceiling', 0.1, 1, 0.9, { face: false }),
-    { id: 'limit', name: 'Limiter', type: 'bool', def: true, widget: 'toggle', face: false },
+    knob('amount', 'Amount', 0, 1.2, 0.85, { mark: 'feedback' }),
+    knob('time', 'Time', 0, 2, 0, { mark: 'echo', unit: 's' }),
+    knob('damp', 'Damp', 200, 18000, 8000, { mark: 'lowpass', curve: 'log', unit: 'Hz' }),
+    knob('ceiling', 'Ceiling', 0.1, 1, 0.9, { mark: 'ceiling', face: false }),
+    { id: 'limit', name: 'Limiter', type: 'bool', def: true, widget: 'toggle', face: false, affects: ['ceiling'] },
     { id: 'dcblock', name: 'DC block', type: 'bool', def: true, widget: 'toggle', face: false },
   ],
   minW: 110,
@@ -1040,12 +1332,13 @@ registerBlock({
   title: 'Convolution',
   category: 'Effects',
   group: 'Time',
+  alsoIn: [{ category: 'Surround', group: 'Spatial' }],
   desc: 'Convolve with an impulse response (reverb, cabinet, any recorded space) — Load an IR file',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'load', name: 'Load IR…', type: 'action', def: 0, widget: 'button', dialogAction: true },
-    knob('mix', 'Mix', 0, 1, 0.5),
+    knob('mix', 'Mix', 0, 1, 0.5, { mark: 'mix', affects: ['gain'] }),
     knob('gain', 'Gain', 0, 2, 1),
     { id: 'normalize', name: 'Normalize', type: 'bool', def: true, widget: 'toggle', face: false },
     { id: 'asset', name: 'IR', type: 'string', def: '', widget: 'select', face: false },
@@ -1056,14 +1349,15 @@ registerBlock({
   title: 'Reverb',
   category: 'Effects',
   group: 'Time',
+  alsoIn: [{ category: 'Surround', group: 'Spatial' }],
   desc: 'Algorithmic reverb (synthesized impulse)',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
-    knob('decay', 'Decay', 0.2, 8, 2.2, { unit: 's' }),
-    knob('predelay', 'Pre', 0, 0.15, 0.01, { unit: 's' }),
-    knob('tone', 'Tone', 400, 16000, 6500, { curve: 'log', unit: 'Hz' }),
-    knob('mix', 'Mix', 0, 1, 0.35),
+    knob('decay', 'Decay', 0.2, 8, 2.2, { mark: 'tail', unit: 's' }),
+    knob('predelay', 'Pre', 0, 0.15, 0.01, { mark: 'predelay', unit: 's' }),
+    knob('tone', 'Tone', 400, 16000, 6500, { mark: 'lowpass', curve: 'log', unit: 'Hz' }),
+    knob('mix', 'Mix', 0, 1, 0.35, { mark: 'mix', affects: ['decay', 'predelay', 'tone'] }),
   ],
 });
 
@@ -1159,13 +1453,71 @@ registerBlock({
   inputs: [],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', role: 'cv', dir: 'out' }],
   params: [
-    { id: 'mode', name: 'Mode', type: 'enum', def: 'hold', widget: 'select', options: ['hold', 'smooth'] },
-    knob('rate', 'Rate', 0.05, 20, 2, { curve: 'log', unit: 'Hz' }),
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'hold', widget: 'select', options: ['hold', 'smooth'], affects: ['rate'] },
+    knob('rate', 'Rate', 0.05, 20, 2, { mark: 'rate', curve: 'log', unit: 'Hz' }),
     { id: 'min', name: 'Min', type: 'float', min: -20000, max: 20000, def: 0, widget: 'select' },
     { id: 'max', name: 'Max', type: 'float', min: -20000, max: 20000, def: 1, widget: 'select' },
   ],
   isControl: true,
 });
+// Tempo Follow — a clock extracted from music.
+//
+// `clock-tempo` measures the period of a clock you already have. This makes one
+// where there wasn't one: feed it a record, a live input, anything with a beat,
+// and it puts out a square clock locked to that beat plus the tempo as CV. Every
+// clocked block in the library (Orbit, Trajectory, the arp, the sequencer) takes
+// a CV clock, so this is the wire that makes them all follow the music instead
+// of a knob — which is the interesting thing to do with a spatial patch.
+//
+// It is an estimator, not a transport: it reports what it currently believes
+// with a confidence, it takes a few bars to settle, and it can land on the
+// half or double of what a person would tap. `div` is there for exactly that —
+// and `lock` freezes the estimate once it is right, so a passage with no
+// discernible beat cannot drag it off.
+registerBlock({
+  type: 'tempo-follow',
+  title: 'Tempo Follow',
+  category: 'Control & CV',
+  group: 'Generators',
+  alsoIn: [{ category: 'Visual', group: 'Monitor' }, { category: 'MIDI & Instruments', group: 'Convert' }],
+  desc: 'Listens to audio and puts out a clock locked to its tempo, plus BPM and beat-phase CV',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [
+    // Square clock at `div` pulses per detected beat — what every clocked
+    // block in the library expects on its `clock` input.
+    { id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'out' },
+    // BPM/240, matching `clock-tempo`, so the two are interchangeable.
+    { id: 'bpm', name: 'bpm', kind: 'audio', role: 'cv', dir: 'out' },
+    // A 0..1 ramp per beat: the smooth version of the clock, for sweeping
+    // anything positional (a Trajectory phase, a filter, a pan).
+    { id: 'phase', name: 'phase', kind: 'audio', role: 'cv', dir: 'out' },
+    // How sure it is, 0..1. Worth patching to a meter while you set it up —
+    // an estimate you can't see the confidence of is a guess.
+    { id: 'conf', name: 'conf', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    // The search window. Halving it halves the work AND removes most octave
+    // errors, so it is the first thing to set.
+    knob('minbpm', 'Min', 40, 200, 70, { unit: 'BPM', step: 1 }),
+    knob('maxbpm', 'Max', 60, 300, 180, { unit: 'BPM', step: 1 }),
+    { id: 'div', name: 'Div', type: 'enum', def: '1', widget: 'select',
+      options: ['1/4', '1/2', '1', '2', '4'] },
+    // Freeze the estimate: the clock keeps running at the tempo it had.
+    { id: 'lock', name: 'Lock', type: 'bool', def: false, widget: 'toggle', affects: ['lockrate'] },
+    // Pulse width of the clock output, as a fraction of the pulse period.
+    knob('width', 'Width', 0.05, 0.9, 0.5, { face: false }),
+    // How hard the beat phase is pulled onto detected onsets. 0 = free-running
+    // at the detected tempo (steady, drifts), 1 = snaps to every onset (tight,
+    // jittery on a loose performance).
+    knob('lockrate', 'Track', 0, 1, 0.35, { face: false }),
+  ],
+  visual: 'tempo',
+  stubbed: true,
+  minW: 118,
+  minH: 80,
+  style: { shape: 'chamfer', fill: '#2c3b3a', stroke: '#4fd0c0' },
+});
+
 // ---------- CV math (audio-rate — works on any signal, colored as CV) ----------
 const cvIn = (id: string, name = id) =>
   ({ id, name, kind: 'audio' as const, role: 'cv' as const, dir: 'in' as const });
@@ -1178,7 +1530,7 @@ registerBlock({
   desc: 'out = in × scale + offset — attenuverter (negative scale inverts)',
   inputs: [cvIn('in')],
   outputs: [cvOut],
-  params: [knob('scale', 'Scale', -2, 2, 1), knob('offset', 'Offset', -2, 2, 0)],
+  params: [knob('scale', 'Scale', -2, 2, 1, { mark: 'bipolar' }), knob('offset', 'Offset', -2, 2, 0, { mark: 'offset' })],
 });
 registerBlock({
   type: 'cv-invert',
@@ -1209,10 +1561,11 @@ registerBlock({
   title: 'Comparator',
   category: 'Logic',
   group: 'Compare',
+  alsoIn: [{ category: 'Control & CV', group: 'Logic' }],
   desc: 'out = 1 while in exceeds the threshold — turns any signal into a clean gate',
   inputs: [cvIn('in')],
   outputs: [cvOut],
-  params: [knob('threshold', 'Thresh', -1, 1, 0.5)],
+  params: [knob('threshold', 'Thresh', -1, 1, 0.5, { mark: 'threshold' })],
 });
 for (const [op, desc] of [
   ['and', 'out = 1 while a AND b are high (> 0.5)'],
@@ -1238,6 +1591,7 @@ registerBlock({
   title: 'NOT',
   category: 'Logic',
   group: 'Gates',
+  alsoIn: [{ category: 'Control & CV', group: 'Logic' }],
   desc: 'out = 1 while in is low (≤ 0.5)',
   inputs: [cvIn('in')],
   outputs: [cvOut],
@@ -1262,10 +1616,10 @@ registerBlock({
   ],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
-    { id: 'mode', name: 'Mode', type: 'enum', def: 'up', widget: 'select', options: ['up', 'down', 'updown', 'random', 'order'] },
-    knob('rate', 'Rate', 0.5, 32, 8, { unit: 'hz' }),
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'up', widget: 'select', options: ['up', 'down', 'updown', 'random', 'order'], affects: ['octaves'] },
+    knob('rate', 'Rate', 0.5, 32, 8, { mark: 'rate', unit: 'hz' }),
     { id: 'octaves', name: 'Oct', type: 'int', min: 1, max: 4, def: 1, step: 1, widget: 'knob' },
-    knob('gate', 'Gate', 0.05, 1, 0.5),
+    knob('gate', 'Gate', 0.05, 1, 0.5, { mark: 'pulse-narrow' }),
     knob('prob', 'Prob', 0, 1, 1),
   ],
 });
@@ -1292,7 +1646,9 @@ registerBlock({
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
     { id: 'semis', name: 'Semi', type: 'int', min: -24, max: 24, def: 0, step: 1, widget: 'knob' },
-    { id: 'scale', name: 'Scale', type: 'enum', def: 'chromatic', widget: 'select',
+    // Chromatic ignores the key entirely — the one case where a control on this
+    // block genuinely does nothing, so it is the one worth drawing.
+    { id: 'scale', name: 'Scale', type: 'enum', def: 'chromatic', widget: 'select', affects: ['root'],
       options: ['chromatic', 'major', 'minor', 'pentatonic', 'dorian', 'mixolydian', 'harmonicMinor'] },
     { id: 'root', name: 'Key', type: 'enum', def: 'C', widget: 'select',
       options: ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] },
@@ -1303,14 +1659,15 @@ registerBlock({
   title: 'Step Sequencer',
   category: 'MIDI & Instruments',
   group: 'Tools',
+  alsoIn: [{ category: 'Control & CV', group: 'Generators' }],
   desc: 'Monophonic step sequencer. Clock in or internal rate; drag steps to set pitch, click to rest. Length 1–32.',
   inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' }],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
     { id: 'steps', name: 'Steps', type: 'string', def: '', widget: 'seqgrid' },
-    knob('rate', 'Rate', 0.5, 32, 8, { unit: 'hz' }),
+    knob('rate', 'Rate', 0.5, 32, 8, { mark: 'rate', unit: 'hz' }),
     { id: 'length', name: 'Len', type: 'int', min: 1, max: 32, def: 8, step: 1, widget: 'knob' },
-    knob('gate', 'Gate', 0.05, 1, 0.5),
+    knob('gate', 'Gate', 0.05, 1, 0.5, { mark: 'pulse-narrow' }),
   ],
 });
 registerBlock({
@@ -1322,8 +1679,8 @@ registerBlock({
   inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
-    { id: 'shape', name: 'Shape', type: 'enum', def: 'linear', widget: 'select', options: ['linear', 'soft', 'hard', 'fixed', 'invert'] },
-    knob('amount', 'Amt', 0, 1, 1),
+    { id: 'shape', name: 'Shape', type: 'enum', def: 'linear', widget: 'select', options: ['linear', 'soft', 'hard', 'fixed', 'invert'], affects: ['amount', 'fixed'] },
+    knob('amount', 'Amt', 0, 1, 1, { mark: 'depth' }),
     knob('fixed', 'Fixed', 0.05, 1, 0.8),
   ],
 });
@@ -1339,9 +1696,9 @@ registerBlock({
   ],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
-    knob('time', 'Time', 0.02, 1.5, 0.25, { unit: 's' }),
-    knob('feedback', 'Fbk', 0, 0.95, 0.5),
-    { id: 'repeats', name: 'Reps', type: 'int', min: 1, max: 12, def: 4, step: 1, widget: 'knob' },
+    knob('time', 'Time', 0.02, 1.5, 0.25, { mark: 'echo', unit: 's' }),
+    knob('feedback', 'Fbk', 0, 0.95, 0.5, { mark: 'feedback' }),
+    { id: 'repeats', name: 'Reps', type: 'int', min: 1, max: 12, def: 4, step: 1, widget: 'knob', affects: ['feedback'] },
   ],
 });
 registerBlock({
@@ -1349,6 +1706,7 @@ registerBlock({
   title: 'MIDI Out',
   category: 'MIDI & Instruments',
   group: 'Output',
+  alsoIn: [{ category: 'I/O & Hardware', group: 'MIDI' }],
   desc: 'Send MIDI to a hardware/virtual output port (drive external synths).',
   inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
   outputs: [],
@@ -1362,6 +1720,7 @@ registerBlock({
   title: 'MIDI Monitor',
   category: 'MIDI & Instruments',
   group: 'Tools',
+  alsoIn: [{ category: 'Visual', group: 'Monitor' }],
   desc: 'Scrolling readout of incoming MIDI events — pass-through, for debugging.',
   inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
@@ -1375,6 +1734,7 @@ registerBlock({
   title: 'MIDI In',
   category: 'MIDI & Instruments',
   group: 'Input',
+  alsoIn: [{ category: 'I/O & Hardware', group: 'MIDI' }],
   desc: 'Hardware MIDI input (WebMIDI; native MIDI on native engine)',
   inputs: [],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
@@ -1385,7 +1745,11 @@ registerBlock({
   title: 'Keyboard',
   category: 'MIDI & Instruments',
   group: 'Input',
+  alsoIn: [{ category: 'Control & CV', group: 'Manual' }],
   desc: 'On-screen piano — click keys to play; resize to add keys',
+  // A UI-driven emitter like the knob/pad blocks, so it can be shown on the
+  // face of the custom block it lives in — a panel with its own keyboard.
+  isControl: true,
   inputs: [],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
@@ -1399,7 +1763,9 @@ registerBlock({
   title: 'Note Button',
   category: 'MIDI & Instruments',
   group: 'Input',
+  alsoIn: [{ category: 'Control & CV', group: 'Manual' }],
   desc: 'On-screen momentary note trigger',
+  isControl: true,
   inputs: [],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
@@ -1416,6 +1782,7 @@ registerBlock({
   title: 'MIDI → CV',
   category: 'MIDI & Instruments',
   group: 'Convert',
+  alsoIn: [{ category: 'Control & CV', group: 'Convert' }],
   desc: 'Extract CV from MIDI: pitch (±1/octave around C4), gate, velocity, pitch bend, aftertouch, and one CC',
   inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
   outputs: [
@@ -1435,6 +1802,7 @@ registerBlock({
   title: 'CV → MIDI',
   category: 'MIDI & Instruments',
   group: 'Convert',
+  alsoIn: [{ category: 'Control & CV', group: 'Convert' }],
   desc: 'Gate rising edge triggers a note; pitch CV picks it (C4 + pitch·octave). Pitch moves retrigger while gated — sample-accurate edges.',
   inputs: [
     { id: 'pitch', name: 'pitch', kind: 'audio', dir: 'in', role: 'cv' },
@@ -1448,6 +1816,7 @@ registerBlock({
   title: 'Clock Tempo',
   category: 'MIDI & Instruments',
   group: 'Convert',
+  alsoIn: [{ category: 'Control & CV', group: 'Convert' }],
   desc: 'Measures tempo from the rising edges of a CV clock (square LFO): bpm out = BPM/240. Feed any square wave in, use the tempo anywhere.',
   inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' }],
   outputs: [{ id: 'bpm', name: 'bpm', kind: 'audio', dir: 'out', role: 'cv' }],
@@ -1464,10 +1833,10 @@ registerBlock({
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'wave', name: 'Wave', type: 'enum', def: 'sawtooth', widget: 'select', options: ['sine', 'triangle', 'sawtooth', 'square'] },
-    knob('attack', 'A', 0.002, 1, 0.01, { unit: 's' }),
-    knob('decay', 'D', 0.01, 1.5, 0.12, { unit: 's' }),
-    knob('sustain', 'S', 0, 1, 0.7),
-    knob('release', 'R', 0.02, 3, 0.3, { unit: 's' }),
+    knob('attack', 'A', 0.002, 1, 0.01, { mark: 'attack', unit: 's' }),
+    knob('decay', 'D', 0.01, 1.5, 0.12, { mark: 'decay', unit: 's' }),
+    knob('sustain', 'S', 0, 1, 0.7, { mark: 'sustain', affects: ['decay'] }),
+    knob('release', 'R', 0.02, 3, 0.3, { mark: 'release', unit: 's' }),
     knob('gain', 'Gain', 0, 1, 0.5),
     // Pitch-bend range in semitones (how far a full bend wheel travels).
     { id: 'bend', name: 'Bend Range', type: 'float', min: 0, max: 24, def: 2, step: 1, unit: 'st', widget: 'knob', face: false },
@@ -1484,8 +1853,13 @@ registerBlock({
 //              held, crossfading `loopFade` at the seam.
 //   oneshot  — the note is a trigger. The region plays through to the end and
 //              note-off is ignored, so a hit is a hit.
-//   slice    — the region is cut at `slices`, and each slice is mapped to a
-//              consecutive key from `root` upward. Each slice is a one-shot.
+//   slice    — the region is cut at `slices` and each slice answers to a key.
+//              Which key is `slicemap`: Chromatic deals them out from `root`
+//              upward at their own pitch (a kit), Pitched gives each one the
+//              note it actually sounds (♪ Keys in the Clip tab detects them)
+//              and answers any key with the nearest slice, transposed — an
+//              instrument. A slice runs the same ADSR as Classic; `slicehold`
+//              picks whether note-off releases it or it plays out.
 //
 // The 'sampleview' widget on `start` is the interactive waveform editor: drag
 // the start/end markers and the fade handles at the region's top corners. Every
@@ -1497,6 +1871,7 @@ registerBlock({
   title: 'Sampler',
   category: 'MIDI & Instruments',
   group: 'Instruments',
+  alsoIn: [{ category: 'Tape', group: 'Decks' }],
   desc: 'MIDI-triggered cassette playback — Classic (looping, ADSR), One-Shot, or Slice-per-key',
   inputs: [
     { id: 'midi', name: 'midi', kind: 'midi', dir: 'in' },
@@ -1505,13 +1880,13 @@ registerBlock({
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'load', name: 'Load Sample…', type: 'action', def: 0, widget: 'button', dialogAction: true },
-    { id: 'mode', name: 'Mode', type: 'enum', def: 'classic', widget: 'select', options: ['classic', 'oneshot', 'slice'] },
+    { id: 'mode', name: 'Mode', type: 'enum', def: 'classic', widget: 'select', options: ['classic', 'oneshot', 'slice'], affects: ['slicemap', 'slicehold'] },
     { id: 'start', name: 'Start', type: 'float', min: 0, max: 1, def: 0, widget: 'sampleview' },
     { id: 'end', name: 'End', type: 'float', min: 0, max: 1, def: 1, widget: 'select', face: false },
     { id: 'fadein', name: 'Fade In', type: 'float', min: 0, max: 0.5, def: 0, widget: 'select', face: false, cv: true },
     { id: 'fadeout', name: 'Fade Out', type: 'float', min: 0, max: 0.5, def: 0, widget: 'select', face: false, cv: true },
     // ---- Classic-mode loop (Ableton's Loop / Length / Fade) ----
-    { id: 'loop', name: 'Loop', type: 'bool', def: false, widget: 'toggle' },
+    { id: 'loop', name: 'Loop', type: 'bool', def: false, widget: 'toggle', affects: ['loopStart', 'loopLen', 'loopFade'] },
     // Loop start, 0..1 of the FILE. Clamped into the region at note-on, so
     // dragging the region never leaves the loop stranded outside it.
     { id: 'loopStart', name: 'Loop', type: 'float', min: 0, max: 1, def: 0, widget: 'select', face: false, cv: true },
@@ -1526,13 +1901,37 @@ registerBlock({
     // derived: the Clip tab writes it when you divide, detect or click. Empty
     // means "one slice = the whole region".
     { id: 'slices', name: 'Slices', type: 'string', def: '', widget: 'select', face: false },
+    // How a played note picks a slice.
+    //   Chromatic — slice `note − root`, played at its own pitch. A kit.
+    //   Pitched   — the slice whose DETECTED key is nearest, transposed to the
+    //               note. An instrument: every key sounds, and it sounds the
+    //               sample that needs stretching least.
+    { id: 'slicemap', name: 'Slice Map', type: 'enum', def: 'Chromatic', widget: 'select',
+      options: ['Chromatic', 'Pitched'], face: false },
+    // One MIDI note per slice, JSON, written by the Clip tab's ♪ Keys button
+    // (`detectSliceKeys`). −1 = nothing pitched there; empty = never detected,
+    // in which case a slice answers to `root + index` as it always did.
+    { id: 'slicekeys', name: 'Slice Keys', type: 'string', def: '', widget: 'select', face: false },
+    // Gate — the note holds the slice under the full ADSR and releases it.
+    // One-Shot — note-off is ignored and the slice plays out (a drum hit).
+    // Either way the release runs *before* the slice ends, so a slice fades
+    // out instead of being cut off at its boundary.
+    { id: 'slicehold', name: 'Slice Hold', type: 'enum', def: 'Gate', widget: 'select',
+      options: ['Gate', 'One-Shot'], face: false },
     // ---- Amp envelope (Classic; A/R only in the one-shot modes) ----
-    knob('attack', 'A', 0, 2, 0.002, { unit: 's' }),
-    knob('decay', 'D', 0.005, 3, 0.2, { unit: 's' }),
-    knob('sustain', 'S', 0, 1, 1),
-    knob('release', 'R', 0.005, 4, 0.05, { unit: 's' }),
+    knob('attack', 'A', 0, 2, 0.002, { mark: 'attack', unit: 's' }),
+    knob('decay', 'D', 0.005, 3, 0.2, { mark: 'decay', unit: 's' }),
+    knob('sustain', 'S', 0, 1, 1, { mark: 'sustain' }),
+    knob('release', 'R', 0.005, 4, 0.05, { mark: 'release', unit: 's' }),
     { id: 'root', name: 'Root', type: 'int', min: 0, max: 127, def: 60, widget: 'knob', step: 1 },
-    knob('gain', 'Gain', 0, 1.5, 0.8),
+    // How much velocity is allowed to take away — see `velAmp` in
+    // src/core/sampler.ts. 1 = amplitude tracks velocity linearly (the old
+    // behaviour); 0 = every trigger is full level, which is what you want for a
+    // loop or one-shot lifted straight off the tape recorder.
+    knob('velamp', 'Vel → Amp', 0, 1, 0.7, { face: false, cv: true }),
+    // Full velocity means UNITY. At 0.8 a sampler gave back a recording several
+    // dB down before velocity had even been applied — see `velAmp`.
+    knob('gain', 'Gain', 0, 1.5, 1),
     knob('speed', 'Speed', 0.25, 4, 1, { curve: 'log' }),
     { id: 'asset', name: 'Cassette', type: 'string', def: '', widget: 'select', face: false },
     { id: 'file', name: 'File', type: 'string', def: '', widget: 'select', face: false },
@@ -1576,14 +1975,21 @@ registerBlock({
 // can hear back, punch into, and only then commit. `out` is what makes that
 // possible — the audition path — and `rec` always starts writing at the
 // playhead, which is what a punch-in is.
+// `tape` is the **live take**: the engine publishes the take's own capture
+// buffer under a live asset id, so a Sampler wired here plays what you are
+// recording *as you record it*, with no ■, no Save As… and no trip through the
+// Library. That is the whole point of the port — see docs/09 "The live take".
 registerBlock({
   type: 'tape-recorder',
   title: 'Tape Recorder',
   category: 'Tape',
   group: 'Decks',
-  desc: 'Records its input into a take you can audition (out) and punch into (Rec at the playhead); “Save As…” in the Clip tab turns the take into a cassette',
+  desc: 'Records its input into a take you can audition (out), punch into (Rec at the playhead) and sample live (tape → a Sampler, while recording); “Save As…” in the Clip tab turns the take into a cassette',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
-  outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
+  outputs: [
+    { id: 'out', name: 'out', kind: 'audio', dir: 'out' },
+    { id: 'tape', name: 'tape', kind: 'tape', dir: 'out' },
+  ],
   params: [
     { id: 'rec', name: 'Rec ●', type: 'action', def: 0, widget: 'button' },
     { id: 'play', name: 'Play ▶', type: 'action', def: 0, widget: 'button' },
@@ -1661,6 +2067,7 @@ registerBlock({
   title: 'Piano Roll',
   category: 'MIDI & Instruments',
   group: 'Rolls',
+  alsoIn: [{ category: 'Tape', group: 'Rolls' }],
   desc: 'One MIDI roll. Wire its roll output into a player; select it to edit the notes in the Dock’s Clip tab.',
   inputs: [],
   outputs: [{ id: 'roll', name: 'roll', kind: 'roll', dir: 'out' }],
@@ -1679,6 +2086,7 @@ registerBlock({
   title: 'MIDI Recorder',
   category: 'MIDI & Instruments',
   group: 'Rolls',
+  alsoIn: [{ category: 'Tape', group: 'Rolls' }],
   desc: 'Records incoming MIDI into a take that draws itself live in the Clip tab; Rec punches in at the playhead, “Save As…” turns the take into a roll',
   inputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'in' }],
   outputs: [
@@ -1711,6 +2119,7 @@ registerBlock({
   title: 'Pianola',
   category: 'MIDI & Instruments',
   group: 'Rolls',
+  alsoIn: [{ category: 'Tape', group: 'Rolls' }],
   desc: 'Plays a MIDI roll out as notes — wire it into a synth or MIDI out',
   inputs: [{ id: 'roll', name: 'roll', kind: 'roll', dir: 'in' }],
   outputs: [{ id: 'midi', name: 'midi', kind: 'midi', dir: 'out' }],
@@ -1744,6 +2153,7 @@ registerBlock({
   type: 'spectrogram',
   title: 'Spectrogram',
   category: 'Visual',
+  group: 'Analysis',
   desc: 'Scrolling spectrogram; passes audio through',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
@@ -1754,6 +2164,7 @@ registerBlock({
   type: 'spectrum',
   title: 'Spectrum',
   category: 'Visual',
+  group: 'Analysis',
   desc: 'Live frequency bars; passes audio through',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
@@ -1768,6 +2179,7 @@ registerBlock({
   type: 'scope',
   title: 'Scope',
   category: 'Visual',
+  group: 'Analysis',
   desc: 'Oscilloscope; passes audio through',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
@@ -1781,16 +2193,41 @@ registerBlock({
   type: 'meter',
   title: 'Meter',
   category: 'Visual',
+  group: 'Levels',
+  alsoIn: [{ category: 'Surround', group: 'Monitor' }],
   desc: 'RMS/peak level meter; passes audio through',
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
-  params: [{ id: 'peakHold', name: 'Peak hold', type: 'bool', def: true, widget: 'select' }],
+  params: [
+    {
+      id: 'peakHold',
+      name: 'Peak hold',
+      type: 'bool',
+      def: true,
+      widget: 'select',
+    },
+    // The meter's look is a *param*, not a `ControlStyle.variant`: variants are
+    // keyed on `block.controls[ref]` and only ever reach `paintWidget`, and a
+    // visual is not a widget — it is painted by `drawVisualAt`, which is handed
+    // params and nothing else. Making it a param also means it persists,
+    // undoes, and can be set from factory content (which is the point: the
+    // Mavis wants a lamp, not a bargraph) with no new plumbing at all.
+    {
+      id: 'meterStyle',
+      name: 'Style',
+      type: 'enum',
+      def: 'bar',
+      widget: 'select',
+      options: ['bar', 'ladder', 'lamp'],
+    },
+  ],
   visual: 'meter',
 });
 
 // ---------- Structure & Custom blocks ----------
-// The Library shows these three "builders" at the top of the Structure & Custom
-// tab, a divider, then the user's saved custom blocks.
+// The Library shows the three "builders" (Custom Block + the two Portals) at the
+// top of the Structure & Custom tab, then everything else filed here grouped
+// normally, then a divider and the user's saved custom blocks.
 registerBlock({
   type: 'subgraph',
   title: 'Custom Block',
@@ -1803,6 +2240,55 @@ registerBlock({
   minW: 120,
   minH: 56,
 });
+// Matrix — a patchbay in one block.
+//
+// N inputs down the left, M outputs down the right, and a gain at every
+// crossing. The point is that routing stops being topology: sending four stems
+// to eight speaker feeds is 32 wires and a canvas you can't read, or it is one
+// block whose grid you rewrite in the Advanced tab without touching a wire.
+// That is a surround problem specifically — "which sources reach which
+// destinations, and how much of each" is the question a multi-speaker patch
+// asks constantly.
+//
+// The two counts are independent and live: raising `ins` adds `in5`, `in6`…
+// and nothing else moves (`GraphDoc.syncRigPorts`). The whole editing surface
+// is the Advanced-tab deep editor (`ui/advmatrix.ts`); the face shows the grid
+// read-only so you can see the patch without opening it.
+registerBlock({
+  type: 'matrix',
+  title: 'Matrix',
+  category: 'Structure & Custom',
+  group: 'Routing',
+  alsoIn: [{ category: 'Surround', group: 'Routing' }, { category: 'I/O & Hardware', group: 'Routing' }],
+  desc: 'Crosspoint router: any of N inputs to any of M outputs, with a gain each — edit the grid in the Advanced tab',
+  // The real ports are `in1..inN` / `out1..outM`, synthesized per instance from
+  // the Ins/Outs params. These are the defaults a fresh block starts with.
+  inputs: [
+    { id: 'in1', name: '1', kind: 'audio', dir: 'in' },
+    { id: 'in2', name: '2', kind: 'audio', dir: 'in' },
+    { id: 'in3', name: '3', kind: 'audio', dir: 'in' },
+    { id: 'in4', name: '4', kind: 'audio', dir: 'in' },
+  ],
+  outputs: [
+    { id: 'out1', name: '1', kind: 'audio', dir: 'out' },
+    { id: 'out2', name: '2', kind: 'audio', dir: 'out' },
+    { id: 'out3', name: '3', kind: 'audio', dir: 'out' },
+    { id: 'out4', name: '4', kind: 'audio', dir: 'out' },
+  ],
+  params: [
+    { id: 'ins', name: 'Ins', type: 'int', min: 1, max: 16, def: 4, step: 1, widget: 'knob' },
+    { id: 'outs', name: 'Outs', type: 'int', min: 1, max: 16, def: 4, step: 1, widget: 'knob' },
+    // One row per output, one gain per input. See core/matrix.ts.
+    { id: 'grid', name: 'Grid', type: 'string',
+      def: '[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]', widget: 'select', face: false },
+    knob('gain', 'Gain', 0, 2, 1),
+  ],
+  visual: 'matrix',
+  minW: 132,
+  minH: 104,
+  style: { shape: 'chamfer', fill: '#25313d', stroke: '#68a6d8' },
+});
+
 // Comment — a note to whoever opens this patch next, including you.
 //
 // Blocks can already carry face text (block-edit mode → Add text…), but that
@@ -1815,6 +2301,9 @@ registerBlock({
   type: 'comment',
   title: 'Comment',
   category: 'Structure & Custom',
+  // Grouped, not bare: an ungrouped entry renders with no subheader, so beside
+  // a grouped sibling it reads as belonging to that sibling's group.
+  group: 'Notes',
   desc: 'A text note on the canvas — no ports, no sound, just what the patch is doing',
   inputs: [],
   outputs: [],

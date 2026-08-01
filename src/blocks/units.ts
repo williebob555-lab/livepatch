@@ -6,10 +6,11 @@ import { ParamValue } from '../core/types';
 import { LevelFrame, MidiEvent, TapeRef } from '../engine/engine';
 import { Unit, UnitEnv, registerUnit } from '../engine/webaudio';
 import { onMidi, sendMidiOut } from '../engine/midi';
-import { getCassette, getCassetteBuffer, saveCassette, updateAssetBytes } from '../core/cassettes';
+import { getCassette, getCassetteBuffer, saveCassette, setLiveTake, updateAssetBytes } from '../core/cassettes';
 import { RollNote, getRollData, saveRoll, setRollData } from '../core/rolls';
 import { forgetTakeHistory } from '../core/takehistory';
-import { parseSlicePoints, sliceEdges } from '../core/sampler';
+import { parseSliceKeys, parseSlicePoints, sliceEdges, sliceForNote, velAmp } from '../core/sampler';
+import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
 import { encodeWavFloat } from '../core/encode/wav';
 
 type P = Record<string, ParamValue>;
@@ -235,7 +236,18 @@ registerUnit('file-player', (params, env) => {
     playFrom(here >= a && here <= b ? here : a);
   };
   const activeAsset = (): string | null => wiredAsset ?? (ownAsset || null);
-  const hydrate = (id: string | null) => {
+  /**
+   * Take (or re-take) the buffer for `id`.
+   *
+   * `keep` is the "same id, new samples" case — a punch-in, a Clip-tab edit, or
+   * a recorder's live take that just got longer. Restarting the deck there
+   * would re-seat the playhead at the start bar several times a second, so it
+   * re-lays the schedule around where the head already is instead. (The bars
+   * are fractions, so a *growing* take does move the window under the deck.
+   * That is inherent to a live take on a deck; the Sampler is the block the
+   * recorder's `tape` out is really for.)
+   */
+  const hydrate = (id: string | null, keep = false) => {
     const my = ++gen;
     if (!id) {
       buffer = null;
@@ -244,8 +256,11 @@ registerUnit('file-player', (params, env) => {
     }
     getCassetteBuffer(id).then((buf) => {
       if (my !== gen || !buf) return;
+      const had = buffer;
       buffer = buf;
-      if (playing) play();
+      if (!playing) return;
+      if (keep && had) reschedule();
+      else play();
     });
   };
   hydrate(activeAsset());
@@ -320,6 +335,10 @@ registerUnit('file-player', (params, env) => {
         hydrate(activeAsset());
       }
     },
+    // Same id, new samples — see UnitEnv.assetChanged.
+    assetChanged: (id) => {
+      if (id === activeAsset()) hydrate(id, true);
+    },
     loadAsset: (_name, buf) => {
       buffer = buf;
       if (playing) play();
@@ -378,6 +397,90 @@ registerUnit('mix2', (params, env) => {
       ga.disconnect();
       gb.disconnect();
       out.disconnect();
+    },
+  };
+});
+
+/**
+ * Matrix — crosspoint router (def in `src/blocks/defs.ts`).
+ *
+ * One GainNode per input (the inlet), one per output (the outlet), and one per
+ * crossing between them. All MATRIX_MAX² crossing nodes are built up front and
+ * left at zero: a GainNode at 0 costs the graph nothing to run, and building
+ * them lazily would mean touching the node graph from `setParam`, which is the
+ * one thing a live unit must not do while audio is flowing through it.
+ *
+ * Web Audio's own up-mixing applies at each crossing, so a wide bus folds to
+ * stereo here — the web engine is the preview engine (docs/04). The native
+ * kernel routes the full width.
+ */
+registerUnit('matrix', (params, env) => {
+  const N = 16; // mirrors MATRIX_MAX in core/matrix.ts
+  const inG: GainNode[] = [];
+  const outG: GainNode[] = [];
+  const cross: GainNode[] = new Array(N * N);
+  for (let i = 0; i < N; i++) {
+    inG.push(env.ctx.createGain());
+    // The block's Gain rides on the output nodes — there is no shared summing
+    // node, because outputs must never reach each other.
+    const o = env.ctx.createGain();
+    o.gain.value = num(params.gain, 1);
+    outG.push(o);
+  }
+  for (let o = 0; o < N; o++)
+    for (let i = 0; i < N; i++) {
+      const c = env.ctx.createGain();
+      c.gain.value = 0;
+      inG[i].connect(c);
+      c.connect(outG[o]);
+      cross[o * N + i] = c;
+    }
+  let nIn = matrixPorts(params.ins, 4);
+  let nOut = matrixPorts(params.outs, 4);
+  let gridStr = str(params.grid);
+
+  const apply = (): void => {
+    const g = parseMatrix(gridStr, nIn, nOut);
+    for (let o = 0; o < N; o++)
+      for (let i = 0; i < N; i++) {
+        const live = o < nOut && i < nIn ? g[crossIndex(nIn, i, o)] : 0;
+        // Ramped, not stepped: toggling a crossing is a gain moving on a
+        // running signal, and a step there clicks (docs/10 rule 10).
+        smooth(cross[o * N + i].gain, env.ctx, live);
+      }
+  };
+  apply();
+
+  const idx = (port: string, prefix: string): number => {
+    if (!port.startsWith(prefix)) return -1;
+    const k = parseInt(port.slice(prefix.length), 10) - 1;
+    return isFinite(k) ? k : -1;
+  };
+  return {
+    inlet: (port) => {
+      const i = idx(port, 'in');
+      return i >= 0 && i < nIn ? inG[i] : null;
+    },
+    outlet: (port) => {
+      const o = idx(port, 'out');
+      return o >= 0 && o < nOut ? outG[o] : null;
+    },
+    setParam: (id, v) => {
+      if (id === 'gain') {
+        const g = num(v, 1);
+        for (const o of outG) smooth(o.gain, env.ctx, g);
+        return;
+      }
+      if (id === 'ins') nIn = matrixPorts(v, 4);
+      else if (id === 'outs') nOut = matrixPorts(v, 4);
+      else if (id === 'grid') gridStr = str(v);
+      else return;
+      apply();
+    },
+    dispose: () => {
+      for (const c of cross) c.disconnect();
+      for (const g of inG) g.disconnect();
+      for (const g of outG) g.disconnect();
     },
   };
 });
@@ -1482,10 +1585,13 @@ registerUnit('synth', (params, env) => {
  *                (clamped into the region) until the key lifts.
  * - **oneshot**  the note is a trigger: the region plays through and note-off
  *                is ignored, so a hit cannot be cut short by a short key press.
- * - **slice**    the region is cut at the slice points and each slice is mapped
- *                to a consecutive key from `root` up. Each slice is a one-shot
- *                at its own pitch (no transposition — a slice is a piece of the
- *                recording, not a note).
+ * - **slice**    the region is cut at the slice points and each slice answers to
+ *                a key. `slicemap` Chromatic deals them out from `root` up at
+ *                their own pitch (no transposition — a slice is a piece of the
+ *                recording, not a note); Pitched answers any key with the slice
+ *                whose *detected* key is nearest, transposed onto it. Either
+ *                way the slice runs the full ADSR, and `slicehold` decides
+ *                whether note-off releases it or it plays out as a hit.
  *
  * Two gain stages per voice, on purpose: `fg` carries the *region* fades (which
  * belong to the material) and `eg` carries the *envelope* (which belongs to the
@@ -1506,6 +1612,7 @@ registerUnit('sampler', (params, env) => {
   let ownAsset = str(params.asset);
   let wiredAsset: string | null = null; // tape-wire cassette wins while plugged
   let slices = parseSlicePoints(params.slices);
+  let sliceKeys = parseSliceKeys(params.slicekeys);
   let gen = 0;
   const hydrate = (id: string | null) => {
     const my = ++gen;
@@ -1562,6 +1669,7 @@ registerUnit('sampler', (params, env) => {
       p[id] = v;
       if (id === 'gain') smooth(master.gain, env.ctx, num(v));
       else if (id === 'slices') slices = parseSlicePoints(v);
+      else if (id === 'slicekeys') sliceKeys = parseSliceKeys(v);
       else if (id === 'asset') {
         const next = str(v);
         if (next !== ownAsset) {
@@ -1585,6 +1693,12 @@ registerUnit('sampler', (params, env) => {
         hydrate(ownAsset || null);
       }
     },
+    // Same id, new samples — see UnitEnv.assetChanged. Sounding voices keep
+    // the buffer they started on (an AudioBufferSourceNode owns its buffer for
+    // life), so a live take grows for the *next* note, never under this one.
+    assetChanged: (id) => {
+      if (id === (wiredAsset ?? ownAsset)) hydrate(id);
+    },
     loadAsset: (_n, buf) => (buffer = buf),
     midiIn: (ev) => {
       if (ev.type === 'on' && buffer) {
@@ -1597,10 +1711,19 @@ registerUnit('sampler', (params, env) => {
         let rate = Math.max(0.01, num(p.speed, 1));
         if (mode === 'slice') {
           const edges = sliceEdges(slices, rs, re);
-          const i = ev.note - Math.round(num(p.root, 60));
-          if (i < 0 || i >= edges.length - 1) return; // key outside the kit
-          s = edges[i];
-          e = edges[i + 1];
+          const hit = sliceForNote(
+            ev.note,
+            Math.round(num(p.root, 60)),
+            edges.length - 1,
+            sliceKeys,
+            str(p.slicemap, 'Chromatic') === 'Pitched',
+          );
+          if (!hit) return; // key outside the kit
+          s = edges[hit.index];
+          e = edges[hit.index + 1];
+          // Chromatic returns 0 semitones — a slice is a piece of a recording,
+          // not a note. Pitched stretches it onto the key that was played.
+          if (hit.semis) rate *= Math.pow(2, hit.semis / 12);
         } else {
           rate *= Math.pow(2, (ev.note - num(p.root, 60)) / 12);
         }
@@ -1641,7 +1764,8 @@ registerUnit('sampler', (params, env) => {
         const D = Math.max(0.005, num(p.decay, 0.2));
         const S = Math.max(0, Math.min(1, num(p.sustain, 1)));
         const R = Math.max(0.005, num(p.release, 0.05));
-        const peak = ev.velocity;
+        // Velocity through the sensitivity blend, not raw — see `velAmp`.
+        const peak = velAmp(ev.velocity, num(p.velamp, 0.7));
         eg.gain.setValueAtTime(0, t);
         eg.gain.linearRampToValueAtTime(peak, t + A);
         eg.gain.linearRampToValueAtTime(peak * S, t + A + D);
@@ -1651,13 +1775,30 @@ registerUnit('sampler', (params, env) => {
         if (looping) src.start(t, s * dur);
         else {
           src.start(t, s * dur, outDur);
-          // An ungated voice has to end itself: ramp out over the release so a
-          // one-shot with a hard tail doesn't click when the node retires.
-          const relAt = Math.max(t + A + D, t + outDur - R);
-          eg.gain.setValueAtTime(Math.max(0, peak * S), relAt);
+          // The material runs out at t+outDur whatever the key does, so the
+          // envelope has to be back at zero by then: release starts R early,
+          // or as early as the material allows when it is shorter than R.
+          // Cutting a voice off with the envelope open is a click, and it is
+          // what every slice used to end on.
+          const relAt = Math.min(t + outDur - 0.0005, Math.max(t, t + outDur - R));
+          // The level the ramps have actually reached by relAt — using the
+          // sustain level unconditionally jumps the gain on a slice shorter
+          // than A+D, which is most of a fast drum kit.
+          const dt = relAt - t;
+          const relVal =
+            dt >= A + D ? peak * S : dt >= A ? peak - (peak - peak * S) * ((dt - A) / Math.max(1e-6, D)) : (peak * dt) / Math.max(1e-6, A);
+          if (relAt > t) eg.gain.setValueAtTime(Math.max(0, relVal), relAt);
           eg.gain.linearRampToValueAtTime(0, t + outDur);
         }
-        const v: Voice = { src, fg, eg, peak, gated: mode === 'classic' };
+        // A slice is gated too unless it is explicitly a one-shot — the ADSR
+        // is the sampler's envelope in every mode (see the def).
+        const v: Voice = {
+          src,
+          fg,
+          eg,
+          peak,
+          gated: mode === 'classic' || (mode === 'slice' && str(p.slicehold, 'Gate') === 'Gate'),
+        };
         src.onended = () => {
           fg.disconnect();
           eg.disconnect();
@@ -1867,6 +2008,363 @@ registerUnit('cv-compare', logicUnit('cmp'));
 registerUnit('logic-not', logicUnit('not'));
 for (const op of ['and', 'or', 'xor', 'nand', 'nor']) registerUnit('logic-' + op, logicUnit(op));
 
+// ---------------------------------------------------------------------------
+// The modular voice — VCO / ladder VCF / EG / LFO / folder / S+H / slew.
+//
+// One AudioWorklet processor covers all seven, exactly like `lp-logic` above
+// covers every gate: they are all short per-sample loops over the same shape
+// (a few k-rate knobs plus one or two audio-rate CV inputs), and seven modules
+// would be seven `addModule` round-trips on the same context for no gain.
+// `processorOptions.op` picks the loop; the k-rate descriptor list is the
+// UNION of every op's knobs, which is what lets one processor class serve
+// them (`parameterDescriptors` is static, so it cannot vary per instance).
+//
+// Enum/bool settings can't be AudioParams, so they ride the message port.
+//
+// The maths here is mirrored sample-for-sample by the native kernels in
+// `engine/src/dsp.ts` — same phase accumulator, same polyBLEP, same ladder
+// topology, same envelope coefficients. **Change one, change both**, or the
+// two engines stop being A/B comparable (docs/08-extending.md).
+// ---------------------------------------------------------------------------
+const MODULAR_WORKLET = `
+// polyBLEP: the correction that removes most of a hard edge's aliasing. Applied
+// at each discontinuity of saw/pulse; without it a 4 kHz saw is a mess of
+// inharmonic tones, which is not what "analog oscillator" is supposed to mean.
+function blep(t, dt) {
+  if (t < dt) { t /= dt; return t + t - t * t - 1; }
+  if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+  return 0;
+}
+// Triangle of period 4 that is the IDENTITY on [-1, 1]: fold(0)=0, fold(1)=1,
+// fold(3)=-1. So at unity gain the folder is a true pass-through and only
+// starts folding once the signal is driven past full scale.
+function fold1(v) {
+  const p = (v + 1) * 0.25;
+  return 1 - 4 * Math.abs(p - Math.floor(p) - 0.5);
+}
+// Padé approximant of tanh — the ladder's saturator. Real tanh per sample per
+// stage is affordable but this is ~10x cheaper and indistinguishable here.
+function sat(x) {
+  if (x > 3) return 1;
+  if (x < -3) return -1;
+  const x2 = x * x;
+  return (x * (27 + x2)) / (27 + 9 * x2);
+}
+class LpModular extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    const k = (name, defaultValue) => ({ name, defaultValue, automationRate: 'k-rate' });
+    return [
+      k('freq', 261.626), k('shape', 0), k('pw', 0.5), k('level', 0.6),
+      k('cutoff', 1200), k('res', 0.15), k('drive', 1),
+      k('amount', 0), k('sym', 0),
+      k('attack', 0.005), k('decay', 0.35), k('sustain', 0.6), k('release', 0.35),
+      k('rate', 2), k('amp', 1), k('glide', 0), k('rise', 0), k('fall', 0),
+    ];
+  }
+  constructor(o) {
+    super();
+    const po = (o && o.processorOptions) || {};
+    this.op = po.op || 'vco';
+    this.f = po.flags || {};
+    this.port.onmessage = (e) => { if (e.data) Object.assign(this.f, e.data); };
+    this.ph = 0; this.syncL = 0; this.trigL = 0; this.resetL = 0;
+    this.s1 = 0; this.s2 = 0; this.s3 = 0; this.s4 = 0; this.s4p = 0;
+    this.env = 0; this.stage = 0; this.gate = false;
+    this.held = 0; this.lag = 0;
+  }
+  process(inputs, outputs, p) {
+    const out = outputs[0] && outputs[0][0];
+    if (!out) return true;
+    const n = out.length;
+    const sr = sampleRate;
+    const A = inputs[0] && inputs[0][0];
+    const B = inputs[1] && inputs[1][0];
+    const C = inputs[2] && inputs[2][0];
+    switch (this.op) {
+      case 'vco': {
+        const f0 = p.freq[0], sh = p.shape[0], pw0 = p.pw[0], lv = p.level[0];
+        const fmax = sr * 0.48;
+        for (let i = 0; i < n; i++) {
+          let f = f0 * Math.pow(2, A ? A[i] : 0);
+          if (!(f > 0)) f = 0; else if (f > fmax) f = fmax;
+          if (C) { const s = C[i]; if (s > 0.5 && this.syncL <= 0.5) this.ph = 0; this.syncL = s; }
+          let pw = pw0 + (B ? B[i] : 0);
+          if (pw < 0.02) pw = 0.02; else if (pw > 0.98) pw = 0.98;
+          const dt = f / sr;
+          const t = this.ph;
+          const saw = 2 * t - 1 - blep(t, dt);
+          let tp = t - pw; if (tp < 0) tp += 1;
+          const pul = (t < pw ? 1 : -1) + blep(t, dt) - blep(tp, dt);
+          out[i] = ((1 - sh) * saw + sh * pul) * lv;
+          this.ph += dt; if (this.ph >= 1) this.ph -= 1;
+        }
+        break;
+      }
+      case 'ladder': {
+        const fc0 = p.cutoff[0], res = p.res[0], dr = p.drive[0];
+        // Resonance steals the passband on a real ladder; put a little back so
+        // opening Res doesn't read as "the sound got quieter".
+        const mk = 1 + res * 0.6;
+        const fmax = sr * 0.45;
+        let g = 1 - Math.exp((-2 * Math.PI * Math.min(fmax, Math.max(20, fc0))) / sr);
+        for (let i = 0; i < n; i++) {
+          if (B) {
+            let fc = fc0 * Math.pow(2, B[i]);
+            if (!(fc > 20)) fc = 20; else if (fc > fmax) fc = fmax;
+            g = 1 - Math.exp((-2 * Math.PI * fc) / sr);
+          }
+          // Half-sample delay in the feedback path: the classic fix that keeps
+          // a zero-delay-free ladder stable up to self-oscillation.
+          const fb = 0.5 * (this.s4 + this.s4p);
+          this.s4p = this.s4;
+          const u = sat((A ? A[i] : 0) * dr * mk - res * 4 * fb);
+          this.s1 += g * (u - this.s1);
+          this.s2 += g * (this.s1 - this.s2);
+          this.s3 += g * (this.s2 - this.s3);
+          this.s4 += g * (this.s3 - this.s4);
+          out[i] = this.s4;
+        }
+        if (!isFinite(this.s1 + this.s2 + this.s3 + this.s4)) {
+          this.s1 = this.s2 = this.s3 = this.s4 = this.s4p = 0;
+          out.fill(0);
+        }
+        break;
+      }
+      case 'wavefold': {
+        const am = p.amount[0], sy = p.sym[0], lv = p.level[0];
+        for (let i = 0; i < n; i++) {
+          let a = am + (B ? B[i] : 0);
+          if (a < 0) a = 0; else if (a > 1) a = 1;
+          out[i] = fold1((A ? A[i] : 0) * (1 + a * 7) + sy * a) * lv;
+        }
+        break;
+      }
+      case 'env': {
+        const inv = outputs[1] && outputs[1][0];
+        const at = p.attack[0], de = p.decay[0], su = p.sustain[0], re = p.release[0];
+        const ka = at > 0 ? 1 - Math.exp(-1 / (at * sr)) : 1;
+        const kd = de > 0 ? 1 - Math.exp(-1 / (de * sr)) : 1;
+        const kr = re > 0 ? 1 - Math.exp(-1 / (re * sr)) : 1;
+        const rt = !!this.f.retrig;
+        for (let i = 0; i < n; i++) {
+          const hi = (A ? A[i] : 0) > 0.5;
+          if (hi && !this.gate) { this.stage = 1; if (rt) this.env = 0; }
+          else if (!hi && this.gate) this.stage = 3;
+          this.gate = hi;
+          if (this.stage === 1) {
+            // Aiming past 1 is what makes an RC attack look like an RC attack:
+            // aiming AT 1 asymptotes and never arrives.
+            this.env += (1.2 - this.env) * ka;
+            if (this.env >= 1) { this.env = 1; this.stage = 2; }
+          } else if (this.stage === 2) this.env += (su - this.env) * kd;
+          else if (this.stage === 3) {
+            this.env -= this.env * kr;
+            if (this.env < 1e-5) { this.env = 0; this.stage = 0; }
+          }
+          out[i] = this.env;
+          if (inv) inv[i] = 1 - this.env;
+        }
+        break;
+      }
+      case 'lfo': {
+        const r0 = p.rate[0], sh = p.shape[0], am = p.amp[0];
+        const uni = !!this.f.uni;
+        const fmax = sr * 0.45;
+        for (let i = 0; i < n; i++) {
+          if (B) { const s = B[i]; if (s > 0.5 && this.resetL <= 0.5) this.ph = 0; this.resetL = s; }
+          let r = r0 * Math.pow(2, A ? A[i] : 0);
+          if (!(r > 0)) r = 0; else if (r > fmax) r = fmax;
+          const dt = r / sr;
+          const t = this.ph;
+          const tri = 1 - 4 * Math.abs(t - 0.5);
+          let th = t - 0.5; if (th < 0) th += 1;
+          const sq = (t < 0.5 ? -1 : 1) - blep(t, dt) + blep(th, dt);
+          const v = (1 - sh) * tri + sh * sq;
+          out[i] = uni ? (v + 1) * 0.5 * am : v * am;
+          this.ph += dt; if (this.ph >= 1) this.ph -= 1;
+        }
+        break;
+      }
+      case 'sh': {
+        const gl = p.glide[0];
+        const track = this.f.mode === 'track';
+        const useIn = this.f.source === 'in';
+        const kg = gl > 0 ? 1 - Math.exp(-1 / (gl * 0.5 * sr)) : 1;
+        for (let i = 0; i < n; i++) {
+          const src = useIn ? (A ? A[i] : 0) : Math.random() * 2 - 1;
+          const tg = B ? B[i] : 0;
+          if (track) this.held = src;
+          else if (tg > 0.5 && this.trigL <= 0.5) this.held = src;
+          this.trigL = tg;
+          this.lag += (this.held - this.lag) * kg;
+          out[i] = this.lag;
+        }
+        break;
+      }
+      default: { // slew
+        const up = p.rise[0];
+        const dn = this.f.link ? up : p.fall[0];
+        const ku = up > 0 ? 1 - Math.exp(-1 / (up * sr)) : 1;
+        const kdn = dn > 0 ? 1 - Math.exp(-1 / (dn * sr)) : 1;
+        for (let i = 0; i < n; i++) {
+          const x = A ? A[i] : 0;
+          this.lag += (x - this.lag) * (x > this.lag ? ku : kdn);
+          out[i] = this.lag;
+        }
+        break;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('lp-modular', LpModular);
+`;
+const modularReady = new WeakMap<AudioContext, Promise<boolean>>();
+const ensureModularWorklet = (ctx: AudioContext): Promise<boolean> => {
+  let p = modularReady.get(ctx);
+  if (!p) {
+    p = (async () => {
+      const url = URL.createObjectURL(new Blob([MODULAR_WORKLET], { type: 'application/javascript' }));
+      try {
+        await ctx.audioWorklet.addModule(url);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    })();
+    modularReady.set(ctx, p);
+  }
+  return p;
+};
+
+interface ModularSpec {
+  op: string;
+  /** Port ids in worklet input order. */
+  ins: string[];
+  /** Port ids in worklet output order. */
+  outs: string[];
+  /** k-rate AudioParam ids (param id === worklet param name). */
+  knobs: string[];
+  /** Params that ride the message port instead (enums/bools). */
+  flags?: string[];
+}
+
+/**
+ * One factory for all seven. Per-port pass gains take wires immediately and the
+ * worklet splices in between them when the (async) module lands — the same
+ * arrangement `logicUnit` uses, and the reason a freshly dropped block is
+ * silently connected rather than silently broken.
+ */
+const modularUnit =
+  (spec: ModularSpec) =>
+  (params: P, env: UnitEnv): Unit => {
+    const inGains = spec.ins.map(() => env.ctx.createGain());
+    const outGains = spec.outs.map(() => env.ctx.createGain());
+    let node: AudioWorkletNode | null = null;
+    let disposed = false;
+    // Only knobs the node actually carries a value for are written; a missing
+    // param must fall through to the worklet's declared default, never to 0
+    // (a `freq` of 0 is a dead oscillator, not a quiet one).
+    const vals: Record<string, number> = {};
+    for (const k of spec.knobs) if (typeof params[k] === 'number') vals[k] = params[k] as number;
+    const flags: Record<string, ParamValue> = {};
+    for (const f of spec.flags ?? []) if (params[f] !== undefined) flags[f] = params[f];
+
+    ensureModularWorklet(env.ctx).then((ok) => {
+      if (disposed || !ok) return;
+      node = new AudioWorkletNode(env.ctx, 'lp-modular', {
+        numberOfInputs: Math.max(1, spec.ins.length),
+        numberOfOutputs: spec.outs.length,
+        outputChannelCount: spec.outs.map(() => 1),
+        processorOptions: { op: spec.op, flags },
+      });
+      for (const k of spec.knobs) {
+        const prm = vals[k] === undefined ? null : node.parameters.get(k);
+        if (prm) prm.value = vals[k];
+      }
+      inGains.forEach((g, i) => g.connect(node!, 0, i));
+      outGains.forEach((g, i) => node!.connect(g, i));
+    });
+
+    return {
+      inlet: (port) => {
+        const i = spec.ins.indexOf(port);
+        return i < 0 ? null : inGains[i];
+      },
+      outlet: (port) => {
+        const i = spec.outs.indexOf(port);
+        return i < 0 ? outGains[0] ?? null : outGains[i];
+      },
+      setParam: (id, v) => {
+        if (spec.knobs.includes(id)) {
+          vals[id] = num(v, vals[id]);
+          const prm = node?.parameters.get(id);
+          // Knobs are stepped, not ramped: several of these (rate, cutoff) are
+          // exponential and a ramp through them is a glide nobody asked for.
+          // Zipper noise is handled by the k-rate block size.
+          if (prm) prm.value = vals[id];
+          return;
+        }
+        if (spec.flags?.includes(id)) {
+          flags[id] = v;
+          node?.port.postMessage({ [id]: v === true || v === 1 ? true : v === false || v === 0 ? false : v });
+        }
+      },
+      dispose: () => {
+        disposed = true;
+        for (const g of [...inGains, ...outGains]) {
+          try {
+            g.disconnect();
+          } catch {
+            /* already gone */
+          }
+        }
+        try {
+          node?.disconnect();
+        } catch {
+          /* already gone */
+        }
+      },
+    };
+  };
+
+registerUnit(
+  'vco',
+  modularUnit({ op: 'vco', ins: ['pitch', 'pwm', 'sync'], outs: ['out'], knobs: ['freq', 'shape', 'pw', 'level'] }),
+);
+registerUnit(
+  'ladder',
+  modularUnit({ op: 'ladder', ins: ['in', 'cut'], outs: ['out'], knobs: ['cutoff', 'res', 'drive'] }),
+);
+registerUnit(
+  'wavefold',
+  modularUnit({ op: 'wavefold', ins: ['in', 'fold'], outs: ['out'], knobs: ['amount', 'sym', 'level'] }),
+);
+registerUnit(
+  'env-adsr',
+  modularUnit({
+    op: 'env',
+    ins: ['gate'],
+    outs: ['out', 'inv'],
+    knobs: ['attack', 'decay', 'sustain', 'release'],
+    flags: ['retrig'],
+  }),
+);
+registerUnit(
+  'lfo',
+  modularUnit({ op: 'lfo', ins: ['rate', 'reset'], outs: ['out'], knobs: ['rate', 'shape', 'amp'], flags: ['uni'] }),
+);
+registerUnit(
+  'sh',
+  modularUnit({ op: 'sh', ins: ['in', 'trig'], outs: ['out'], knobs: ['glide'], flags: ['mode', 'source'] }),
+);
+registerUnit(
+  'slew',
+  modularUnit({ op: 'slew', ins: ['in'], outs: ['out'], knobs: ['rise', 'fall'], flags: ['link'] }),
+);
+
 // Capture runs in an AudioWorklet on the AUDIO thread. The previous
 // ScriptProcessor fired on the main thread, so heavy UI frames (cassette
 // faces, waveforms) missed callbacks and dropped whole buffers into the
@@ -2056,6 +2554,9 @@ class Take {
  * which is what lets the Clip tab draw the take. It stays out of the Library
  * until "Save As…" copies it into a cassette of its own.
  */
+/** Floor on how often the live take is republished — see `refreshLive`. */
+const LIVE_MIN_MS = 60;
+
 registerUnit('tape-recorder', (params, env) => {
   const inG = env.ctx.createGain();
   const an = env.ctx.createAnalyser();
@@ -2094,6 +2595,72 @@ registerUnit('tape-recorder', (params, env) => {
   let loop = params.loop === true || params.loop === 1;
   let regStart = num(params.regStart, 0);
   let regEnd = num(params.regEnd, 1);
+
+  // ---- the live take ------------------------------------------------------
+  // `tape` hands the take out *while it is being recorded*, so a Sampler wired
+  // here plays what you just played without ■, without Save As… and without a
+  // trip through the Library. Its own id namespace, never the committed
+  // cassette's: the take is ahead of the file between punches, and this id must
+  // never reach the document.
+  const liveId = 'live_' + env.nodeId;
+  const liveRef: TapeRef = { assetId: liveId, name: 'Live take' };
+  let liveBuf: AudioBuffer | null = null;
+  let liveDirty = false;
+  let liveAt = 0;
+  /** Milliseconds the last rebuild took — see `refreshLive`. */
+  let liveCost = 0;
+  let pushedRef: TapeRef | null = null;
+
+  const pushTape = (): void => {
+    const r = take.frames && liveBuf ? liveRef : ref;
+    if (r === pushedRef) return;
+    pushedRef = r;
+    tapeOut?.(r);
+  };
+
+  /**
+   * Republish the live take, at a rate that pays for itself.
+   *
+   * There is no growing `AudioBuffer` and no view into one, so unlike the
+   * native mirror (`LiveTake` in engine/src/dsp.ts) every refresh is a full
+   * copy of the take — O(take), on the main thread. So the rate self-limits:
+   * never spend more than ~5% of wall time rebuilding. A phrase refreshes
+   * essentially every frame, which is what live sampling needs; a ten-minute
+   * take refreshes rarely, and a ten-minute take is not what anyone is live
+   * sampling. This is the Web engine being the fallback engine again — the
+   * native one follows the take continuously and at bounded cost.
+   */
+  const refreshLive = (): void => {
+    if (!tapeOut) return;
+    if (!take.frames) {
+      if (liveBuf) {
+        liveBuf = null;
+        setLiveTake(liveId, null);
+        pushTape();
+      }
+      return;
+    }
+    if (!liveDirty && liveBuf) return;
+    const t0 = performance.now();
+    if (liveBuf && t0 - liveAt < Math.max(LIVE_MIN_MS, liveCost * 20)) return;
+    const chs = take.flatten();
+    const b = new AudioBuffer({
+      length: take.frames,
+      numberOfChannels: 2,
+      sampleRate: take.sampleRate,
+    });
+    b.copyToChannel(chs[0], 0);
+    b.copyToChannel(chs[1], 1);
+    liveBuf = b;
+    liveDirty = false;
+    liveAt = performance.now();
+    liveCost = liveAt - t0;
+    setLiveTake(liveId, b);
+    pushTape();
+    // The buffer object is new every time (an AudioBuffer cannot grow), so a
+    // sink holding the old one has to be told to take this one.
+    env.assetChanged(liveId);
+  };
 
   /** The play window in FRAMES of the take (bars are 0..1 of the take). */
   const win = (): { a: number; b: number } => {
@@ -2145,6 +2712,7 @@ registerUnit('tape-recorder', (params, env) => {
     head += l.length;
     cache = null; // the audition buffer is stale now
     dirtySinceCommit = true;
+    liveDirty = true; // and so is the live take on the `tape` out
     if (head >= MAX_FRAMES) stopAll();
   };
 
@@ -2159,7 +2727,11 @@ registerUnit('tape-recorder', (params, env) => {
     const done = (id: string, name: string): void => {
       takeId = id;
       ref = { assetId: id, name };
-      tapeOut?.(ref);
+      // Through `pushTape`, not straight out: while the recorder still holds
+      // the take, `tape` keeps presenting the LIVE one. Swapping a sampler onto
+      // the freshly written file on every ■ would re-decode the same audio and
+      // then fall behind the next punch.
+      pushTape();
       env.emitAsset(id);
       saving = false;
     };
@@ -2221,6 +2793,12 @@ registerUnit('tape-recorder', (params, env) => {
     // The cassette itself is left alone — dropping a take must not silently
     // delete a recording the user may already be using elsewhere.
     ref = null;
+    // The live buffer does go, and `tape` goes with it: there is no take to
+    // hand out any more.
+    liveBuf = null;
+    liveDirty = false;
+    setLiveTake(liveId, null);
+    pushTape();
   };
 
   ensureRecWorklet(env.ctx).then((ok) => {
@@ -2319,8 +2897,14 @@ registerUnit('tape-recorder', (params, env) => {
     },
     setTapeOut: (cb) => {
       tapeOut = cb;
-      if (cb && ref) cb(ref);
+      pushedRef = null;
+      if (cb) pushTape();
     },
+    // The pump for the live take. A control-rate hook rather than the capture
+    // callback: the copy must not sit in the audio path, and it has to keep
+    // running between chunks so a take that stopped growing still gets its
+    // final state out.
+    tick: () => refreshLive(),
     visual: { level, wave: () => (take.frames ? take.picture() : null) },
     // One domain with the decks: `pos` is where the head is in the take, and
     // `elapsed` is the take's length — which is also the running record timer,
@@ -2344,6 +2928,9 @@ registerUnit('tape-recorder', (params, env) => {
           n?.disconnect();
         } catch {}
       }
+      // The live take only exists for as long as the unit that owns it.
+      liveBuf = null;
+      setLiveTake(liveId, null);
       void recStart;
     },
   };
@@ -2930,6 +3517,13 @@ registerUnit('eq-curve', (params, env) => {
   const modeIdx = (): number => (P.mode === 'Mid-Side' ? 1 : P.mode === 'Left-Right' ? 2 : 0);
   const bandF = (n: number): number => Math.max(20, Math.min(20000, gp('f' + (n + 1), DEF_F[n] ?? 1000) * Math.pow(2, gp('freqShift', 0))));
 
+  // **Stereo only, deliberately.** The native kernel is width-transparent (it
+  // builds a filter bank per channel in `setWidth`, see engine/src/dsp.ts), but
+  // a `Unit` is never told its net width and this graph is a hard-wired
+  // 2-splitter/2-merger. So on a wide bus this engine gives you the front pair
+  // and nothing else — the same shape of limitation as the sampler's loop
+  // crossfade, and for the same reason: this is the stereo preview engine
+  // (docs/04). Surround EQ needs the native engine.
   const inGain = ctx.createGain();
   const split = ctx.createChannelSplitter(2);
   inGain.connect(split);

@@ -1060,5 +1060,109 @@ console.log('\n--- ambisonics: encode → decode round trip ---');
   }
 }
 
+// ------------------------------------------------------------------- eq --
+// The EQ on a surround bus.
+//
+// This one is here because it is the shape of width bug that does NOT read as
+// a width bug. `eq-curve` was stereo-only: `out` was a 2-channel buffer, so the
+// graph's `min(out.length, net.width)` rule left every channel above the second
+// **silent**. On a 7.1 bus that is six dead speakers with the front pair still
+// playing — the report was "the parametric EQ is completely garbled", not
+// "the EQ drops channels". Any per-channel effect that grows a fixed-width
+// buffer will do the same thing, so the assertions below are the template:
+// width out == width in, every channel filtered, stereo behaviour unchanged.
+console.log('\n--- eq-curve: a surround bus survives the EQ ---');
+{
+  const kf = require('../dist-engine/dsp.js').kernelFactory;
+  const W = 8;
+  const ctxN = { n: N, sr: SR };
+  {
+    const k = kf('eq-curve')({}, services);
+    check(typeof k.setWidth === 'function', 'eq-curve declares setWidth');
+    k.setWidth('in', W);
+    const src = allocBuf(W);
+    for (let c = 0; c < W; c++) src[c].fill(c + 1, 0, N);
+    k.process({ in: src }, ctxN);
+    const out = k.out('out');
+    check(out.length === W, `a width-${W} net comes out ${W} wide (was 2 — six silent speakers)`);
+    check(
+      out.slice(0, W).every((c, i) => Math.abs(c[0] - (i + 1)) < 1e-4),
+      'and every channel keeps its own signal at unity through a flat EQ',
+    );
+  }
+  {
+    // A band must SHAPE the surround channels, not merely pass them through:
+    // "not silent" is not the same as "filtered".
+    const k = kf('eq-curve')({}, services);
+    k.setWidth('in', W);
+    k.process({ in: allocBuf(W) }, ctxN); // let it learn the rate
+    k.setParam('t1', 'lowpass');
+    k.setParam('f1', 200);
+    k.setParam('q1', 0.707);
+    const src = allocBuf(W);
+    const out = k.out('out');
+    const pk = new Float64Array(W);
+    let ph = 0;
+    for (let q = 0; q < 200; q++) {
+      for (let i = 0; i < N; i++) {
+        const v = 0.5 * Math.sin(ph);
+        for (let c = 0; c < W; c++) src[c][i] = v;
+        ph += (2 * Math.PI * 5000) / SR;
+      }
+      k.process({ in: src }, ctxN);
+      if (q > 100) for (let c = 0; c < W; c++) for (let i = 0; i < N; i++) pk[c] = Math.max(pk[c], Math.abs(out[c][i]));
+    }
+    check([...pk].every((p) => p < 0.02), 'a 200 Hz lowpass crushes a 5 kHz tone on EVERY channel, not just 0-1');
+  }
+  {
+    // Mid-Side is a statement about the front pair. Channels 2+ must pass into
+    // their own bus rather than being folded into an M/S they are not part of.
+    const k = kf('eq-curve')({ mode: 'Mid-Side' }, services);
+    k.setWidth('in', W);
+    const src = allocBuf(W);
+    for (let c = 0; c < W; c++) src[c].fill(c + 1, 0, N);
+    k.process({ in: src }, ctxN);
+    const out = k.out('out');
+    check(Math.abs(out[0][0] - 1) < 1e-4 && Math.abs(out[1][0] - 2) < 1e-4, 'Mid-Side round-trips channels 0-1 unchanged when flat');
+    check(
+      out.slice(2, W).every((c, i) => Math.abs(c[0] - (i + 3)) < 1e-4),
+      'and leaves channels 2+ on their own signal',
+    );
+  }
+  {
+    // Solo auditions a band — it must not mute the rig while doing it.
+    const k = kf('eq-curve')({}, services);
+    k.setWidth('in', W);
+    k.process({ in: allocBuf(W) }, ctxN);
+    k.setParam('solo', 1);
+    const src = allocBuf(W);
+    const out = k.out('out');
+    let ph = 0;
+    const pk = new Float64Array(W);
+    for (let q = 0; q < 60; q++) {
+      for (let i = 0; i < N; i++) {
+        const v = 0.5 * Math.sin(ph);
+        for (let c = 0; c < W; c++) src[c][i] = v;
+        ph += (2 * Math.PI * 120) / SR; // band 1 sits at 120 Hz
+      }
+      k.process({ in: src }, ctxN);
+      if (q > 40) for (let c = 0; c < W; c++) for (let i = 0; i < N; i++) pk[c] = Math.max(pk[c], Math.abs(out[c][i]));
+    }
+    check(out.length === W && [...pk].every((p) => p > 0.05), 'Solo auditions on every channel rather than muting the surround');
+  }
+  {
+    // Stereo is the overwhelmingly common case and must be untouched by all of
+    // the above: a flat EQ is bit-unity, a +12 dB bell is exactly +12 dB.
+    const k = kf('eq-curve')({}, services);
+    const src = allocBuf(2);
+    src[0].fill(0.5, 0, N);
+    src[1].fill(-0.25, 0, N);
+    k.process({ in: src }, ctxN);
+    const out = k.out('out');
+    check(out.length === 2, 'a stereo patch still gets a stereo EQ');
+    check(Math.abs(out[0][0] - 0.5) < 1e-5 && Math.abs(out[1][0] + 0.25) < 1e-5, 'and a flat EQ passes it through at unity');
+  }
+}
+
 console.log(ok ? '\nALL OK' : '\nFAILURES');
 process.exit(ok ? 0 : 1);

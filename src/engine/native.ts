@@ -56,13 +56,24 @@ interface Bridge {
 const bridge = (): Bridge | undefined => (window as any).livepatchNative;
 
 const SETTINGS_KEY = 'livepatch.nativeengine';
+/**
+ * Largest buffer size the native engine can be asked for. This mirrors `MAXQ`
+ * in engine/src/{dsp,io}.ts — every graph-facing buffer over there is exactly
+ * that many frames — and it is a correctness limit, not a taste one: a bigger
+ * quantum makes the DSP read past its own arrays, which produces NaN, which
+ * recursive kernels latch permanently. Keep the two in step.
+ */
+export const MAX_ENGINE_FRAMES = 2048;
 export interface NativeSettings {
   frames: number; // 0 = driver default
   sampleRate: number; // 0 = device preferred
 }
 export const loadNativeSettings = (): NativeSettings => {
   try {
-    return { frames: 0, sampleRate: 0, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+    const s = { frames: 0, sampleRate: 0, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+    // A setting saved before the cap existed must not survive a reload.
+    s.frames = Math.min(MAX_ENGINE_FRAMES, Math.max(0, s.frames | 0));
+    return s;
   } catch {
     return { frames: 0, sampleRate: 0 };
   }
@@ -75,6 +86,19 @@ const b64ToBytes = (b64: string): Uint8Array => {
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+};
+
+/** Base64 of a byte array. Chunked because `String.fromCharCode(...bytes)` on a
+ *  half-megabyte sweep spreads half a million arguments onto the stack and
+ *  throws `RangeError` — on some engines it works up to a few tens of thousands
+ *  and then does not, which makes it a bug that only appears at high sample
+ *  rates. */
+const bytesToB64 = (bytes: Uint8Array): string => {
+  let s = '';
+  const STEP = 0x8000;
+  for (let i = 0; i < bytes.length; i += STEP)
+    s += String.fromCharCode(...bytes.subarray(i, Math.min(i + STEP, bytes.length)));
+  return btoa(s);
 };
 
 /** Result of a round-trip latency measurement (see `measureLatency`). */
@@ -90,6 +114,30 @@ export interface LatencyResult {
   error?: string;
 }
 
+/** One speaker's finished sweep capture, reassembled from its chunks. */
+export interface SweepCapture {
+  id: string;
+  pcm: Float32Array;
+  sampleRate: number;
+}
+/** Progress of a calibration run (see `SpeakerCalMsg` in the engine protocol). */
+export interface CalProgress {
+  id?: string;
+  index?: number;
+  total?: number;
+  done?: boolean;
+  error?: string;
+}
+export interface MeasureSpeakersOpts {
+  device?: string;
+  channel?: number;
+  asioOut?: boolean;
+  outDevice?: string;
+  speakers: Array<{ id: string; ch: number }>;
+  sweep: Float32Array;
+  tail?: number;
+}
+
 export class NativeEngineClient implements EngineAdapter {
   readonly name = 'native';
   running = false;
@@ -100,6 +148,10 @@ export class NativeEngineClient implements EngineAdapter {
   onStatus: ((s: NativeStatus) => void) | null = null;
   onDevices: (() => void) | null = null;
   onLatencyResult: ((r: LatencyResult) => void) | null = null;
+  /** One speaker's capture, once every chunk of it has arrived. */
+  onSweepCapture: ((c: SweepCapture) => void) | null = null;
+  /** Calibration-run progress and completion. */
+  onCalProgress: ((p: CalProgress) => void) | null = null;
   /** Echoed incoming MIDI while learn is armed (device, event). */
   onMidiSeen: ((device: string, ev: MidiEventLite) => void) | null = null;
 
@@ -141,6 +193,40 @@ export class NativeEngineClient implements EngineAdapter {
   private watchTimer = 0;
   private decodingAssets = new Set<string>();
 
+  /**
+   * Drop everything this client believes about the engine *process*.
+   *
+   * **Anything memoized as "already sent" is a lie the moment the engine
+   * restarts**, because the new process starts with empty state while the
+   * renderer's memo still says the message went out. `lastWatchSent` is the one
+   * that bites: `poll` only sends `watch-visuals` when the *set* of on-screen
+   * nodes changes, so after a restart the same blocks are still on screen, the
+   * key is unchanged, nothing is re-sent — and `GraphExec.watched` stays empty
+   * for the rest of the session. The engine then never emits `visuals` at all,
+   * and every watch-gated display goes dead while the audio is fine: the
+   * Spatial Scope and the Speaker Rig levels, and equally the scope, spectrum,
+   * sequencer playhead, tape transport, recorder waveform and MIDI monitor.
+   * That was the report ("stops displaying levels after rebooting the audio
+   * engine … may also apply to more blocks" — it applied to all of them).
+   *
+   * The cached visual *frames* go too: they describe a process that no longer
+   * exists, and holding them shows a frozen meter rather than an empty one,
+   * which reads as working.
+   */
+  private forgetEngineState(): void {
+    this.lastWatchSent = '';
+    this.visualCache.clear();
+    this.levels.clear();
+    this.mods.clear();
+    this.modSrcs.clear();
+    // `watchedAt` is deliberately kept: it is the renderer's own record of what
+    // is on screen, and it is what makes the next `poll` re-send the list.
+  }
+
+  /** A fresh engine process appeared and needs the graph again — see `onMessage`. */
+  onEngineRestart: (() => void) | null = null;
+  private everReady = false;
+
   async start(): Promise<void> {
     const b = bridge();
     if (!b?.engineStart) {
@@ -148,6 +234,8 @@ export class NativeEngineClient implements EngineAdapter {
       this.onStatus?.(this.status);
       return;
     }
+    // `engineStart` spawns a new process; nothing the last one was told counts.
+    this.forgetEngineState();
     if (!this.unsub) this.unsub = b.onEngineMessage((m) => this.onMessage(m));
     const s = loadNativeSettings();
     await b.engineStart({ frames: s.frames, sampleRate: s.sampleRate });
@@ -311,6 +399,15 @@ export class NativeEngineClient implements EngineAdapter {
       case 'latency-result':
         this.onLatencyResult?.(m as LatencyResult);
         break;
+      case 'speaker-sweep':
+        this.takeSweepChunk(m);
+        break;
+      case 'speaker-cal':
+        // A run that ends drops any half-assembled capture: a partial one is
+        // not a shorter measurement, it is a measurement of nothing.
+        if (m.done) this.sweepPart = null;
+        this.onCalProgress?.(m as CalProgress);
+        break;
       case 'need-asset':
         this.provideAsset(String(m.id));
         break;
@@ -339,6 +436,26 @@ export class NativeEngineClient implements EngineAdapter {
         });
         break;
       case 'status':
+        // `engine ready` is the first thing a freshly booted engine says. Seeing
+        // it a SECOND time means the process was replaced without this client
+        // asking — `electron/main.cjs` auto-respawns a crashed engine and sends
+        // it `config` + `start`, but it cannot send the graph, which only the
+        // renderer has. So the new process comes up with no graph and no watch
+        // list: silent, with dead meters, until the user happens to edit
+        // something. Treat it exactly like a start we performed ourselves.
+        if (m.info === 'engine ready') {
+          if (this.everReady) {
+            this.forgetEngineState();
+            // The respawn's `config` comes from main.cjs, which knows the
+            // cassettes dir and the VST addon path but NOT the audio settings —
+            // those live in renderer storage. Without this the engine silently
+            // comes back at the default rate and buffer size.
+            const s = loadNativeSettings();
+            bridge()?.engineSend({ op: 'config', frames: s.frames, sampleRate: s.sampleRate });
+            this.onEngineRestart?.();
+          }
+          this.everReady = true;
+        }
         this.status = { ...this.status, ...m };
         if (m.running !== undefined && this.running) this.running = true;
         this.onStatus?.(this.status);
@@ -389,6 +506,83 @@ export class NativeEngineClient implements EngineAdapter {
   /** Start a loopback round-trip latency measurement (result → onLatencyResult). */
   measureLatency(opts: { device?: string; channel?: number; runs?: number } = {}): void {
     bridge()?.engineSend({ op: 'measure-latency', ...opts });
+  }
+
+  // ---- speaker calibration ----
+  /** The capture being reassembled. One at a time: the engine measures one
+   *  speaker at a time and finishes each before starting the next. */
+  private sweepPart: { id: string; pcm: Float32Array; sampleRate: number; next: number } | null = null;
+
+  /**
+   * Reassemble a `speaker-sweep` chunk.
+   *
+   * The engine ships a capture in pieces because its stdout write is
+   * synchronous and a single 300 kB write would stall the audio pump (see
+   * `SpeakerSweepMsg`). Ordering is checked rather than assumed: a chunk out of
+   * sequence means a message was lost, and silently stitching the rest together
+   * would produce a capture with a hole in it — which deconvolves into a
+   * perfectly plausible, completely wrong response.
+   */
+  private takeSweepChunk(m: {
+    id?: string;
+    chunk?: number;
+    chunks?: number;
+    frames?: number;
+    scale?: number;
+    sampleRate?: number;
+    pcm?: string;
+  }): void {
+    const id = String(m.id ?? '');
+    const chunk = Number(m.chunk ?? 0);
+    if (chunk === 0 || !this.sweepPart || this.sweepPart.id !== id) {
+      if (chunk !== 0) return; // a mid-capture chunk with no head — drop the lot
+      this.sweepPart = {
+        id,
+        pcm: new Float32Array(Math.max(0, Number(m.frames ?? 0))),
+        sampleRate: Number(m.sampleRate ?? 48000),
+        next: 0,
+      };
+    }
+    const part = this.sweepPart;
+    if (part.next !== chunk) {
+      this.sweepPart = null;
+      return;
+    }
+    const bytes = b64ToBytes(String(m.pcm ?? ''));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const scale = Number(m.scale ?? 1 / 32767);
+    const count = bytes.byteLength >> 1;
+    // Chunks are a fixed size, so the write offset follows from the index —
+    // which is also what makes the ordering check above meaningful.
+    const at = chunk * count;
+    for (let i = 0; i < count && at + i < part.pcm.length; i++) part.pcm[at + i] = view.getInt16(i * 2, true) * scale;
+    part.next = chunk + 1;
+    if (part.next < Number(m.chunks ?? 1)) return;
+    this.sweepPart = null;
+    this.onSweepCapture?.({ id: part.id, pcm: part.pcm, sampleRate: part.sampleRate });
+  }
+
+  /** Start a speaker-calibration run. Captures arrive on `onSweepCapture`,
+   *  progress on `onCalProgress`. */
+  measureSpeakers(opts: MeasureSpeakersOpts): void {
+    this.sweepPart = null;
+    bridge()?.engineSend({
+      op: 'measure-speakers',
+      device: opts.device ?? '',
+      channel: opts.channel ?? 1,
+      asioOut: !!opts.asioOut,
+      outDevice: opts.outDevice ?? '',
+      speakers: opts.speakers,
+      sweep: bytesToB64(new Uint8Array(opts.sweep.buffer, opts.sweep.byteOffset, opts.sweep.byteLength)),
+      tail: opts.tail,
+    });
+  }
+
+  /** Stop a run in progress. The engine answers with a `done` progress
+   *  message, so the caller's teardown runs through the same path either way. */
+  cancelSpeakerMeasure(): void {
+    this.sweepPart = null;
+    bridge()?.engineSend({ op: 'measure-speakers', cancel: true, speakers: [], sweep: '' });
   }
 
   /** `api` is the block's Driver param where it has one (Speaker Rig), so the

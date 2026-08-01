@@ -11,6 +11,52 @@ const { spawn } = require('child_process');
 const SCENE_EXT = '.lps'; // LivePatch Scene (JSON)
 
 // ============================================================================
+// Keep the renderer running when nobody is looking at it.
+//
+// **This is why audio garbled when the window was minimized, or when another
+// app was fullscreen in front of it.** Those are not two bugs — they are the
+// two ways Chromium decides a window is not visible, and it responds to both
+// by throttling the renderer:
+//
+//   - **Minimized** → the window is hidden. rAF stops (nothing composites),
+//     timers are clamped to roughly one a minute, and on Windows the renderer
+//     *process priority is lowered*.
+//   - **Fully covered by another window** → Chromium's Windows-only native
+//     occlusion detection marks the window OCCLUDED and treats it exactly like
+//     hidden. This is the one that catches "a game or a video is fullscreen in
+//     front of LivePatch", and it is why the fault does not need the window to
+//     be minimized at all.
+//
+// Either state wrecks audio twice over. The Web Audio engine — **the default
+// engine** — renders in this process, so a deprioritized renderer misses its
+// audio deadline and crackles. And *both* engines apply CV modulation from
+// `runtime.poll()` on the render loop (docs/04), so a stalled loop freezes
+// every sweep, gate and S&H mid-flight. Garbled is exactly what that sounds
+// like.
+//
+// An audio app is *expected* to be in the background — that is what putting a
+// patch on while you do something else means — so none of this throttling is
+// wanted here. The renderer keeps full priority and unthrottled timers for the
+// whole run.
+//
+// These must be set before `app.whenReady()`; a switch appended later is
+// ignored, silently.
+//
+// The renderer has its own half of this: rAF still stops when the window is
+// genuinely not compositing, so `src/main.ts` runs a control-rate fallback
+// pump while `document.hidden`. That fallback existed before this and did
+// nothing, because its timer was one of the things being throttled.
+// ============================================================================
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+// Turn the occlusion *calculation* off outright. The switch above stops the
+// backgrounding that follows from it, but the detector also drives
+// `document.visibilityState`, and a patch has no reason to care whether some
+// other window happens to be in front of this one.
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
+// ============================================================================
 // Runtime diagnostics log — one file per run, meant to be handed to someone.
 //
 // Written **only from the Electron main process**. That is the whole design
@@ -120,6 +166,20 @@ function diagFromEngine(msg) {
   if (!msg || typeof msg !== 'object') return;
   const op = msg.op;
   if (op === 'levels' || op === 'mods' || op === 'visuals' || op === 'midi-seen') return;
+  if (op === 'speaker-sweep') {
+    // Metadata only. A calibration ships the whole capture through here in
+    // base64 chunks — hundreds of kB per speaker — and logging the PCM would
+    // bury the session in a wall of samples nobody can read while telling you
+    // nothing the header does not.
+    diagWrite('speaker-sweep', {
+      id: msg.id,
+      chunk: msg.chunk,
+      chunks: msg.chunks,
+      frames: msg.frames,
+      sampleRate: msg.sampleRate,
+    });
+    return;
+  }
   if (op === 'status') {
     const rec = { ...msg };
     delete rec.op;
@@ -527,8 +587,44 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Per-window half of the anti-throttling set at the top of this file.
+      // The command-line switches cover the process; this covers the window,
+      // and both are needed — Electron re-applies window-level throttling on
+      // hide/occlude independently of the switches.
+      backgroundThrottling: false,
     },
   });
+
+  /**
+   * Record what the window is doing, into the diagnostics log.
+   *
+   * Audio faults get reported as "it garbles when I minimize it" or "when a
+   * game is in front of it", and until now the log said **nothing** about the
+   * window — so a capture could not confirm or rule out that correlation, and
+   * neither could the person reading it. (That is not hypothetical: it cost a
+   * round trip on exactly this question.) Now a minimize lands in the log next
+   * to the `status` lines around it, and the two either line up or they don't.
+   *
+   * Cheap by construction: these fire on user actions, not on a timer.
+   */
+  for (const [ev, state] of [
+    ['minimize', 'minimized'],
+    ['restore', 'restored'],
+    ['focus', 'focused'],
+    ['blur', 'blurred'],
+    ['hide', 'hidden'],
+    ['show', 'shown'],
+  ]) {
+    win.on(ev, () => diagWrite('window', { state }));
+  }
+  // Note there is deliberately no "occluded" event to hook: Chromium's native
+  // occlusion detection is switched off at the top of this file, which is the
+  // point — an occluded window is treated as an ordinary visible one, and none
+  // of the events above fire for it either.
+  const wc = win.webContents;
+  wc.on('render-process-gone', (_e, d) => diagWrite('window', { state: 'renderer-gone', reason: d && d.reason }));
+  wc.on('unresponsive', () => diagWrite('window', { state: 'unresponsive' }));
+  wc.on('responsive', () => diagWrite('window', { state: 'responsive' }));
 
   const devUrl = process.env.LIVEPATCH_DEV_URL;
   if (devUrl) win.loadURL(devUrl);

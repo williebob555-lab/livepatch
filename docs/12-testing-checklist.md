@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-07-29._
+_Last verified: 2026-08-01._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -17,6 +17,12 @@ here and now doesn't, that's the bug.
 
 - [ ] Parity: `registerUnit` list == `registerKernel` list (the grep in
       [`08-extending.md`](08-extending.md)). Must be empty diff.
+- [ ] **It is in the Library without searching for it.** Open its category chip
+      *and* the `All` tab and find the tile. Search finding it proves nothing —
+      a block missing from its own category tab is still registered, still
+      compiles and still works, so nothing else in this list catches it. Any
+      category with a bespoke layout (`Structure & Custom`) is where this goes
+      wrong. Check the subgroup header above the tile says what you meant.
 - [ ] Web engine: drag it in, wire it, operate every widget; confirm audible/
       visible effect.
 - [ ] Native engine: same, and verify it isn't silently passing through.
@@ -25,6 +31,23 @@ here and now doesn't, that's the bug.
 - [ ] Save → reload the scene; the block returns with its state.
 - [ ] If it's a custom-block candidate: save as custom, instantiate twice,
       confirm no dangling wires (id remap).
+
+## Factory content (`src/core/factory/`) — presets and built-in custom blocks
+
+- [ ] `node scripts/factory-preset-test.mjs` passes (details below). It is the
+      only thing standing between a hand-authored preset and a silent
+      half-wiring, so run it for *any* edit in that directory.
+- [ ] The Library's **Structure & Custom** tab shows a `Factory` subheader, and
+      anything filed elsewhere (the Mavis under MIDI & Instruments) appears in
+      its own category tab.
+- [ ] A factory block's context menu offers **no** Rename and **no** Delete;
+      a factory-derived instance's block menu offers **only** "Save as Custom
+      Block…", never "Save Custom Block". Each of those would otherwise appear
+      to work and be back on the next launch.
+- [ ] Open a preset from Scenes ▸ Factory presets, edit it, press Save: it must
+      ask for a name (loaded scenes are `savedAs: null` + `dirty`).
+- [ ] Enter a factory custom block, change something inside, leave, undo. The
+      Library entry is unchanged.
 
 ## Multichannel / surround changes (net width)
 
@@ -35,6 +58,13 @@ here and now doesn't, that's the bug.
       allocation, per-channel summing and the truncation rules.
 - [ ] A wide bus through a **subgraph** still carries every channel (the portal
       case — this is the one that fails silently).
+- [ ] **Put every effect you touched on a 7.1 bus and listen to the rig, not the
+      front pair.** An effect holding a fixed stereo output buffer leaves
+      channels 2+ *silent*, not folded — the front pair plays normally and the
+      rest of the rig goes dead, which is reported as the block "garbling" the
+      sound rather than as a width bug. (`eq-curve`, 2026-08-01.) Check the
+      channel is **filtered**, not merely non-silent: passing the signal through
+      unprocessed is the other half of the same mistake.
 - [ ] A stereo block wired onto a wide net still works, and does **not** narrow
       the net for the other sinks on it.
 - [ ] Stereo patches are unchanged: `load`/`loadMax` in `status` no worse than
@@ -76,6 +106,56 @@ here and now doesn't, that's the bug.
       thousands of metres in a normal drag.
 - [ ] Wheel zooms the plan pane and is ignored over the direction pane; `Fit`
       restores auto-fit.
+
+### Speaker calibration (Rig ▸ Calibrate)
+
+```
+npm run build:engine && node --expose-gc scripts/speaker-cal-test.cjs
+```
+
+That covers the maths and the audio path headlessly — see "Speaker calibration
+probe" below for what and why. The rest needs a room, a microphone and an
+interface:
+
+- [ ] **The guards fire before anything plays.** On the Web engine → "needs the
+      Native engine". Audio off → "turn Audio on". No Speaker Rig block in the
+      patch → it says to add one. An 8-speaker rig on a stereo device → "the rig
+      needs 8 output channels and the device has 2". None of these may start a
+      run and fail later as "no signal on the microphone" — that sends the user
+      hunting for a cable that is fine.
+- [ ] A full run on a real rig: each speaker sweeps **in turn, on its own
+      channel**, in rig order. Watch the room, not the screen — a channel-map
+      error here is silent and poisons every correction that follows.
+- [ ] **`late` and `xruns` stay put across the whole run.** The capture goes
+      back to the renderer in base64 chunks over a *synchronous* stdout; if that
+      chunking regressed to one big write, this is where it shows.
+- [ ] Cancel mid-run, and turn Audio off mid-run. Both must end the run, close
+      any capture stream it opened, and leave no dialog waiting forever.
+- [ ] With a mic calibration file loaded, a mic with a known HF lift measures
+      **flatter**, not peakier. Getting the sign wrong is the classic error and
+      it looks entirely plausible.
+- [ ] After the run: the measured speakers are **green in PLAN and DIRECTION**,
+      the toolbar reads `◉ Calibrated n/N`, distances have moved to the measured
+      values, and the audible result is flatter and level-matched.
+- [ ] **Ctrl+Z undoes the whole run in one step** — calibrations *and*
+      distances. Ctrl+Y redoes it.
+- [ ] **Moving a calibrated speaker turns it blue again**, and a 0.1° accidental
+      nudge does **not**. Same for changing its `Out` channel or ticking LFE;
+      renaming must keep it.
+- [ ] **Delete a speaker earlier in the list.** Every later speaker that had no
+      explicit `Out` must go blue: it just got renumbered onto a different
+      amplifier channel, so its measurement is of something else now. This is
+      the case a per-caller invalidation check misses.
+- [ ] Save the scene → reload: calibrations come back and the speakers are still
+      green. Save the rig as a **preset**, load it into a fresh scene: same.
+- [ ] **Partly-calibrated rigs stay time-aligned.** Calibrate half a rig and
+      play correlated material: the image must not pull toward the uncalibrated
+      speakers. (They run through a unit-impulse convolver precisely so they
+      share the calibrated speakers' one hop of latency.)
+- [ ] Drag a speaker around a **calibrated** rig with audio running: no
+      dropouts, no clicks. A rig push arrives per pointer-move and now carries
+      the curves — if filters are being rebuilt per frame this is where you hear
+      it.
 
 ## Surround source blocks
 
@@ -162,6 +242,19 @@ here and now doesn't, that's the bug.
 - [ ] `chan-pick`: picks the channels you asked for (check against the wire's
       channel legend), and a channel the bus doesn't carry is silent, not
       wrapped.
+- [ ] `matrix`: wire distinct sources into `in1..inN` and confirm each output
+      carries exactly what its grid row says — outputs are independent (a
+      shared summing node makes them all identical), several inputs into one
+      output **sum**, and one input can reach several outputs. Toggling a
+      crossing while audio runs must be **click-free** (it ramps across the
+      quantum). A wide bus crosses it intact on the native engine.
+- [ ] `tempo-follow`: play music into it and watch the face — the BPM settles
+      within a few bars and the confidence bar goes green. Patch `clock` into an
+      `orbit` or a `path` and the motion locks to the beat; `div` multiplies the
+      pulse rate without moving the BPM; `lock` freezes it through a breakdown.
+      Silence holds the tempo and drops the confidence rather than resetting.
+      Expect it to sometimes land on half or double time — that is inherent, and
+      it is what `minbpm`/`maxbpm`/`div` are for.
 - [ ] **Built-in CV inputs show modulation.** Wire an `orbit` into a
       `panner3d`'s x/y and watch the XY pad: the purple marker must track the
       source around the room. Same for `amb-encode` x/y/z and `amb-rotate` yaw
@@ -205,6 +298,71 @@ OS-level gestures that cause most of these.
 - [ ] Piano roll pinch zooms **both** axes — spread horizontally for time,
       vertically for pitch.
 
+### The input standard ([`14-input.md`](14-input.md)) — run for any UI change
+
+First, the automated half:
+
+```
+node scripts/input-standard-test.mjs
+```
+
+It compiles `src/ui/input.ts` standalone and asserts the arithmetic no amount of
+clicking will tell you about: that a jittery two-finger translation produces
+zoom **exactly** 1, that zoom engages past the deadzone *continuously* (a
+deadzone that is discarded rather than subtracted shows up as a snap, and did —
+5.4%), that a horizontal pinch never engages the pitch axis, and the whole
+trackpad-vs-mouse classification table. Run it for any change to `input.ts`.
+
+Then the manual pass below. Every line is a bug that shipped.
+
+**Two-finger pan-first (touch), on the workspace, waveform, Roll, and Widgets
+tab:**
+
+- [ ] A two-finger drag **pans without perceptibly zooming**. This is the whole
+      of rule 1 — if the view scales while you translate, the deadzone is gone
+      and the Roll is unusable again. Watch a note under your fingers: it should
+      stay under them.
+- [ ] Spreading past ~24 px starts zooming, and there is **no jump** at the
+      moment it engages.
+- [ ] A third finger landing (and lifting) mid-gesture does not throw the view.
+- [ ] Two-finger **tap** opens the context menu, including over a live widget
+      where long-press is deliberately suppressed.
+- [ ] Two fingers cancel whatever one finger had started (a knob stops taking
+      values, a held button releases), and a lone remaining finger does **not**
+      resume it.
+
+**Trackpad, all surfaces:**
+
+- [ ] Two-finger scroll **pans**. It must not zoom. Diagonal scrolls move both
+      axes.
+- [ ] Ctrl/⌘ + scroll zooms; on the Roll it zooms **time**.
+- [ ] Shift + scroll zooms **pitch** on the Roll (a deliberate departure from
+      the browser's horizontal-scroll convention — see 14-input.md).
+- [ ] A real **mouse wheel** still zooms on a plain scroll. Test both devices;
+      the heuristic that separates them is the fragile part.
+- [ ] Value wheels (EQ Q, trajectory height) move by the same amount for the
+      same physical gesture on a trackpad as on a mouse — not ~10× further.
+
+**Dock chrome (the "resizing the dock is finicky" class):**
+
+- [ ] Zone splitters resize by **touch**, and keep tracking past a slow, careful
+      drag (a `pointercancel` from a missing `touch-action` kills this a few px
+      in).
+- [ ] Splitters are grabbable with a finger at all — they widen under
+      `pointer: coarse`.
+- [ ] A panel header tears off by touch; the panel does not detach from a tap.
+- [ ] A floating panel resizes by touch via its corner grip. CSS `resize: both`
+      is mouse-only and must not have come back.
+- [ ] The UI-scale slider (Options) moves under a **finger**. It is a relative
+      control, and `movementX` is 0 for touch — rule 6.
+
+**Everywhere:**
+
+- [ ] Interrupt a drag on each canvas (swipe in from a screen edge, or switch
+      apps) and confirm the surface is not left mid-drag afterwards — that is
+      the `pointercancel` reset.
+- [ ] Repeat the two headline gestures at UI scale ≠ 1.0.
+
 ## VST hosting changes (`native/vsthost`, `engine/src/vst.ts`)
 
 - [ ] Rebuild the addon with the app/engine STOPPED (the .node is locked
@@ -213,6 +371,18 @@ OS-level gestures that cause most of these.
       Ozone 11 EQ (load, 1 s processed audio, params, automation, state
       round-trip). Ignore the process EXIT code oddities — plugin DLLs crash
       in static destructors; the printed OK/FAIL lines are the result.
+- [ ] `node scripts/vsthost-stall.mjs` — **no host call may hold the JS thread
+      past one quantum.** The engine's JS thread is the audio pump, so a
+      blocking native call is a dropout of exactly its own length; this is the
+      guard on that. Run it whenever you add or change a host entry point, and
+      treat "I only call it from a timer, not from `process()`" as *not* an
+      excuse — same thread. (docs/13, "Nothing blocking on the JS thread".)
+- [ ] Audio stays clean **while you drive a plugin**: with a patch playing,
+      open the plugin's own editor, sweep a knob in it for ten seconds, close
+      it, then swap the plugin for a different one and delete the block. Watch
+      `late`/`xruns` in the status bar throughout. Freezes here were host calls
+      on the JS thread; the probe above catches the mechanism, only this
+      catches a new one.
 - [ ] Scan: Library ▸ Plugins ▸ Rescan finds the installed set; a failing
       module is reported, not fatal.
 - [ ] Drag a plugin onto the canvas AND onto an existing VST block (swap).
@@ -236,6 +406,13 @@ OS-level gestures that cause most of these.
 
 ## Audio / IO / timing changes (the sensitive ones)
 
+- [ ] Sample rate + NaN survival: `node --expose-gc scripts/samplerate-test.cjs`
+      — all cases pass. (Any change to `Biquad`, a kernel's rate handling, or
+      the buffer-size path in `io.ts`.) See "Sample rate sweep" below.
+- [ ] Non-finite recovery: `node scripts/nonfinite-recovery-test.cjs` — no
+      kernel latches. **Required for any new or edited kernel that carries state
+      across quanta**, and for anything touching `trapNonFinite` or
+      `VstKernel.scrub`. See "Non-finite recovery across every kernel" below.
 - [ ] `status.late == 0` and `status.xruns` stable during a soak (watch the
       status bar or the smoke output).
 - [ ] `status.loadMax` did not materially rise vs. before.
@@ -251,8 +428,38 @@ OS-level gestures that cause most of these.
       the status bar's `midi ~Xms` matches. (Any change to the MIDI path,
       priming, or the pump.)
 - [ ] Capture ring: `node scripts/ring-latency.cjs` — latency stays bounded
-      (~40 ms) under stall floods and pure drift causes 0 trims. (Any change to
+      (~40 ms) under stall floods, pure drift causes 0 trims, and the CLUSTERS
+      scenario stays near-zero underruns after its settle. (Any change to
       `Ring`, `capLatency`, `adapt`, or the input/secondary-output pump.)
+      **CLUSTERS is the one that catches a hunting setpoint** — a tuner that
+      only learns by glitching passes the other two and pops every ~10 s
+      forever. Watch the number, not just the OK line: a jump from ~10 to ~400
+      is the old limit cycle back.
+- [ ] **Engine restart keeps the displays alive.** With a Spatial Scope, a
+      Speaker Rig and a scope/spectrum on screen, toggle audio off→on (and kill
+      the engine process outright, to exercise the auto-respawn): levels and
+      traces must come back, audio must come back, and the buffer size in the
+      status bar must be the one you configured, not the driver default. Every
+      one of those was broken by renderer state outliving the process
+      (docs/05). Any new renderer→engine message needs this test.
+- [ ] Tape commit: `node scripts/tape-commit-test.cjs` — pressing ■ blocks the
+      loop for well under a quantum's worth of budget and the streamed file is
+      byte-identical to the one-shot encoder. (Any change to the recorder's
+      save path, `writeWavChunked`, or `wav.ts`.) **Record a long take at 96 kHz
+      and listen at the moment you press ■** — this one was a 325 ms hole.
+- [ ] Output meter: `node scripts/out-meter-test.cjs` — a sine reads its own
+      slope, a splice and a quantum-boundary seam both read ≈ 1–2, over-unity
+      counts `clip`, a NaN counts `nonFinite` and the meter still works after
+      it. (Any change to `meterOut`, the interleave loops, or `clip`.)
+- [ ] **When a user reports popping, read `dMax` before anything else.** Near
+      the signal's own slope means the click is not in the engine's output —
+      chase the endpoint chain, not the pump. Near 1 means it *is*, and
+      `late`/`xruns`/GC being clean does not contradict that. `peak > 1` or a
+      `clip` field present makes it distortion rather than a dropout.
+- [ ] **Then look for `ringTrim` / `ringOver` / `asioSkip`.** These are the
+      engine's own deliberate splices, they are audible, and they move no other
+      counter — a log full of healthy numbers with one of these fields present
+      is a log of a popping session. Absent means it fired zero times.
 - [ ] MIDI stuck notes: hold a note button / keyboard key while CV sweeps its
       note/octave — no stranded voices, release always silences.
 - [ ] ASIO bridge: capture from a second ASIO driver runs indefinitely, 0 xrun
@@ -260,6 +467,53 @@ OS-level gestures that cause most of these.
       lenient to expose the watchdog rules).
 - [ ] Reconfigure stays delta-based: adding/moving blocks doesn't re-open ASIO
       (no 0.5–1 s stall on edit).
+
+### Audio survives the window not being looked at
+
+Both of these must be tested **in the real Electron window, on both engines** —
+a browser pane cannot reproduce either, because the switches that fix them are
+Electron's and the tab under test is foregrounded.
+
+Build a patch that is obviously modulated (an LFO or an Orbit into a Panner, or
+a Trajectory driving a source) so a *frozen* modulation is as audible as a
+dropout, start audio, and then:
+
+- [ ] **Minimize the window for a minute.** The sound must not crackle, and the
+      modulation must still be moving when you restore. Restoring must not
+      "catch up" in a lurch either — that means the loop stalled and something
+      is dead-reckoning off wall-clock.
+- [ ] **Put another app fullscreen in front of it** (a game, a video, anything
+      that fully covers it) for a minute. Same expectations. This is a *separate*
+      case from minimizing — it is Chromium's native occlusion detection — and
+      it was the one nobody thought to test, because the window is still open
+      and still "running".
+- [ ] Switch to another window that only *partly* covers it, and to another
+      virtual desktop. Neither should change anything.
+- [ ] Watch `status` across the whole test: `xruns` and `late` must stay 0, and
+      `starved` must never appear.
+- [ ] **Test it with a bridged ASIO input too** (an `audio-in` on a second ASIO
+      driver, e.g. a Voicemeeter/VB-Matrix virtual ASIO while the master runs on
+      the interface). That path has its own process and it is the one that
+      breaks: measured, the capture stopped **one second after the window lost
+      focus** and never recovered, while every engine-side metric stayed
+      healthy. Click onto another window — not even fullscreen — and watch for a
+      full minute.
+      - `starved: [...]` in a status line, or `asio bridge … captured nothing
+        for 2 s`, is that fault. Neither is a tuning problem.
+      - If it does freeze, the watchdog must **restart it** (`asio bridge …
+        stopped delivering audio — restarting it`) and audio must come back
+        within a couple of seconds rather than staying dead. A permanent
+        starvation means the watchdog did not fire.
+      - `node scripts/bridge-watchdog-test.cjs` covers the recovery logic
+        headlessly (restarts a dead bridge, never a live one, bounded).
+- [ ] The diagnostics log records `window` lines (minimized / restored /
+      focused / blurred). If a fault lines up with one of them, say so in the
+      report — that correlation is the whole reason the field exists.
+- [ ] If either fails, check `electron/main.cjs` still appends all four command
+      line switches **before `app.whenReady()`** (a later one is ignored with no
+      warning) and that the window still sets `backgroundThrottling: false`.
+      Then check `src/main.ts`'s hidden-window pump is still polling and still
+      **not** drawing.
 
 ## UI changes
 
@@ -338,6 +592,32 @@ OS-level gestures that cause most of these.
 - [ ] Delete the source block → its clones vanish. **Undo → they come back.**
 - [ ] Arrange mode: move/resize/multi-select, snap guides appear only for snaps
       that applied, geometry survives save/reload.
+
+### Advanced tab
+
+- [ ] **Trajectory** — click anywhere on or near the curve: the waypoint lands
+      in **that leg**, not at the end of the list. Check the leg between the
+      last waypoint and the first specifically; before the fix every new point
+      went there whatever you clicked.
+- [ ] A new waypoint inherits its neighbours' height, so inserting into a lifted
+      stretch does not drop it to the floor.
+- [ ] **Record a long gesture** (several seconds, a spiral or a figure-eight).
+      The *whole* gesture survives — check the **end** of it is there, not just
+      the first two seconds — and the hint's waypoint count stays inside the
+      ceiling. Capture simplifies; it does not truncate.
+- [ ] Wheel over a waypoint sets its height, and a **two-finger vertical drag**
+      does the same on a touchscreen. (Both deep editors originally left this
+      parameter mouse-only, which on a tablet means a trajectory you can lay out
+      in plan but never lift off the floor.)
+- [ ] **Matrix** — click a cell to toggle, drag across to paint a run, Shift-drag
+      / wheel / two-finger drag for a level, right-click for the row and column
+      operations. Cells hit where they are drawn at UI scale ≠ 1.
+- [ ] Matrix `Ins`/`Outs` ± add and remove ports **independently**, wires to a
+      removed port go with it, and the surviving crosspoints keep their gains.
+      Undo restores both the ports and the wires.
+- [ ] Moving a Matrix port along its edge by hand **survives a reload and an
+      undo** — the port sync only re-spaces when the count changed, or it drags
+      user placement back and recompiles the graph every time.
 
 ### Clip tab — a viewer, not an editor
 
@@ -420,19 +700,51 @@ OS-level gestures that cause most of these.
 - [ ] Loop brackets drag: the **start** keeps the length, the **end** changes
       it. Both stay clamped inside the region — drag a play bar over the loop
       and the loop follows rather than pointing outside.
-- [ ] `loopFade` ramps the seam. **Native only** — the Web unit loops without
-      it (documented divergence; do not "fix" it by adding a per-lap scheduler
-      without reading [`09-persistence-and-assets.md`](09-persistence-and-assets.md)).
+- [ ] `loopFade` crossfades the seam, **including on a loop that starts at the
+      region start**. That case has no run-up before the loop, and the fade used
+      to be clamped to that run-up — i.e. to zero — so the control silently did
+      nothing on the loop the `⟳ Loop` / `⤢ Loop` buttons hand you, which is the
+      one everybody reaches. The fade overlaps the loop's own head instead, so
+      the only ceiling is half the loop, and a lap is the bracket **minus** the
+      fade (the toolbar says so).
+- [ ] The `⤫ Seam Fade` button toggles a useful default (a quarter of the loop)
+      and the picture draws **two** ramps — the tail going out and the head
+      coming in. One ramp would claim the head is untouched.
+- [ ] `loopFade` is **native only** — the Web unit loops without it (documented
+      divergence; do not "fix" it by adding a per-lap scheduler without reading
+      [`09-persistence-and-assets.md`](09-persistence-and-assets.md)).
 - [ ] **One-Shot** — press and release a key instantly: the hit still plays all
       the way through. If a short press cuts it off, note-off is not being
       ignored.
 - [ ] **Slice** — `Divide…` cuts the region evenly; `⌁ Detect` lands slices on
       transients **on the first press** (it awaits its scan — a first press
       that does nothing means it went back to the sync peak getter); `⨯ Clear`
-      empties it. Each slice answers to a consecutive key from Root upward, and
-      the toolbar names the range.
-- [ ] A slice plays **at its own pitch** — Slice mode does not transpose.
-- [ ] A key past the end of the kit is silent, not a wrapped slice.
+      empties it.
+- [ ] **Chromatic map** (the default): each slice answers to a consecutive key
+      from Root upward, plays **at its own pitch** (Slice mode does not
+      transpose), and a key past the end of the kit is silent, not a wrapped
+      slice. The toolbar names the range.
+- [ ] **`♪ Keys`** detects the pitch of every slice, writes `slicekeys`, and
+      switches the block to the **Pitched** map. The waveform then labels each
+      slice with the key it was *detected* to sound (`—` where nothing pitched
+      was found), not with root+index — labelling it root+index there would
+      describe a mapping the engines are not using.
+- [ ] **Pitched map**: playing a slice's detected key plays that slice
+      untransposed; a key between two slices plays the nearer one, transposed
+      onto it; and **no key falls off the end of the kit**. That last one is the
+      difference between a kit and an instrument. Slices with no detected pitch
+      keep their chromatic slot but **lose every tie** to a detected one — a
+      placeholder key must not steal a note from a slice that was actually
+      heard to play it.
+- [ ] Re-cutting the region (`Divide…`/`Detect`/`Clear`) **drops the detected
+      keys**: key `i` describes slice `i`, so a re-cut would map notes to
+      material nothing ever listened to.
+- [ ] A slice runs the **full ADSR**. `⌁ Gate` (default) releases it on
+      note-off like Classic; `⌁ One-Shot` ignores note-off. Either way the
+      release starts early enough to *finish* by the slice end — turn Release
+      up and the slice should audibly fade out, not stop. (It used to flip into
+      release one sample before the end, so the R knob did nothing and every
+      slice ended on a step.)
 - [ ] Drag a slice marker past its neighbour: the kit **reorders** rather than
       colliding. Ctrl-click adds one; right-click deletes one; neither does
       anything outside Slice mode.
@@ -441,7 +753,12 @@ OS-level gestures that cause most of these.
       would hand out silent keys).
 - [ ] Undo/redo covers every marker drag, mode change and slice edit. Note that
       `restore()` swaps in a fresh scene — a held `Block` reference goes stale.
-- [ ] `node scripts/deck-kernel-test.cjs` covers all three modes headless.
+- [ ] `node scripts/deck-kernel-test.cjs` covers all three modes headless,
+      including the slice ADSR, the Pitched map and the seam crossfade.
+- [ ] `node scripts/slice-pitch-test.cjs` covers the pitch detector itself —
+      the octave trap (a strong second harmonic must not read an octave low),
+      unpitched material returning "none" rather than a guess, and the
+      slice→key mapping rules on both maps.
 
 
 ## MIDI rolls / piano roll (`clipview.ts` roll mode, `pianoroll.ts`)
@@ -527,6 +844,13 @@ bytes and the state derived from them getting out of step.
       (Litter here is the whole reason for `scratch`.)
 - [ ] ▶ auditions the take between the bars, through the recorder's **audio
       out** — wire it to an output and listen before saving.
+- [ ] **A take played back through a Sampler is as loud as it was recorded.**
+      Record something peaking near full scale, wire it into a Sampler, play a
+      note at full velocity: the output peaks at the same level. Then check the
+      `Vel → Amp` knob — at 0 every velocity plays full level, at 1 velocity
+      scales it linearly. Losing several dB between the recorder and the sampler
+      is the 2026-08-01 report, and it was the instrument's gain staging, not the
+      tape path (which measures bit-exact — `scripts/recorder-kernel-test.cjs`).
 - [ ] **Punch in**: scrub to the middle, ●, record briefly, ■. Audio before the
       punch survives, the punched span is **overwritten in place**, audio after
       it survives, and **no second asset is created** — the same id is rewritten.
@@ -539,10 +863,57 @@ bytes and the state derived from them getting out of step.
       Save As… names it into the Rolls tab.
 - [ ] Open a scene saved before the recorders gained ports: the `out` / `thru`
       ports are backfilled (`backfillDefPorts`) rather than silently missing.
-- [ ] Open a scene saved **while the recorders still had asset outputs**: the
-      `tape` / `roll` output ports are **gone**, and any wire that reached one
-      went with them (`RETIRED_PORTS`). A retired port left behind reads as a
-      working route that the engine ignores.
+- [ ] Open a scene saved **while the MIDI recorder still had its asset output**:
+      the `roll` output port is **gone**, and any wire that reached it went with
+      it (`RETIRED_PORTS`). A retired port left behind reads as a working route
+      that the engine ignores. (`tape-recorder`'s `tape` is **not** retired any
+      more — it must be backfilled onto any scene that lacks it.)
+
+### Piano roll transport and the matrix face
+
+- [ ] **Space toggles**: press once to play, again to stop. It must not restart
+      from the top — the state lives in the engine (`runtime.transportFor`), not
+      in a param, and asking a `playing` param that does not exist is what made
+      it a replay button.
+- [ ] **Space plays once.** The roll runs to the end bar and stops even with
+      Loop on, and the **Loop toggle is back on afterwards** — Space parks it,
+      it does not overwrite it. Check every way out: a second Space, ■, playback
+      ending on its own, and selecting a different block.
+- [ ] Draw and stretch notes right up against the **end bar**. The bar must not
+      steal the pointer from a note in front of it; it is grabbed from the
+      outside (`BAR_INNER_TOL`).
+- [ ] Vertical **scroll** on the Roll: scrolling down shows *lower* notes. A
+      two-finger **drag** goes the other way — the note under the fingers stays
+      under them. Both piano-roll surfaces, and see docs/14 on the two signs.
+- [ ] **Click a crosspoint on a Matrix block's face**: it opens/closes, and the
+      cell that changes is the one under the pointer (Shift-click = half open).
+      Missing the grid still drags the block. Then open the Advanced tab, click
+      a cell, and type a percentage — the field edits the cell you clicked, not
+      the one you happen to be hovering on the way to the box.
+
+### The live take (`tape-recorder` → `tape`)
+
+- [ ] Wire `tape-recorder.tape` → a **Sampler**, give the sampler MIDI, and
+      press ●. Play a phrase in, then hit a key **while still recording**: the
+      sampler plays what you just recorded. Both engines. This is the whole
+      feature — if it needs ■ first, it is broken.
+- [ ] Keep recording: each new key press reaches **further** into the take. A
+      note already sounding keeps the material it started on rather than
+      glitching.
+- [ ] Watch the audio while the take grows past a few minutes (native): no
+      xruns, no click at the moment the mirror's capacity doubles. A whole-take
+      memcpy on the pump is the failure mode — it shows as one fat spike in
+      `jitterQ`, not as a steady load.
+- [ ] **Punch in** with the sampler still wired: notes played after the punch
+      hear the *new* audio in the punched span, not the pre-punch material.
+- [ ] ■ does **not** disturb the wired sampler (it stays on the live take —
+      the same audio, no re-decode).
+- [ ] **Clear** with the sampler wired: it falls back to the committed cassette
+      if there is one, and goes silent if there is not. Nothing keeps playing a
+      take that no longer exists.
+- [ ] Delete the recorder, or rebuild the graph: the live asset goes with it
+      (`dispose`). A `live_*` id must never reach a saved scene, the Library or
+      the Cassettes tab.
 
 ## Cross-engine parity harness (reusable)
 
@@ -624,6 +995,17 @@ Two independent measurements, because either alone misleads:
 harness that allocates per quantum costs ~40 B/quantum, the same order as the
 bug being hunted.
 
+**The slope check has a floor exemption, and it is not a loosening.** Once the
+warm-up has decayed below the measurement's own GC noise, the short run is no
+longer reliably larger than the long one — measured here, the long run sits at
+6–10 B/quantum while the short one bounces between 9 and 45, so a strict
+`longRun < shortRun` fails at random on a completely clean audio path. (Found
+when a module grew enough to shift V8's inline-cache warm-up; steady state did
+not move.) A *flat* leak is flat at a rate that matters — one small object per
+quantum is ~40 B — so a long run already at the floor has proved the same thing
+the slope was asked to prove. Re-running to get a luckier short run proves
+nothing; if this trips, look at `longRun`.
+
 ## Convolution probe (reusable)
 
 ```
@@ -640,7 +1022,24 @@ naive O(NM) convolution sample-for-sample after aligning the fixed one-hop
 latency, a stereo IR convolves each channel with its own IR, normalize keeps a
 long hot IR bounded, and `process` is allocation-free (the IR is resampled,
 normalized and partitioned at load time). Current: all within ~1e-7 of ground
-truth. The kernel loads its IR from the cassette store; the probe hands it a
+truth.
+
+It also checks the two things that are **inaudible in isolation** — the block
+sounds perfect either way and only `loadMax`/`xruns` know — and so are the ones
+that regress silently:
+
+- **Correct at a quantum that does not divide the hop** (n = 64/128/300/512/1024).
+  The FIFO used to zero-fill a short read, which self-corrects in a few quanta
+  when the quantum divides the hop and sprays silence gaps for ~30 quanta when
+  it does not. The lead is primed to `H − gcd(n, H)` now; 300 is the case that
+  fails without it (rms error 1.2 against ground truth, i.e. unrecognisable).
+- **Flat cost and linear rate scaling.** p99 per-quantum cost must stay under
+  2.5× the average (all the partition work used to land in the quantum that
+  completed a hop, ~4× the average at 96 kHz/128), and load must scale under
+  2.6× from 48 kHz to 96 kHz for the same IR *duration* (a fixed 256-sample hop
+  made it quadratic — measured 4.0×). Current: 1.8× and 1.95×.
+
+The kernel loads its IR from the cassette store; the probe hands it a
 fake `sv.assets` that resolves an in-memory IR. Web parity is intentionally the
 browser `ConvolverNode` (a sanctioned divergence, like Reverb).
 
@@ -678,6 +1077,107 @@ disagree, which is unfindable from the listening position. Also covers Once
 (holds the endpoint), Ping-pong (reverses), empty path (silence), and that
 `liveParams` tracks the output (the editor's playhead telemetry).
 
+It also covers the two **editing** helpers, which are pure but are the reason
+the block is usable: `insertIndexFor` puts a new waypoint in the leg the click
+is nearest (it used to append, so on a closed path every new point landed on
+the last→first leg), and `simplifyPath` fits an arbitrarily long freehand
+gesture into the waypoint ceiling *without losing its end* — the probe draws a
+three-turn spiral and asserts both that every original point is still near the
+resulting curve and that the curve goes all the way round, which truncation
+would fail.
+
+## Speaker calibration probe (reusable)
+
+```
+npm run build:engine && node --expose-gc scripts/speaker-cal-test.cjs
+```
+
+**Every part of this feature fails plausibly**, which is the entire reason the
+probe exists. A deconvolution with the wrong scaling, a cepstrum folded on the
+wrong side, a mic curve added instead of subtracted — none of them error, none
+of them look wrong on a plot, and all of them produce a correction filter that
+quietly makes the room worse. From the listening position you cannot tell
+"corrected" from "corrected backwards" without a second measurement rig.
+
+So the probe **measures a speaker it built itself**: a known biquad, a known
+delay and a known level, pushed through the real sweep, the real deconvolution
+and the real minimum-phase designer, then asserted against the numbers it
+started from. Current results:
+
+- `analyseSweep` recovers the filter to **0.20 dB** worst case (150 Hz–12 kHz),
+  the arrival time to **0 samples**, and level changes to 0.02 dB. It still
+  reads 0.21 dB with −48 dBFS of noise in the room. Silence and a clipping
+  input are *named* failures, not strange-looking responses.
+- The mic calibration file is **subtracted** (a +5 dB mic reads 4.9 dB lower),
+  and its flat region leaves the response alone.
+- `deriveCorrection` flattens a 5.86 dB span to **0.25 dB**, never boosts (peak
+  0.000 dB), refuses to invert a 24 dB/oct woofer roll-off, and leaves a flat
+  speaker alone to within 0.000 dB.
+- `buildCalIR` realises the curve to **0.07 dB**, is minimum-phase (100 % of
+  the energy in the first eighth), places a 5 ms delay as exactly 240 zero
+  taps, refuses a non-finite curve, and is the same 10.7 ms at 48 and 96 kHz.
+- The run-wide decisions: relative delays, attenuation-only trims, measured
+  spacing with the rig's overall scale preserved, a **subwoofer left at its own
+  level** (its band is not the mains' band, so the two levels are not
+  comparable — but its delay still sets the alignment reference), and a failed
+  speaker skipped with a note rather than faked.
+- `calStale` expires on the edits it should (1° move, 20 cm, `out`, LFE, being
+  renumbered) and not on the ones it should not (0.3°, 1.5 cm, rename).
+
+The last section drives the real `speaker-rig` kernel, because
+`audio-alloc-test.cjs` does not:
+
+- an uncalibrated rig is **bit-identical** to before the feature existed, with
+  no filter tail at all;
+- a −6 dB correction arrives as exactly 0.501;
+- **an uncalibrated speaker in a calibrated rig comes out on the same sample**
+  as a calibrated one — the invariant that keeps a half-calibrated rig imaging
+  correctly, and the reason uncalibrated speakers get a unit impulse rather
+  than a bypass;
+- zero `subarray` views and flat heap in the corrected path;
+- the filters survive 48 k → 96 k → 48 k and still apply −6 dB;
+- an **unchanged** rig push costs 0.014 ms (it arrives once per pointer-move of
+  a drag), and a changed one is picked up.
+
+## Matrix router probe (reusable)
+
+```
+npm run build:engine && node scripts/matrix-kernel-test.cjs
+```
+
+Routing is easy to get right and easy to get *subtly* wrong, and every way of
+getting it wrong is silent — an output that also carries its neighbour's input
+sounds like a patch. So every check is about **identity**: each input carries
+its own DC value, so a leak, a swap or a drop reads as a wrong number rather
+than a plausible level. Covers the diagonal, fan-out (which is what catches a
+summing node accidentally shared between outputs), summing into one output,
+fractional crosspoint gains, resizing either side independently (surviving
+crosspoints keep their gains, new ones start closed, short/missing grid rows pad
+with zeros), the one-quantum ramp when a crosspoint opens (a step there is a
+click — docs/10 rule 10), the truncation rules for a narrow source on a wide
+output, and zero allocation in `process`.
+
+## Tempo Follow probe (reusable)
+
+```
+npm run build:engine && node scripts/tempo-kernel-test.cjs
+```
+
+Feeds synthetic percussion at a known tempo and asks whether the clock coming
+out is that tempo — synthetic on purpose, so a failure is unambiguously the
+estimator rather than a hard passage. Beyond the BPM figure it asserts the
+things that make the block *usable*: the clock output really ticks once a beat
+(and `div` multiplies that without moving the estimate), the phase output is a
+ramp rather than a gate, the estimate **settles** instead of wandering, silence
+holds the tempo while confidence falls away, `lock` freezes it, and `process`
+allocates nothing — the correlation sweep is the only real analysis anywhere on
+the audio path, and it is spread across quanta specifically so it can live
+there.
+
+Note the probe builds its `{ in: buf }` map **once**: an object literal inside
+the drive loop is ~40 B of the harness's own garbage per quantum, which is the
+same order as the bug being hunted (the first version of it measured itself).
+
 ## Spatial / utility kernel probe (reusable)
 
 ```
@@ -705,6 +1205,184 @@ numbers, because "audio came out" is true of every one of these bugs:
   window (the crossover cascade neither eats nor doubles the signal), spin
   redistributes over time, silence in gives silence out, and changing `Bands`
   mid-run stays finite (the filter-state reset).
+
+## Sample rate sweep + NaN survival (reusable)
+
+```
+npm run build:engine && node --expose-gc scripts/samplerate-test.cjs
+```
+
+Run this for **any** change to `Biquad`, to a kernel's `ctx.sr` handling, or to
+the buffer-size path in `io.ts`. It exists because of a bug that presented as
+"EQ Curve stopped passing audio at 96 kHz" and had two independent halves, each
+harmless-looking on its own:
+
+- a quantum larger than `MAXQ` (reachable from the buffer-size setting — WASAPI
+  grants an oversize request verbatim, and WASAPI's frame count *scales with the
+  sample rate*) made kernels read past their own arrays, and `undefined`
+  arithmetic produced NaN;
+- a biquad feeds its output back, so that NaN latched and **every subsequent
+  output was NaN forever**, through param changes and through changing the
+  setting back. Drivers render NaN as silence, so it reads as a dead block, not
+  as a glitch.
+
+What it asserts, and why each case earns its place:
+
+- Audio comes out at 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz.
+- The measured magnitude matches the RBJ model **at the running rate** — not
+  just "some audio came out". A 16 kHz bell sits at 2/3 of Nyquist at 48 k and
+  1/3 at 96 k, so a filter designed at the wrong rate fails here. This is the
+  numeric half of "the drawn curve is the audio" (docs/07-ui.md).
+- One poisoned sample is transient, not terminal.
+- A quantum of `MAXQ * 2` is survivable. `io.ts` refuses to hand one over now,
+  but a kernel that can be permanently destroyed by one is a debugging trap.
+- Walking 48 k → 96 k → 44.1 k → 192 k → 48 k on **one instance** keeps passing
+  audio (state reset on rate change, not just new coefficients).
+- `ctx.sr` of 0 / NaN / negative is ignored rather than designed with.
+- Steady state still allocates nothing (docs/10 rule 1) — the heal check is one
+  `Number.isFinite` per biquad per quantum and must stay that cheap.
+
+**Writing a new stateful kernel?** Add it here. "Carries state across quanta"
+is the trigger, not "is a filter": delay lines, integrators, envelope followers
+and allpass chains latch just as permanently.
+
+## Non-finite recovery across every kernel (reusable)
+
+```
+npm run build:engine && node scripts/nonfinite-recovery-test.cjs
+```
+
+The sweep above pins `Biquad`; this one pins **every registered kernel**, and it
+exists because pinning one block turned out not to be enough. After `Biquad` got
+its trap, the identical report came back as "now it's the Upmix" — the NaN
+source had not been found, so it simply killed the next block downstream that
+had recursive state. Five kernels were latching: `upmix`, `decorrelate`,
+`binaural`, `feedback`, `reverb`.
+
+It warms each kernel on clean audio, injects one NaN sample, then feeds **two
+seconds** of clean audio and requires finite output.
+
+- The two-second tail is the assertion. Clearing a kernel's scalar state but not
+  its **ring buffers** passes over a few quanta and fails here: the bad sample
+  is still in the delay line and comes back around one lap later. That failure
+  mode — recovers, then dies again on a cycle — is worse than a dead block.
+- The kernel list is **scraped from `dsp.ts`/`vst.ts` at run time**, so a new
+  block is covered the day it lands, not the day someone updates a list.
+- `conv` is expected to pass with no trap: it is FIR, so its history flushes
+  itself. Its IR is scrubbed at load instead — a non-finite sample *in the IR*
+  is the filter, and no audio-path reset can undo it.
+
+Verify the test still has teeth after touching `trapNonFinite`: stub it out and
+confirm the five kernels above reappear. A guard test that cannot fail is worse
+than none, because it certifies the invariant it stopped checking.
+
+## Modular-voice probe (reusable)
+
+```
+npm run build:engine && node --expose-gc scripts/modular-kernel-test.cjs
+```
+
+Pins the seven analog primitives (`vco`, `ladder`, `env-adsr`, `lfo`,
+`wavefold`, `sh`, `slew`). Each has one property that, if it regresses quietly,
+makes the whole voice wrong in a way that reads as some *other* block's fault:
+
+- **1 volt per octave**, on the VCO's `pitch`, the ladder's `cut` and the LFO's
+  `rate`. A wrong exponent still makes a sound, so the report comes back as
+  "the synth is detuned", not "the CV law is wrong".
+- The ladder really attenuates at ≈ −24 dB/oct and really self-oscillates
+  (**it has to be excited to start** — a digital ladder at exactly zero state
+  with zero input stays there, so the test pings it and listens a second later).
+- The envelope **reaches 1** (a one-pole aimed *at* 1 asymptotes and never
+  arrives) and **returns to exactly 0** (an envelope that only approaches zero
+  holds a VCA open forever).
+- The folder is a **unity pass-through at zero fold**. Any gain there and
+  inserting the block changes the sound before you touch the knob.
+- Allocation is measured in **bytes per quantum over 200 000 quanta**, the same
+  method as the zero-allocation guard above, because a single short measurement
+  reports V8's warm-up as a leak. This caught a real one: a `trapNonFinite`
+  reset written as an inline arrow function is a closure allocated once per
+  quantum — ~370 a second per block, in four of the seven kernels.
+
+## Sequential-logic probe — the Rule 110 preset (reusable)
+
+```
+npm run build:engine && node scripts/rule110-machine-test.mjs
+```
+
+Builds the "Rule 110 Automaton" preset, compiles it, runs the **real
+`GraphExec`** over it and compares the sixteen state bits against an
+independent Rule 110 simulation written from the truth table. It is the only
+end-to-end test of a *large synchronous graph* — 185 nodes, 173 nets, a
+feedback ring the executor has to break cycles in, and a clock fanned out to
+forty registers. Everything else in `scripts/` drives one kernel at a time.
+
+What it establishes, and the numbers worth knowing:
+
+- All 48 generations match the reference exactly, from a cold all-zero boot
+  (which also proves the 15-gate NOR watchdog and the seed path — without them
+  nothing ever happens).
+- The 4-bit carry chain counts 0..15 and wraps, on the same clock.
+- `RUN` is a clock **enable**: the machine freezes between states and resumes.
+- **Cost: ~10% of the audio budget at 128 frames / 48 kHz** for the whole
+  machine. Useful as a rough ceiling for "how big can a patch get".
+- **Clocked graphs need a clock period of many quanta.** Verified exact at 4,
+  20 and 50 Hz. The floor is *reported, not asserted* — past it the readback
+  merges generations, so the probe stops being separable from what it probes.
+
+> **Two things this test corrected that had been assumed.** The preset's
+> registers are master–slave (two S+Hs, the second on the inverted clock), and
+> the original rationale was "single-stage would ripple round the ring and be
+> silently wrong". Rebuilding it with the gates reading the master stage
+> computes Rule 110 **exactly** — the executor's cycle break already covers it.
+> And the counter appeared broken until it turned out two blocks were both
+> named `C1`. Anything that resolves a block by name should reject duplicates.
+
+## Factory content probe (reusable)
+
+```
+node scripts/factory-preset-test.mjs
+```
+
+Validates every built-in custom block and preset scene (`src/core/factory/`).
+It bundles the renderer with esbuild (a Vite dependency, already installed) and
+runs it in-process, so no build step is needed.
+
+Factory content is **document data written by hand**, and the document format
+hides ids in six places — wire endpoints, portal-derived port ids,
+`cv:<child>:<param>` ports, `exposed`, `paramLinks`, and `link:`/`expose:` face
+refs. Every one of them fails *silently*:
+
+| what is wrong | what you see |
+|---|---|
+| wire to a port that doesn't exist | preset loads and looks right, one connection missing |
+| `link:` item with no matching `paramLink` | `faceItems` drops it as stale — the knob is just not on the panel |
+| duplicate id across nested graphs | one remap map, so two blocks collapse into one on instantiate |
+| two independent wires into one input | `ins[port]` is last-net-wins, so one source is never heard |
+| `nextId` at or below an id in the scene | the first block the user adds re-issues an existing id |
+| a layout item wider/taller than the content box | the widget hangs outside the block, forever, on every instance |
+
+That last row is the 2026-08-01 addition (`checkLayoutFits`) and it caught five
+of the six factory custom blocks at once. Nothing at runtime clamps a stored
+layout — `faceItems` returns it verbatim, and `clampFaceItem` only runs on the
+automatic flow, on a drag and on a resize — so a layout authored against the raw
+`size`, forgetting the padding `padOf` reserves for port labels, simply draws
+outside the block. The failure message prints the size the block needs to be.
+`style.freeWidgets` is checked against the raw box rather than skipped: it
+waives the padding and the outline, not the block.
+
+It also compiles each scene and requires every net tap to resolve. The Mavis
+gets specific assertions on top: 24 jacks, 11 outputs / 13 inputs, jack names
+matching the manual exactly, all 24 placed with `free` fractions, 22 mirrored
+knobs and 2 exposed children — plus its **silkscreen**, which fails just as
+quietly as the wiring: every `text:` layout item resolves to a `texts` entry, is
+marked `decor` (or it eats the clicks of everything it covers), every `glyph`
+names a symbol `PANEL_GLYPHS` actually has (a typo draws nothing at all), every
+mirrored knob's name is printed somewhere on the panel (the widgets hide their
+own labels, so an unprinted knob is a blank dial), and the keyboard is exposed
+with the `pad` variant that makes it the hardware's button row.
+
+It has already earned its keep — it caught a missing `s.parent.texts` assignment
+that would have shipped the Mavis with its entire silkscreen invisible.
 
 ## Deterministic clock-drift sim (reusable)
 
@@ -750,7 +1428,15 @@ live click.
   algorithms). Everything else should match numerically.
 - **The Sampler's `loopFade` is native-only.** An `AudioBufferSourceNode` has
   loop points but no seam crossfade; faking one needs a second source per lap,
-  and the Web engine is the fallback path. It loops without the crossfade.
+  and the Web engine is the fallback path. It loops without the crossfade —
+  which also means the two engines' **lap lengths differ** when a fade is set:
+  the native seam fade overlaps the loop's own head, so a lap there is the
+  bracket minus the fade.
+- **`tempo-follow` and `matrix`'s full width are native-only.** Tempo Follow is
+  `stubbed` (it needs analysis the preview engine has no place to do); the
+  Matrix's web unit routes correctly but leaves channel folding to Web Audio's
+  own up-mixing, so a wide bus folds to stereo there. Both are the same bargain
+  the surround blocks make (docs/08, "Add a multichannel block", rule 3).
 
 ## When a user reports a click/pop
 
@@ -761,3 +1447,14 @@ live click.
    blocking the engine loop.
 3. Drift → the resampler; confirm `asio-in` (ring-free) is unaffected and it's a
    mixed-clock path (Windows capture + ASIO master).
+4. **`xruns` climbing steadily at low `load` and low GC is the tuner, not the
+   machine.** Plot `inDepth` across the status ticks: if it slides downward at a
+   constant rate and jumps back up exactly where `xrunsDelta` is non-zero,
+   that's the capture setpoint hunting, and the pop is self-inflicted. See
+   `Ring.peakDip` in `engine/src/io.ts` and the CLUSTERS scenario above. A
+   diagnostics log makes this obvious in about ten seconds of reading — the
+   sawtooth is unmistakable and completely independent of what is being played.
+5. Repeated `engine exited (…) — restarting` lines are audio holes too, not
+   just crashes. `0xC0000409` right after an `ASIO:` line was a stale WASAPI
+   callback running against the new master's channel count (fixed 2026-07-30;
+   both pumps now bail if they are not the current master).

@@ -24,6 +24,7 @@ import {
 } from './types';
 import { defaultParams, defaultPorts, getDef } from './registry';
 import { defaultDeviceFor } from './prefs';
+import { activeRig, dropStaleCals, setActiveRig } from './rig';
 
 /**
  * 'structure' = topology changed → engine recompiles.
@@ -90,6 +91,13 @@ export class GraphDoc {
   dirty = false;
   /** Non-null once the scene exists in the local registry under this name. */
   savedAs: string | null = null;
+  /**
+   * Set by `loadScene` when the installation's rig replaced the one the scene
+   * carried, so the shell can say so. Discarding a speaker layout is a real
+   * change to how the patch will sound — it must not happen invisibly.
+   * Cleared on the next load; read once and forget.
+   */
+  rigOverride: { was: string; wasCount: number; now: string } | null = null;
 
   private undoStack: string[] = [];
   private redoStack: string[] = [];
@@ -199,6 +207,10 @@ export class GraphDoc {
       this.path = [];
     }
     if (s.side !== undefined) restoreSides(s.side);
+    // Undoing a rig edit is a rig edit: the installation's copy has to follow,
+    // or Ctrl+Z would move the speakers on screen and leave the stored layout
+    // at the value the *next* scene load would put straight back.
+    if (this.scene.rig?.speakers?.length) setActiveRig(this.scene.rig);
     // Port widths are part of the snapshot, but a snapshot taken before a rig
     // existed (or hand-edited) can disagree with it; re-derive rather than
     // trust it.
@@ -255,6 +267,26 @@ export class GraphDoc {
     // A hand-edited or pre-rig scene can arrive with no layout at all; spatial
     // blocks would then compile to nothing rather than to a sane default.
     if (!scene.rig?.speakers?.length) scene.rig = defaultRig();
+    // A scene edited by hand (or written by an older build) can carry a
+    // calibration whose baseline no longer matches the speaker it is attached
+    // to. Drop those on the way in rather than applying a filter measured for a
+    // position the speaker is not in.
+    else scene.rig = dropStaleCals(scene.rig);
+    // **The room wins.** The installation's rig (core/rig.ts) replaces whatever
+    // layout the incoming scene was authored against — a user's speakers do not
+    // move because they opened a different patch. Null on a fresh install, so a
+    // factory preset still arrives configured the way it was designed.
+    const mine = activeRig();
+    this.rigOverride = null;
+    if (mine) {
+      const theirs = scene.rig;
+      // Only worth reporting when it actually changed something the patch can
+      // feel: the channel count, or a layout by another name. A silent swap of
+      // two identical 7.1.4s needs no banner.
+      if (theirs.speakers.length !== mine.speakers.length || theirs.name !== mine.name)
+        this.rigOverride = { was: theirs.name, wasCount: theirs.speakers.length, now: mine.name };
+      scene.rig = dropStaleCals(JSON.parse(JSON.stringify(mine)) as Rig);
+    }
     this.syncRigPorts();
     this.touch('structure');
     this.touch('theme');
@@ -271,7 +303,20 @@ export class GraphDoc {
    */
   setRig(rig: Rig, live = false): void {
     if (!live) this.pushHistory();
-    this.scene.rig = rig;
+    // A calibration describes one speaker, in one place, on one amplifier
+    // channel. Every route into the rig comes through here — a drag, the
+    // inspector, a preset, ± Speaker, undo — so this is the one place that has
+    // to notice that a speaker no longer matches the measurement stapled to it.
+    // Doing it per-caller left the "delete a speaker and every later one is now
+    // on a different amp channel" case uncovered. `dropStaleCals` returns the
+    // same object when nothing is stale, so a drag pays one comparison per
+    // speaker per pointer-move and allocates nothing.
+    this.scene.rig = dropStaleCals(rig);
+    // The layout is the room's, not the patch's: every edit is also an edit to
+    // the installation's rig, so it is still there in the next scene. This is
+    // the single write point precisely because every route in already funnels
+    // through here.
+    setActiveRig(this.scene.rig);
     // Width follows the speaker count, and width is topology. Only raise
     // 'structure' when it actually moved — see syncRigPorts.
     const widthChanged = this.syncRigPorts();
@@ -331,7 +376,7 @@ export class GraphDoc {
     // Devices) instead of "(default)" — the setting exists precisely so this
     // does not have to be picked by hand on every new block. No preference
     // set leaves the def's own default untouched.
-    const dev = defaultDeviceFor(type);
+    const dev = defaultDeviceFor(type, String(b.params.api ?? ''));
     if (dev && b.params.device !== undefined) b.params.device = dev;
     if (def.isSubgraph) {
       b.graph = { blocks: [], wires: [] };
@@ -357,6 +402,9 @@ export class GraphDoc {
         'spatial-scope',
         'speaker-monitor',
         'chan-pick',
+        'chan-split',
+        'chan-merge',
+        'matrix',
       ].includes(type)
     )
       this.syncRigPorts();
@@ -725,11 +773,175 @@ export class GraphDoc {
           // end up narrower — the wire's channel chip is what tells you.
           const w = Math.max(2, Math.min(32, Number(b.params.chans) || 2));
           for (const p of b.ports) if (p.kind === 'audio') set(p, w);
+        } else if (b.type === 'matrix') {
+          // Not a width: a *count*. The Matrix grows and shrinks its two sides
+          // independently, which is the same class of problem — a port list
+          // that is not a constant — so it is re-derived in the same place
+          // rather than at every site that can edit the counts.
+          if (this.syncMatrixPorts(g, b)) changed = true;
+        } else if (b.type === 'chan-split' || b.type === 'chan-merge') {
+          // A count *and* a width: Count sets how many narrow ports the fanned
+          // side has, and the single wide port's width follows Count (doubled in
+          // Pairs mode). Both are topology, re-derived here for the same reason
+          // as the Matrix.
+          if (this.syncPackPorts(g, b)) changed = true;
         }
         if (b.graph) visit(b.graph);
       }
     };
     visit(this.scene.root);
+    return changed;
+  }
+
+  /**
+   * Give a Matrix block exactly `ins` inputs and `outs` outputs.
+   *
+   * Ports that survive keep their id (so wires to them survive too) and their
+   * edge; only the spacing along the edge is re-derived. Ports the counts no
+   * longer cover take their wires with them — a wire to a port that is not
+   * there compiles to a tap the engine cannot resolve, and silently drops.
+   *
+   * Returns true when anything changed, so the caller raises 'structure' only
+   * when it must: this runs on every scene load and every undo.
+   */
+  private syncMatrixPorts(g: Graph, b: Block): boolean {
+    const count = (v: ParamValue | undefined, def: number): number => {
+      const n = Math.round(Number(v));
+      return isFinite(n) ? Math.max(1, Math.min(16, n)) : def;
+    };
+    const ni = count(b.params.ins, 4);
+    const no = count(b.params.outs, 4);
+    const want: Array<{ id: string; name: string; dir: PortDir; edge: 'left' | 'right' }> = [];
+    for (let i = 0; i < ni; i++) want.push({ id: 'in' + (i + 1), name: String(i + 1), dir: 'in', edge: 'left' });
+    for (let o = 0; o < no; o++) want.push({ id: 'out' + (o + 1), name: String(o + 1), dir: 'out', edge: 'right' });
+    const wanted = new Set(want.map((w) => w.id));
+    let changed = false;
+
+    // ---- drop what the counts no longer cover, wires included ----
+    const dead = new Set(b.ports.filter((p) => !wanted.has(p.id)).map((p) => p.id));
+    if (dead.size) {
+      b.ports = b.ports.filter((p) => !dead.has(p.id));
+      const doomed = new Set<string>();
+      const collect = (id: string): void => {
+        if (doomed.has(id)) return;
+        doomed.add(id);
+        for (const w of g.wires) if (w.parentId === id) collect(w.id);
+      };
+      for (const w of g.wires)
+        for (const end of [w.a, w.b])
+          if (end.port && end.port.blockId === b.id && dead.has(end.port.portId)) collect(w.id);
+      if (doomed.size) g.wires = g.wires.filter((w) => !doomed.has(w.id));
+      changed = true;
+    }
+
+    // ---- add what is missing, in port order ----
+    const byId = new Map(b.ports.map((p) => [p.id, p]));
+    const ports: Port[] = [];
+    let nIn = 0;
+    let nOut = 0;
+    // Re-spacing only when the count actually moved. Port positions are
+    // user-editable (drag a port along its edge), and a sync that re-derived
+    // `t` unconditionally would drag them back on every scene load and undo —
+    // and raise a 'structure' change, recompiling the graph, each time.
+    const respace = dead.size > 0 || want.some((w) => !byId.has(w.id));
+    for (const w of want) {
+      const slot = w.dir === 'in' ? nIn++ : nOut++;
+      const total = w.dir === 'in' ? ni : no;
+      const t = (slot + 1) / (total + 1);
+      const existing = byId.get(w.id);
+      if (existing) {
+        if (respace) existing.t = t;
+        ports.push(existing);
+      } else {
+        ports.push({ id: w.id, name: w.name, kind: 'audio', dir: w.dir, edge: w.edge, t, showLabel: true });
+        changed = true;
+      }
+    }
+    // Anything else on the block (a `cv:` port added by the user) stays put.
+    for (const p of b.ports) if (!wanted.has(p.id)) ports.push(p);
+    b.ports = ports;
+    return changed;
+  }
+
+  /**
+   * Give a Channel Split / Channel Merge block exactly `count` narrow ports on
+   * its fanned side, and size its single wide port to match.
+   *
+   * Split fans OUT (`out1..outN`, a stereo input `in`); Merge fans IN
+   * (`in1..inN`, a stereo... no — a *wide* output `out`). The wide port carries
+   * `count` channels, or `2·count` in Pairs mode — that is the width the net
+   * inference reads, so the wire's channel chip shows what the block is packing.
+   *
+   * Ports that survive keep their id (wires with them), same as the Matrix; a
+   * port the count no longer covers takes its wires with it. Returns true when
+   * anything moved, so the caller raises 'structure' only when it must (this
+   * runs on every scene load and undo).
+   */
+  private syncPackPorts(g: Graph, b: Block): boolean {
+    const isSplit = b.type === 'chan-split';
+    const count = ((): number => {
+      const n = Math.round(Number(b.params.count));
+      return isFinite(n) ? Math.max(1, Math.min(16, n)) : 8;
+    })();
+    const pairs = String(b.params.mode ?? 'Channels') === 'Pairs';
+    const wide = Math.max(2, Math.min(32, pairs ? count * 2 : count));
+    const varDir: PortDir = isSplit ? 'out' : 'in';
+    const varEdge: 'left' | 'right' = isSplit ? 'right' : 'left';
+    const varPrefix = isSplit ? 'out' : 'in';
+    const fixedId = isSplit ? 'in' : 'out';
+    let changed = false;
+
+    // ---- the single wide port follows Count (width is topology) ----
+    for (const p of b.ports)
+      if (p.id === fixedId && p.chans !== wide) {
+        p.chans = wide;
+        changed = true;
+      }
+
+    // ---- the fanned narrow ports: exactly `count` of them ----
+    const want: Array<{ id: string; name: string }> = [];
+    for (let i = 0; i < count; i++) want.push({ id: varPrefix + (i + 1), name: String(i + 1) });
+    const wanted = new Set(want.map((w) => w.id));
+
+    // drop what the count no longer covers, wires included (mirrors the Matrix).
+    const dead = new Set(b.ports.filter((p) => p.dir === varDir && p.id !== fixedId && !wanted.has(p.id)).map((p) => p.id));
+    if (dead.size) {
+      b.ports = b.ports.filter((p) => !dead.has(p.id));
+      const doomed = new Set<string>();
+      const collect = (id: string): void => {
+        if (doomed.has(id)) return;
+        doomed.add(id);
+        for (const w of g.wires) if (w.parentId === id) collect(w.id);
+      };
+      for (const w of g.wires)
+        for (const end of [w.a, w.b])
+          if (end.port && end.port.blockId === b.id && dead.has(end.port.portId)) collect(w.id);
+      if (doomed.size) g.wires = g.wires.filter((w) => !doomed.has(w.id));
+      changed = true;
+    }
+
+    // add what is missing, re-spacing only when the count actually moved (port
+    // positions are user-editable — see syncMatrixPorts).
+    const byId = new Map(b.ports.map((p) => [p.id, p]));
+    const respace = dead.size > 0 || want.some((w) => !byId.has(w.id));
+    const ports: Port[] = [];
+    let slot = 0;
+    // Rebuild the fanned ports in count order first…
+    for (const w of want) {
+      const t = (slot + 1) / (count + 1);
+      slot++;
+      const existing = byId.get(w.id);
+      if (existing) {
+        if (respace) existing.t = t;
+        ports.push(existing);
+      } else {
+        ports.push({ id: w.id, name: w.name, kind: 'audio', dir: varDir, edge: varEdge, t, showLabel: true });
+        changed = true;
+      }
+    }
+    // …then the fixed wide port and anything else (cv: ports) keep their spots.
+    for (const p of b.ports) if (!wanted.has(p.id)) ports.push(p);
+    b.ports = ports;
     return changed;
   }
 

@@ -124,6 +124,30 @@ export interface BlockStyle {
   bgImage?: string;
   /** How the skin fills the block (default 'cover'). */
   bgFit?: 'stretch' | 'contain' | 'cover';
+  /**
+   * Where this block sits in the paint order relative to wires. Default
+   * 'front' — blocks are drawn after wires, so a cable disappears behind the
+   * block it plugs into.
+   *
+   * 'behind' paints the block *before* the wires, so cables run across its
+   * face. That is what a patchbay looks like, and it is the only way to read a
+   * dense patch whose big panels swallow every wire that crosses them.
+   *
+   * **Hit order follows paint order**: over a 'behind' block a wire takes the
+   * press, the hover and the context menu, because the cable is the thing drawn
+   * on top and therefore the thing being pointed at. Geometry and wire routing
+   * are untouched, and *ports* are still tested first — they are ~5 px targets
+   * and you must be able to pull a new wire out of a panel that already has
+   * cables crossing it. See `Editor.wireBeatsBlock`.
+   */
+  wireLayer?: 'front' | 'behind';
+  /**
+   * Thickness (px) for wires that touch this block, overriding `theme.wireWidth`
+   * — level thickening and the multichannel extra still apply on top. Lets one
+   * block's connections read as heavier (a speaker bus) or as hairlines (a
+   * thicket of CV) without restyling every wire in the scene.
+   */
+  wireWidth?: number;
 }
 
 /**
@@ -149,7 +173,16 @@ export interface FaceItem {
   fit?: 'stretch' | 'contain' | 'cover';
 }
 
-/** A free text label on a block face, referenced by a 'text:<id>' face item. */
+/**
+ * A free text label on a block face, referenced by a 'text:<id>' face item.
+ *
+ * With `bg` / `border` / `glyph` it is also the face's **silkscreen**: the
+ * printed graphics of a hardware panel — reverse-video jack labels, the boxes
+ * that group a section, the little waveform next to a WAVE knob. Those are
+ * deliberately not a second item kind: everything that places, hides, clamps,
+ * lists and persists a text item then works on panel artwork for free
+ * (docs/07-ui.md, "Panel silkscreen").
+ */
 export interface FaceText {
   text: string;
   /** Font px (default 12). */
@@ -157,6 +190,26 @@ export interface FaceText {
   /** Falls back to the block's text color. */
   color?: string;
   align?: 'left' | 'center' | 'right';
+  /** Fill painted behind the item — a reverse-video label ("this is an output"). */
+  bg?: string;
+  /** Outline painted around the item; with an empty `text`, a section box. */
+  border?: string;
+  /** Corner radius for `bg`/`border` (default 3). */
+  radius?: number;
+  /** Stroke width for `border` and `glyph` (default 1). */
+  lineWidth?: number;
+  /** Quarter turn about the item's centre, degrees: -90 or 90. Vertical tabs. */
+  rotate?: number;
+  /** Vector panel symbol drawn instead of `text` (see `src/ui/glyphs.ts`).
+   *  `text` is kept as the item's name in the Properties face-item list. */
+  glyph?: string;
+  /**
+   * Printed artwork, not a label the user maintains: ignored by hit-testing in
+   * patch mode, so a section box the size of half the panel does not swallow
+   * the clicks meant for the block (and double-click still opens a custom
+   * block instead of the edit-text prompt). Block-edit mode still grabs it.
+   */
+  decor?: boolean;
 }
 
 export type ParamValue = number | string | boolean;
@@ -184,6 +237,14 @@ export interface ControlStyle {
   /** Captions for the on/off states (toggle 'rocker', pressed buttons). */
   onLabel?: string;
   offLabel?: string;
+  /**
+   * Hide the spec's panel mark (`ParamSpec.mark`) for this one widget.
+   *
+   * For a face that already prints its own silkscreen: the Mavis puts the saw
+   * symbol under WAVE at an exact panel coordinate, and the automatic mark
+   * would print a second one just above it.
+   */
+  showMark?: boolean;
 }
 
 /**
@@ -510,6 +571,47 @@ export interface Speaker {
    * patching with it instead of silently pointing the wrong speaker.
    */
   out?: number;
+  /**
+   * Measured response and the correction derived from it. Absent = this speaker
+   * has never been calibrated, which is also what the Rig tab draws (a
+   * calibrated speaker is green). See `SpeakerCal`.
+   */
+  cal?: SpeakerCal;
+}
+
+/**
+ * One speaker's calibration — the outcome of a sweep measurement.
+ *
+ * **Curves, not filter taps.** `resp` and `corr` are magnitudes in dB at the
+ * fixed 1/12-octave grid in `core/calibrate.ts` (`calFreqs()`), ~121 numbers
+ * each; the engine derives the actual minimum-phase FIR from `corr` when the
+ * rig reaches it. Storing the taps instead would be ~4× the size, would have to
+ * be rebuilt at a different sample rate anyway, and would put a number nobody
+ * can read into the scene file. This way a saved rig preset costs ~1.5 kB per
+ * speaker and survives a device change.
+ *
+ * **`at` is what makes a calibration expire.** A measurement describes one
+ * speaker in one place feeding one amplifier channel; move it, repatch it or
+ * turn it into a sub and the measurement is about something that no longer
+ * exists. `calStale()` compares this snapshot against the live speaker, and
+ * `GraphDoc.updateSpeaker` drops the whole `cal` when it says so — which is why
+ * the speaker goes back to blue in the Rig tab the moment you drag it.
+ */
+export interface SpeakerCal {
+  /** Measured magnitude, dB relative to this speaker's own in-band mean. */
+  resp: number[];
+  /** Correction the filter applies, dB — capped and normalised to ≤ 0 dB. */
+  corr: number[];
+  /** Broadband level trim, linear and always ≤ 1 (correction never boosts). */
+  gain: number;
+  /** Alignment delay for this speaker, seconds. 0 on the furthest speaker. */
+  delay: number;
+  /** Geometry + patching this measurement describes. See the note above. */
+  at: { az: number; el: number; dist: number; out: number; lfe: boolean };
+  /** When it was measured (epoch ms) — the Rig tab shows the age. */
+  when: number;
+  /** Microphone calibration file used, for display. '' / absent = flat mic. */
+  mic?: string;
 }
 
 /**

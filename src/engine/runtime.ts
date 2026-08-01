@@ -36,6 +36,11 @@ class Runtime {
       for (const fn of this.assetSubs) fn(nodeId, assetId);
     };
     for (const e of [this.webaudio, this.native]) e.onAsset = relay;
+    // A respawned engine has no graph — only the renderer has one. Without this
+    // an auto-restart (electron/main.cjs, after a crash) comes back silent.
+    this.native.onEngineRestart = () => {
+      if (this.audioOn && this.engine === this.native) this.resetGraph();
+    };
     initMidi();
   }
 
@@ -129,6 +134,9 @@ class Runtime {
    */
   assetChanged(id: string): void {
     this.native.refreshAsset(id);
+    // Both engines, unconditionally: which one is live can change under an
+    // edit, and telling a stopped engine is free.
+    this.webaudio.assetChanged(id);
   }
 
   private learnWebUnsub: (() => void) | null = null;

@@ -25,6 +25,8 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -117,8 +119,44 @@ class UiThread {
 
   /** Tear a plugin down ON THE UI THREAD and block until done. Same toolkit
    *  rule as createInstance: Qt-backed plugins crash if their objects are
-   *  released from a different thread than the one that made them. */
+   *  released from a different thread than the one that made them.
+   *
+   *  **Never call this from the JS thread** — it is the audio pump, and the
+   *  wait is up to 5 s. Use `destroyInstanceAsync`. */
   void destroyInstance(VstInstance* inst);
+
+  /**
+   * Hand an instance to the UI thread to tear down and delete, and return
+   * immediately.
+   *
+   * `destroyInstance` blocked the caller for as long as the plugin took to
+   * release (bounded at 5 s). That call sat on the JS thread — the audio pump —
+   * so deleting a plugin block, or merely re-picking a plugin in the Properties
+   * panel (which destroys the old instance), froze audio for as long as the
+   * plugin's shutdown took. Ownership moves with the command, so nothing on the
+   * JS side can reach the instance afterwards.
+   */
+  void destroyInstanceAsync(std::unique_ptr<VstInstance> inst);
+
+  /**
+   * Run `fn` on the UI thread; returns an event that is signalled when it has.
+   *
+   * **The post itself is cheap and non-blocking** (a mutex + deque push), so it
+   * is safe to issue from the JS thread; the *wait* must happen on a uv worker.
+   * That split is the whole point: the plugin's controller belongs to this
+   * thread (threading rule 1, docs/13), and the calls that need it — parameter
+   * enumeration, `getState`, `setState` — are exactly the slow ones. Running
+   * them inline on the JS thread is what froze audio whenever a parameter
+   * changed.
+   *
+   * Posting from the JS thread also keeps UI-thread work in JS call order, so a
+   * destroy issued after a read can never overtake it.
+   *
+   * The caller owns the returned handle: pass it to `waitCall`.
+   */
+  HANDLE postCall(std::function<void()> fn);
+  /** Wait for (and close) a `postCall` event. Call from a uv worker only. */
+  static bool waitCall(HANDLE done, uint32_t ms);
 
   /**
    * The LivePatch app window (from Electron main, cross-process). New editor
@@ -154,9 +192,13 @@ class UiThread {
   std::atomic<uintptr_t> owner_{0};
 
   struct Cmd {
-    enum What { Open, Close, Input, Fps, Embed, CreateInst, DestroyInst } what;
+    enum What { Open, Close, Input, Fps, Embed, CreateInst, DestroyInst, Call } what;
     CreateJob* job = nullptr;
     HANDLE doneEvent = nullptr;
+    /** `Call`: the work to run here. `DestroyInst`: set when the command owns
+     *  the instance (the async path) — destroying it is the last thing done. */
+    std::function<void()> fn;
+    std::unique_ptr<VstInstance> owned;
     VstInstance* inst;
     Steinberg::Vst::IEditController* controller;
     bool capture;

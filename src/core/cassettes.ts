@@ -397,8 +397,35 @@ export async function getCassetteBytes(id: string): Promise<ArrayBuffer | null> 
   return rec?.data ?? null;
 }
 
+/**
+ * **Live takes** — audio that exists only in a running unit, never on disk.
+ *
+ * A tape recorder publishes its in-progress take here so anything wired to its
+ * `tape` out can play what is being recorded *right now* (docs/09, "The live
+ * take"). They shadow the store: `getCassetteBuffer` answers from this map
+ * first, and the ids (`live_<node>`) are never persisted, never listed and
+ * never written, so nothing else in the app can collide with one.
+ */
+const liveTakes = new Map<string, AudioBuffer>();
+
+/** Publish (or, with null, withdraw) a live take under `id`. */
+export function setLiveTake(id: string, buf: AudioBuffer | null): void {
+  if (!id) return;
+  if (buf) liveTakes.set(id, buf);
+  else liveTakes.delete(id);
+  // The peak scans are keyed by id and derived from the previous buffer.
+  invalidateCassette(id);
+}
+
+/** Whether `id` names a live take rather than a stored cassette. */
+export function isLiveTake(id: string): boolean {
+  return liveTakes.has(id);
+}
+
 /** Decode (and cache) a cassette's AudioBuffer. Null when missing/undecodable. */
 export function getCassetteBuffer(id: string): Promise<AudioBuffer | null> {
+  const live = liveTakes.get(id);
+  if (live) return Promise.resolve(live);
   const hit = bufCache.get(id);
   if (hit) return Promise.resolve(hit);
   let p = bufPending.get(id);

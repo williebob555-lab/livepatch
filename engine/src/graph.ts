@@ -84,6 +84,12 @@ export class GraphExec {
 
   constructor(sv: Services) {
     this.sv = sv;
+    // A live asset (a recorder's in-progress take) got longer, or a punch
+    // repaired material under it. Same id, new samples — the exact case
+    // `assetChanged` exists for, so it takes the same route as `assetReady`.
+    this.sv.assets.onLiveChange = (id) => {
+      for (const n of this.nodes.values()) n.kernel.assetChanged?.(id);
+    };
   }
 
   apply(g: CompiledGraph): void {

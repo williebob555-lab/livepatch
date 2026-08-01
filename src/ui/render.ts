@@ -5,8 +5,8 @@
 // ============================================================================
 import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
-import { getDef, paramSpec } from '../core/registry';
-import { Block, ParamValue, Theme, Vec2, Wire } from '../core/types';
+import { ParamSpec, getDef, paramSpec } from '../core/registry';
+import { Block, FaceItem, ParamValue, Theme, Vec2, Wire } from '../core/types';
 import { parsePoints, samplePath } from '../core/trajectory';
 import { runtime } from '../engine/runtime';
 import {
@@ -35,9 +35,14 @@ import {
   eqGainToY,
   eqPlotRect,
   eqResponseDbBus,
+  matrixCellRect,
+  matrixFaceRect,
+  matrixGeom,
   speakerBarSlots,
 } from './widgets';
-import { ResolvedRef, paintFaceWidget } from './facepaint';
+import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
+import { Rect, ResolvedRef, paintFaceWidget } from './facepaint';
+import { drawPanelGlyph } from './glyphs';
 import { uiScale } from './uiscale';
 import { isSpeakerSilenced } from '../core/rig';
 import { fmtDuration, getCassette } from '../core/cassettes';
@@ -168,6 +173,154 @@ const mix = (a: [number, number, number], b: [number, number, number], t: number
   )})`;
 
 /** Level → color + extra thickness, following the theme's dB thresholds. */
+// ---------------------------------------------------------------------------
+// Parameter-relationship ties (`ParamSpec.affects`) — the routing.
+//
+// **These are printed panel artwork, not wires**, and the difference is the
+// whole look. The first attempt drew a quadratic through a control point, which
+// on anything but two adjacent knobs bent back over itself and read as a
+// scribble. Real panels print relationships as straight runs meeting at right
+// angles, in the gutters between controls — so that is what this builds: a
+// polyline of horizontal and vertical segments only, with the corners softened
+// just enough not to look like a staircase.
+// ---------------------------------------------------------------------------
+
+interface Pt {
+  x: number;
+  y: number;
+}
+
+/** Do two rectangles overlap (with a little slack)? */
+const hits = (a: Rect, c: Rect, pad = 1): boolean =>
+  a.x < c.x + c.w + pad && c.x < a.x + a.w + pad && a.y < c.y + c.h + pad && c.y < a.y + a.h + pad;
+
+/** Is the straight corridor between two boxes free of every other widget? */
+function laneClear(corridor: Rect, ends: Rect[], others: Rect[]): boolean {
+  for (const r of others) {
+    if (ends.includes(r)) continue;
+    if (hits(corridor, r)) return false;
+  }
+  return true;
+}
+
+/**
+ * An orthogonal route from the driving control to the driven one.
+ *
+ * Three cases, in the order a draughtsman would pick them:
+ *
+ *  1. **Side by side with nothing between** → one straight segment along the
+ *     band the two boxes share. This is the common case (a Sustain beside its
+ *     Decay) and it wants no cleverness at all.
+ *  2. **Stacked with nothing between** → the same, vertically.
+ *  3. **Anything else** → a three-segment elbow that leaves the source, runs
+ *     along a clear lane past the widgets in the way, and turns into the
+ *     target. The lane goes below both boxes, or above them when there is no
+ *     room below; `lane` staggers it so several ties off one control read as a
+ *     small bus instead of one thick line.
+ *
+ * Returns null when the two boxes are on top of each other and there is nothing
+ * sensible to draw.
+ */
+function tieRoute(src: Rect, dst: Rect, others: Rect[], inner: { t: number; b: number; l: number; r: number }, lane: number): Pt[] | null {
+  const GAP = 2; // clear of the widget's own edge at both ends
+  const ends = [src, dst];
+  const sMid = { x: src.x + src.w / 2, y: src.y + src.h / 2 };
+  const dMid = { x: dst.x + dst.w / 2, y: dst.y + dst.h / 2 };
+
+  // 1 — same row.
+  const rowLo = Math.max(src.y, dst.y);
+  const rowHi = Math.min(src.y + src.h, dst.y + dst.h);
+  if (rowHi - rowLo > 6) {
+    const right = dMid.x > sMid.x;
+    const x0 = right ? src.x + src.w : src.x;
+    const x1 = right ? dst.x : dst.x + dst.w;
+    const y = (rowLo + rowHi) / 2;
+    const corridor: Rect = { x: Math.min(x0, x1), y: y - 1, w: Math.abs(x1 - x0), h: 2 };
+    if (Math.abs(x1 - x0) > 4 && laneClear(corridor, ends, others))
+      return [
+        { x: x0 + (right ? GAP : -GAP), y },
+        { x: x1 - (right ? GAP : -GAP), y },
+      ];
+  }
+
+  // 2 — same column.
+  const colLo = Math.max(src.x, dst.x);
+  const colHi = Math.min(src.x + src.w, dst.x + dst.w);
+  if (colHi - colLo > 6) {
+    const down = dMid.y > sMid.y;
+    const y0 = down ? src.y + src.h : src.y;
+    const y1 = down ? dst.y : dst.y + dst.h;
+    const x = (colLo + colHi) / 2;
+    const corridor: Rect = { x: x - 1, y: Math.min(y0, y1), w: 2, h: Math.abs(y1 - y0) };
+    if (Math.abs(y1 - y0) > 4 && laneClear(corridor, ends, others))
+      return [
+        { x, y: y0 + (down ? GAP : -GAP) },
+        { x, y: y1 - (down ? GAP : -GAP) },
+      ];
+  }
+
+  const stagger = lane * 3.5;
+  const sx = Math.min(Math.max(sMid.x, inner.l + 3), inner.r - 3);
+  const dx = Math.min(Math.max(dMid.x, inner.l + 3), inner.r - 3);
+  const clamp = (v: number, lo: number, hi: number): number => (hi < lo ? (lo + hi) / 2 : Math.min(Math.max(v, lo), hi));
+
+  // 3 — different rows: the lane belongs in the GUTTER BETWEEN THEM, which is
+  // the one strip guaranteed to be free of widgets and inside the block.
+  // Routing "outside both boxes" instead sent a Reverb's Mix→Tone tie up over
+  // the title and along the whole width of the panel to come back down — the
+  // path was orthogonal and still looked like a detour, because it was one.
+  const srcAbove = src.y + src.h <= dst.y;
+  const dstAbove = dst.y + dst.h <= src.y;
+  if (srcAbove || dstAbove) {
+    const gapTop = srcAbove ? src.y + src.h : dst.y + dst.h;
+    const gapBot = srcAbove ? dst.y : src.y;
+    const laneY = clamp((gapTop + gapBot) / 2 + stagger, gapTop + 1, gapBot - 1);
+    return [
+      { x: sx, y: srcAbove ? src.y + src.h + GAP : src.y - GAP },
+      { x: sx, y: laneY },
+      { x: dx, y: laneY },
+      { x: dx, y: dstAbove ? dst.y + dst.h + GAP : dst.y - GAP },
+    ];
+  }
+
+  // 4 — same row, but something sits between them: step out of the row and run
+  // back along it. Below by default (a panel reads top-down), above only when
+  // the block has no room left underneath.
+  const below = Math.max(src.y + src.h, dst.y + dst.h) + 4 + stagger;
+  const above = Math.min(src.y, dst.y) - 4 - stagger;
+  const useBelow = below <= inner.b - 2 || above < inner.t + 2;
+  const laneY = useBelow ? Math.min(below, inner.b - 2) : Math.max(above, inner.t + 2);
+  const sEdge = useBelow ? src.y + src.h : src.y;
+  const dEdge = useBelow ? dst.y + dst.h : dst.y;
+  if (Math.abs(sx - dx) < 2 && Math.abs(sEdge - dEdge) < 2) return null;
+  return [
+    { x: sx, y: sEdge + (useBelow ? GAP : -GAP) },
+    { x: sx, y: laneY },
+    { x: dx, y: laneY },
+    { x: dx, y: dEdge + (useBelow ? GAP : -GAP) },
+  ];
+}
+
+/** Stroke a polyline with its corners rounded — right angles, not a scribble. */
+function strokeElbow(g: CanvasRenderingContext2D, pts: Pt[], radius: number): void {
+  g.beginPath();
+  g.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const n = pts[i + 1];
+    // Never round by more than half of either adjoining segment, or the corner
+    // overshoots and the line visibly doubles back on itself.
+    const r = Math.min(
+      radius,
+      Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y) / 2,
+      Math.hypot(n.x - p.x, n.y - p.y) / 2,
+    );
+    g.arcTo(p.x, p.y, n.x, n.y, Math.max(0, r));
+  }
+  g.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  g.stroke();
+}
+
 export function levelStyle(theme: Theme, rms: number, peak: number): { color: string; extra: number } {
   const db = rms > 1e-6 ? 20 * Math.log10(rms) : -120;
   const q = theme.levelQuietDb;
@@ -259,13 +412,27 @@ export class Renderer {
 
     const netByWire = this.netStyles();
 
-    for (const w of graph.wires) this.drawWire(w, theme, netByWire, overlay);
+    // Per-block wire thickness (`style.wireWidth`). Built only when some block
+    // actually declares one, so the overwhelmingly common case allocates
+    // nothing in a function that runs every frame while audio is on
+    // (docs/10-performance.md).
+    let wireW: Map<string, number> | null = null;
+    for (const b of graph.blocks)
+      if (b.style.wireWidth != null) (wireW ??= new Map<string, number>()).set(b.id, b.style.wireWidth);
+
+    // ---- blocks sent behind the wires ----
+    // Paint order only: geometry and hit-testing are untouched, so a block back
+    // here is still grabbed and wired exactly as before — it just has cables
+    // running across its face instead of vanishing under it.
+    for (const b of graph.blocks) if (b.style.wireLayer === 'behind') this.drawBlock(b, theme, overlay);
+
+    for (const w of graph.wires) this.drawWire(w, theme, netByWire, overlay, wireW);
     for (const w of graph.wires) this.drawWireEnds(w, theme, netByWire);
     // Chips last, so a crossing wire never draws over a channel count.
     for (const w of graph.wires) this.drawWireChip(w, theme, netByWire);
 
     // ---- blocks ----
-    for (const b of graph.blocks) this.drawBlock(b, theme, overlay);
+    for (const b of graph.blocks) if (b.style.wireLayer !== 'behind') this.drawBlock(b, theme, overlay);
 
     // ---- overlays ----
     if (overlay.hoverWire && overlay.mode === 'patch' && !overlay.draggingWireEnd) {
@@ -630,11 +797,33 @@ export class Renderer {
     g.stroke();
   }
 
+  /**
+   * Base thickness for this wire: the theme's, unless a block it plugs into
+   * overrides it (`BlockStyle.wireWidth`).
+   *
+   * The widest override on the wire wins, so deliberately-heavy cables stay
+   * heavy along their whole length rather than changing gauge halfway. A
+   * *branch* has only one real endpoint (its root end rides the trunk), which
+   * is exactly the end that should decide — no special case needed.
+   */
+  private wireWidthFor(w: Wire, theme: Theme, wireW: Map<string, number> | null): number {
+    if (!wireW) return theme.wireWidth;
+    let out: number | undefined;
+    for (const end of [w.a, w.b]) {
+      const id = end.port?.blockId;
+      if (!id) continue;
+      const v = wireW.get(id);
+      if (v != null && (out == null || v > out)) out = v;
+    }
+    return out ?? theme.wireWidth;
+  }
+
   private drawWire(
     w: Wire,
     theme: Theme,
     netByWire: Map<string, NetInfo>,
     overlay: Overlay,
+    wireW: Map<string, number> | null = null,
   ): void {
     const path = this.paths.get(w.id);
     if (!path || path.pts.length < 2) return;
@@ -645,7 +834,7 @@ export class Renderer {
     // a glance and at any zoom, without competing with the bundle ribbon
     // (which already means "several wires travelling together").
     const wide = !!info && info.kind === 'audio' && info.width > 2;
-    const width = theme.wireWidth + extra + (wide ? theme.wireWideExtra : 0);
+    const width = this.wireWidthFor(w, theme, wireW) + extra + (wide ? theme.wireWideExtra : 0);
     if (w.selected) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 4, theme.selectionColor + '88');
     if (overlay.snapWire === w.id) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 6, theme.selectionColor + '55');
     // Solid border first, signal color on top. A wire on a cycle swaps the
@@ -870,6 +1059,113 @@ export class Renderer {
     return floor + (1 - floor) * t;
   }
 
+  /**
+   * Does this block type declare any `ParamSpec.affects`? Memoized per type,
+   * because the answer is "no" for nearly every block and `drawBlock` runs for
+   * every block on every frame while audio is on — a `params.some(...)` scan
+   * there is exactly the kind of per-frame work docs/10 is about.
+   */
+  private tieTypes = new Map<string, boolean>();
+  private hasTies(type: string): boolean {
+    let v = this.tieTypes.get(type);
+    if (v === undefined) {
+      try {
+        v = getDef(type).params.some((p) => !!p.affects?.length);
+      } catch {
+        v = false;
+      }
+      this.tieTypes.set(type, v);
+    }
+    return v;
+  }
+
+  /**
+   * How far a param is from its default, 0..1 — "is this control currently
+   * doing anything?".
+   *
+   * This is what lights a tie. A sync switch that is off, or a mod amount at
+   * zero, is not affecting anything and must not claim to be; the whole value
+   * of the indicator is that it distinguishes *can affect* from *is affecting*.
+   */
+  private paramActivity(v: ParamValue, spec: ParamSpec): number {
+    if (spec.type === 'bool') return (v === true || v === 1) !== (spec.def === true || spec.def === 1) ? 1 : 0;
+    if (spec.type === 'enum' || spec.type === 'string') return v === spec.def ? 0 : 1;
+    const n = Number(v);
+    const d = Number(spec.def);
+    if (!Number.isFinite(n) || !Number.isFinite(d)) return 0;
+    const span = Math.abs((spec.max ?? 1) - (spec.min ?? 0)) || 1;
+    return Math.min(1, Math.abs(n - d) / span);
+  }
+
+  /**
+   * Draw the "this knob changes what that knob means" ties (`ParamSpec.affects`).
+   *
+   * A front panel groups related controls by *printing* the relationship —
+   * a bracket, a bus line, an arrow. A block face had no way to say it at all,
+   * so "why does turning Time do nothing" (because Sync is on) had no answer
+   * anywhere on screen. The tie is dim while the source sits at its default and
+   * brightens as it moves away from it, so the face reports what is actually
+   * happening rather than what could.
+   *
+   * Only `param:` refs: a mirrored `link:` would need BOTH ends mirrored onto
+   * the same face, and a tie with one end missing is worse than none.
+   */
+  private drawParamTies(b: Block, theme: Theme, items: FaceItem[], o: { x: number; y: number }): void {
+    if (!this.hasTies(b.type)) return;
+    // Below this the whole face is a smudge and the ties are just noise.
+    if (this.view.scale < 0.5) return;
+    const g = this.g;
+    const boxOf = (id: string): FaceItem | undefined => items.find((i) => i.ref === 'param:' + id);
+    const rectOf = (i: FaceItem): Rect => ({ x: o.x + i.x, y: o.y + i.y, w: i.w, h: i.h });
+    const accent = rgb(theme.portControlColor);
+    const fill = rgb(theme.blockFill);
+    const inner = { t: o.y, b: b.pos.y + b.size.h, l: b.pos.x, r: b.pos.x + b.size.w };
+    // Boxes a lane must not be drawn through — every face item, not only the
+    // two ends, because the point of routing is to miss the ones in between.
+    const others = items.filter((i) => (i.alpha ?? 1) > 0.01).map(rectOf);
+
+    for (const it of items) {
+      if (!it.ref.startsWith('param:')) continue;
+      const spec = paramSpec(b, it.ref.slice(6));
+      if (!spec?.affects?.length) continue;
+      if ((it.alpha ?? 1) <= 0.01) continue;
+      const heat = this.paramActivity(b.params[spec.id], spec);
+      const src = rectOf(it);
+      let lane = 0;
+      for (const targetId of spec.affects) {
+        const dstItem = boxOf(targetId);
+        if (!dstItem || dstItem === it || (dstItem.alpha ?? 1) <= 0.01) continue;
+        const dst = rectOf(dstItem);
+        const pts = tieRoute(src, dst, others, inner, lane++);
+        if (!pts) continue;
+        g.strokeStyle = mix(fill, accent, 0.3 + 0.7 * heat);
+        g.lineWidth = (1 + heat * 0.6) / Math.max(0.6, this.view.scale);
+        g.lineJoin = 'round';
+        g.lineCap = 'butt';
+        strokeElbow(g, pts, 3);
+        // A filled pip at the driving end and a head at the driven one: the
+        // relationship has a direction, and a bare line between two knobs does
+        // not say which of them is in charge. Same vocabulary as a schematic.
+        const solid = mix(fill, accent, 0.4 + 0.6 * heat);
+        g.fillStyle = solid;
+        g.beginPath();
+        g.arc(pts[0].x, pts[0].y, 1.7, 0, Math.PI * 2);
+        g.fill();
+        const tip = pts[pts.length - 1];
+        const prev = pts[pts.length - 2];
+        const ang = Math.atan2(tip.y - prev.y, tip.x - prev.x);
+        const head = 3.6 + heat * 1.4;
+        g.beginPath();
+        g.moveTo(tip.x, tip.y);
+        g.lineTo(tip.x - Math.cos(ang - 0.44) * head, tip.y - Math.sin(ang - 0.44) * head);
+        g.lineTo(tip.x - Math.cos(ang + 0.44) * head, tip.y - Math.sin(ang + 0.44) * head);
+        g.closePath();
+        g.fill();
+      }
+    }
+    g.lineJoin = 'miter';
+  }
+
   private drawBlock(b: Block, theme: Theme, overlay: Overlay): void {
     const g = this.g;
     const def = getDef(b.type);
@@ -950,16 +1246,48 @@ export class Renderer {
       if (it.ref.startsWith('text:')) {
         const tx = b.texts?.[it.ref.slice(5)];
         if (!tx) continue;
+        // Silkscreen: a rotated item turns about its own centre, so everything
+        // below can keep drawing in the item's own (unrotated) box.
+        const spun = tx.rotate === 90 || tx.rotate === -90;
+        if (spun) {
+          g.save();
+          g.translate(rx + it.w / 2, ry + it.h / 2);
+          g.rotate((tx.rotate! * Math.PI) / 180);
+          g.translate(-(rx + it.h / 2), -(ry + it.w / 2));
+        }
+        // A quarter turn swaps the box's width and height about that centre.
+        const bw = spun ? it.h : it.w;
+        const bh = spun ? it.w : it.h;
+        if (tx.bg || tx.border) {
+          g.beginPath();
+          (g as any).roundRect(rx + 0.5, ry + 0.5, bw - 1, bh - 1, tx.radius ?? 3);
+          if (tx.bg) {
+            g.fillStyle = tx.bg;
+            g.fill();
+          }
+          if (tx.border) {
+            g.strokeStyle = tx.border;
+            g.lineWidth = tx.lineWidth ?? 1;
+            g.stroke();
+          }
+        }
+        if (tx.glyph) {
+          drawPanelGlyph(g, tx.glyph, { x: rx, y: ry, w: bw, h: bh }, tx.color || textColor, tx.lineWidth ?? 1);
+          if (spun) g.restore();
+          continue;
+        }
         const size = tx.size ?? 12;
         g.fillStyle = tx.color || textColor;
         setFont(g, uiFont(size));
         g.textBaseline = 'middle';
         g.textAlign = tx.align ?? 'left';
-        const ax = tx.align === 'center' ? rx + it.w / 2 : tx.align === 'right' ? rx + it.w : rx;
+        const pad = tx.bg || tx.border ? 4 : 0;
+        const ax = tx.align === 'center' ? rx + bw / 2 : tx.align === 'right' ? rx + bw - pad : rx + pad;
         const lines = tx.text.split('\n');
         const lh = size * 1.25;
-        const y0 = ry + it.h / 2 - ((lines.length - 1) * lh) / 2;
+        const y0 = ry + bh / 2 - ((lines.length - 1) * lh) / 2;
         lines.forEach((ln, i) => g.fillText(ln, ax, y0 + i * lh));
+        if (spun) g.restore();
         continue;
       }
       if (it.ref === 'title') {
@@ -995,6 +1323,11 @@ export class Renderer {
       }
     }
     g.globalAlpha = 1;
+    // Ties between controls that affect one another, on top of the widgets but
+    // under the badges and ports. After `globalAlpha` is back to 1: these are
+    // drawn with their own rgba, and inheriting an item's fade would make a tie
+    // vanish because one of its two ends happens to be dimmed.
+    if (focus > 0.9) this.drawParamTies(b, theme, items, o);
 
     // ---- badges ----
     // Set the font inside the branches: most blocks carry no badge at all, and
@@ -1442,6 +1775,47 @@ export class Renderer {
     }
   }
 
+  /**
+   * Matrix router face — the crosspoint grid.
+   *
+   * Inputs run left to right, outputs top to bottom, which is the same
+   * orientation as the block's own ports (inputs down the left edge, outputs
+   * down the right), so the picture and the wires agree. Brightness is the
+   * crosspoint gain, so a half-open crossing reads as half-open rather than
+   * just "on".
+   *
+   * **Live, not read-only**: a click on a cell opens or closes that crossing
+   * (`editor.ts` `widgetDown`). The geometry comes from `matrixFaceRect` +
+   * `matrixGeom` so the painter and the hit-test cannot drift.
+   */
+  private drawMatrixFace(
+    g: CanvasRenderingContext2D,
+    r: { x: number; y: number; w: number; h: number },
+    params: Record<string, ParamValue>,
+    theme: Theme,
+  ): void {
+    const ins = matrixPorts(params.ins, 4);
+    const outs = matrixPorts(params.outs, 4);
+    const grid = parseMatrix(params.grid, ins, outs);
+    const gm = matrixGeom(matrixFaceRect(r), ins, outs);
+    if (gm.cw < 2) return;
+    const seam = gm.cw > 6 ? 1 : 0;
+    for (let o = 0; o < outs; o++)
+      for (let i = 0; i < ins; i++) {
+        const c = matrixCellRect(gm, i, o);
+        const v = grid[crossIndex(ins, i, o)];
+        if (v > 0.001) {
+          g.fillStyle = theme.wireGoodColor;
+          g.globalAlpha = 0.25 + 0.75 * v;
+        } else {
+          g.fillStyle = theme.gridColor;
+          g.globalAlpha = 1;
+        }
+        g.fillRect(c.x + seam, c.y + seam, c.w - seam * 2, c.h - seam * 2);
+      }
+    g.globalAlpha = 1;
+  }
+
   private drawSpatialScope(
     g: CanvasRenderingContext2D,
     r: { x: number; y: number; w: number; h: number },
@@ -1756,6 +2130,95 @@ export class Renderer {
    * offscreen caches so the Dock's spectrogram scrolls on its own clock
    * instead of stealing frames from the one on the canvas.
    */
+  /**
+   * The LED variants of the Meter: a dimming segment ladder, or one dimming
+   * lamp. Both exist because a bargraph is an *instrument*, and a hardware
+   * panel — the Mavis above all — carries indicators, not instruments.
+   *
+   * **Dimming is done by mixing toward the unlit colour, never with
+   * `globalAlpha`.** `drawBlock` sets `globalAlpha` to the face item's own
+   * opacity before calling into here and only resets it after the whole item
+   * loop, so writing it would silently discard the user's per-item fade for
+   * every item painted afterwards. Mixing also happens to be the truthful
+   * picture: an LED at 20 % is a dim LED on a dark panel, not a translucent one.
+   *
+   * The scale is dB, not linear amplitude. A linear ladder spends three of its
+   * twelve segments on the top 6 dB and the rest on inaudible detail, which is
+   * why every hardware meter ever built is marked in dB.
+   */
+  private drawLedMeter(
+    g: CanvasRenderingContext2D,
+    r: { x: number; y: number; w: number; h: number },
+    theme: Theme,
+    rms: number,
+    peak: number,
+    style: string,
+  ): void {
+    const FLOOR_DB = -48;
+    const norm = (v: number): number => {
+      if (!(v > 1e-6)) return 0;
+      const db = 20 * Math.log10(v);
+      return Math.max(0, Math.min(1, 1 - db / FLOOR_DB));
+    };
+    const level = norm(rms);
+    const pk = norm(peak);
+    // Unlit is the panel, not black: an LED that vanishes when dark reads as a
+    // hole in the block rather than as an indicator that is off.
+    const off = rgb(theme.blockFill);
+    const colAt = (t: number): [number, number, number] =>
+      rgb(t > 0.9 ? theme.wireClipColor : t > 0.72 ? theme.wireHotColor : theme.wireGoodColor);
+
+    if (style === 'lamp') {
+      const cx = r.x + r.w / 2;
+      const cy = r.y + r.h / 2;
+      const rad = Math.max(3, Math.min(r.w, r.h) / 2 - 2);
+      const on = colAt(pk);
+      // Brightness follows the held peak so a transient actually registers;
+      // the RMS sets the size of the glow, which is what makes a loud sustained
+      // signal look different from a click at the same peak.
+      const bright = Math.max(pk, level * 0.85);
+      if (bright > 0.02) {
+        const glow = g.createRadialGradient(cx, cy, rad * 0.2, cx, cy, rad * 1.9);
+        glow.addColorStop(0, mix(off, on, Math.min(1, bright * 0.9)));
+        glow.addColorStop(1, mix(off, on, 0));
+        g.fillStyle = glow;
+        g.beginPath();
+        g.arc(cx, cy, rad * 1.9, 0, Math.PI * 2);
+        g.fill();
+      }
+      g.beginPath();
+      g.arc(cx, cy, rad, 0, Math.PI * 2);
+      g.fillStyle = mix(off, on, 0.1 + 0.9 * bright);
+      g.fill();
+      g.strokeStyle = theme.blockStroke;
+      g.lineWidth = 1;
+      g.stroke();
+      return;
+    }
+
+    // Ladder. Segment count follows the box so a tall meter gets resolution and
+    // a short one stays legible, rather than a fixed count squashing to slivers.
+    const horiz = r.w > r.h * 1.6;
+    const span = (horiz ? r.w : r.h) - 6;
+    const across = (horiz ? r.h : r.w) - 6;
+    const n = Math.max(3, Math.min(24, Math.floor(span / 8)));
+    const gap = 2;
+    const segL = (span - (n - 1) * gap) / n;
+    for (let i = 0; i < n; i++) {
+      const lo = i / n;
+      const hi = (i + 1) / n;
+      // The segment holding the level fades across itself, so the meter moves
+      // smoothly instead of stepping — the "dimming" in dimming LED.
+      const k = Math.max(0, Math.min(1, (level - lo) / (hi - lo)));
+      // The held peak re-lights one segment above the bar, full brightness.
+      const isPeak = pk > lo && pk <= hi && pk > level;
+      const on = colAt(hi);
+      g.fillStyle = mix(off, on, isPeak ? 1 : 0.14 + 0.86 * k);
+      if (horiz) g.fillRect(r.x + 3 + i * (segL + gap), r.y + 3, segL, across);
+      else g.fillRect(r.x + 3, r.y + r.h - 3 - (i + 1) * segL - i * gap, across, segL);
+    }
+  }
+
   drawVisualAt(
     g: CanvasRenderingContext2D,
     _b: Block,
@@ -1771,11 +2234,17 @@ export class Renderer {
   ): void {
     const params = _b.params;
     const cacheKey = surface ? nodeId + '@' + surface : nodeId;
-    g.fillStyle = 'rgba(0,0,0,0.55)';
-    g.fillRect(x, y, w, h);
-    g.strokeStyle = theme.blockStroke;
-    g.lineWidth = 1;
-    g.strokeRect(x, y, w, h);
+    // A 'lamp' meter is a bare LED printed on the panel, not a framed
+    // instrument — the standard dark plate and border would draw a box around a
+    // single dot, which is precisely the look it exists to avoid.
+    const bareLamp = kind === 'meter' && params.meterStyle === 'lamp';
+    if (!bareLamp) {
+      g.fillStyle = 'rgba(0,0,0,0.55)';
+      g.fillRect(x, y, w, h);
+      g.strokeStyle = theme.blockStroke;
+      g.lineWidth = 1;
+      g.strokeRect(x, y, w, h);
+    }
     if (kind === 'eq') {
       // Interactive parametric curve — drawn from params, engine not required.
       this.drawEqCurve(g, _b, { x, y, w, h }, theme, overlay);
@@ -1785,6 +2254,12 @@ export class Renderer {
       // Read-only plan of the trajectory, drawn from the `points` param; the
       // engine is only needed for the live playhead dot (native only).
       this.drawPathFace(g, { x, y, w, h }, params, nodeId, theme);
+      return;
+    }
+    if (kind === 'matrix') {
+      // Parametric like the EQ curve: the patch is in the params, so the face
+      // is right with the engine off.
+      this.drawMatrixFace(g, { x, y, w, h }, params, theme);
       return;
     }
     const feed = runtime.visualFor(nodeId);
@@ -1805,6 +2280,13 @@ export class Renderer {
       return;
     }
     if (!feed) {
+      // An LED meter draws *dark* rather than printing "audio off" in a box the
+      // size of a lamp: an unlit LED is the honest picture of no signal, and it
+      // is what the panel looks like with the power off.
+      if (kind === 'meter' && params.meterStyle !== 'bar' && params.meterStyle !== undefined) {
+        this.drawLedMeter(g, { x, y, w, h }, theme, 0, 0, String(params.meterStyle));
+        return;
+      }
       g.fillStyle = theme.portLabelColor;
       setFont(g, uiFont(10));
       g.textAlign = 'center';
@@ -1822,6 +2304,29 @@ export class Renderer {
       const lh = 11;
       const start = Math.max(0, lines.length - Math.floor((h - 6) / lh));
       lines.slice(start).forEach((ln, i) => g.fillText(ln, x + 5, y + 4 + i * lh));
+      return;
+    }
+    if (kind === 'tempo') {
+      // "<bpm>\n<confidence %>" from the kernel — the estimate and how much it
+      // believes itself, which is the pair you need while setting the block up.
+      // A tempo you can't see the confidence of is a guess with a decimal point.
+      const [bpmTxt = '--', confTxt = '0'] = (feed.text?.() ?? '').split('\n');
+      const c = Math.max(0, Math.min(100, parseFloat(confTxt) || 0));
+      g.textAlign = 'center';
+      g.textBaseline = 'alphabetic';
+      g.fillStyle = bpmTxt === '--' ? theme.portLabelColor : theme.wireGoodColor;
+      // Integer size: a fractional one reads back differently and defeats
+      // setFont's guard, paying the full font-switch cost every frame.
+      setFont(g, uiFont(Math.round(Math.max(11, Math.min(26, h * 0.4))), '600'));
+      g.fillText(bpmTxt, x + w / 2, y + h * 0.55);
+      setFont(g, uiFont(9));
+      g.fillStyle = theme.portLabelColor;
+      g.fillText(bpmTxt === '--' ? 'listening…' : 'BPM', x + w / 2, y + h * 0.55 + 12);
+      // Confidence bar along the bottom edge.
+      g.fillStyle = 'rgba(255,255,255,0.10)';
+      g.fillRect(x + 4, y + h - 6, w - 8, 3);
+      g.fillStyle = c > 55 ? theme.wireGoodColor : c > 25 ? theme.wireHotColor : theme.wireClipColor;
+      g.fillRect(x + 4, y + h - 6, ((w - 8) * c) / 100, 3);
       return;
     }
     if (kind === 'spectrogram' && feed.freq) {
@@ -1923,6 +2428,19 @@ export class Renderer {
     }
     if (kind === 'meter' && feed.level) {
       const { rms, peak } = feed.level();
+      const style = String(params.meterStyle ?? 'bar');
+      if (style === 'ladder' || style === 'lamp') {
+        // Peak hold is what makes an LED meter readable — a lamp that only
+        // shows the instantaneous value flickers too fast to read a number off.
+        let held = peak;
+        if (params.peakHold !== false) {
+          const prev = this.peakHold.get(cacheKey) ?? 0;
+          held = peak >= prev ? peak : prev * 0.985;
+          this.peakHold.set(cacheKey, held);
+        }
+        this.drawLedMeter(g, { x, y, w, h }, theme, rms, held, style);
+        return;
+      }
       const { color } = levelStyle(theme, rms, peak);
       const hh = Math.min(1, rms * 1.4) * (h - 4);
       g.fillStyle = color;

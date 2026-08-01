@@ -408,6 +408,22 @@ void UiThread::drainCmds() {
         }
         if (c.inst) c.inst->teardown();
         if (c.doneEvent) SetEvent(c.doneEvent);
+        // Async path: the command owns the instance, so it dies here — on the
+        // thread that made it, after teardown, with nothing left referring to
+        // it. `owned` and `inst` are the same object; the reset is last.
+        c.owned.reset();
+        break;
+      }
+      case Cmd::Call: {
+        // Arbitrary controller work marshalled off the JS thread. Whatever it
+        // throws must not escape into the message pump, and the waiter must be
+        // released either way or its uv worker parks until the timeout.
+        try {
+          if (c.fn) c.fn();
+        } catch (...) {
+          /* a plugin that throws here loses the result, not the process */
+        }
+        if (c.doneEvent) SetEvent(c.doneEvent);
         break;
       }
       case Cmd::Input:
@@ -443,6 +459,35 @@ void UiThread::destroyInstance(VstInstance* inst) {
   // Bounded: a wedged plugin GUI must not hang the engine forever.
   WaitForSingleObject(done, 5000);
   CloseHandle(done);
+}
+
+void UiThread::destroyInstanceAsync(std::unique_ptr<VstInstance> inst) {
+  if (!inst) return;
+  if (!running_.load()) return; // never started — nothing was created here;
+                                // the unique_ptr frees it as it goes out of scope
+  Cmd c{};
+  c.what = Cmd::DestroyInst;
+  c.inst = inst.get();
+  c.owned = std::move(inst);
+  post(std::move(c)); // no doneEvent — nobody waits
+}
+
+HANDLE UiThread::postCall(std::function<void()> fn) {
+  HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!done) return nullptr;
+  Cmd c{};
+  c.what = Cmd::Call;
+  c.fn = std::move(fn);
+  c.doneEvent = done;
+  post(std::move(c)); // cheap: mutex + deque push, safe from the JS thread
+  return done;
+}
+
+bool UiThread::waitCall(HANDLE done, uint32_t ms) {
+  if (!done) return false;
+  const bool ok = WaitForSingleObject(done, ms) == WAIT_OBJECT_0;
+  CloseHandle(done);
+  return ok;
 }
 
 bool UiThread::open(VstInstance* inst, Vst::IEditController* controller,

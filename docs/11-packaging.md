@@ -1,8 +1,8 @@
 # 11 — Build, Packaging & Updates
 
-_Last verified: 2026-07-26. Files: `package.json`, `electron-builder.yml`,
-`scripts/bundle-node.mjs`, `engine/postbuild.mjs`, `vite.config.ts`,
-`electron/main.cjs`, `src/ui/updates.ts`._
+_Last verified: 2026-08-01. Files: `package.json`, `electron-builder.yml`,
+`scripts/ship.mjs`, `scripts/bundle-node.mjs`, `engine/postbuild.mjs`,
+`vite.config.ts`, `electron/main.cjs`, `src/ui/updates.ts`._
 
 ## Scripts
 
@@ -19,7 +19,9 @@ _Last verified: 2026-07-26. Files: `package.json`, `electron-builder.yml`,
 | `npm run package` | `build` + `bundle:node` + `electron-builder --win` (NSIS, local only) |
 | `npm run package:dir` | same but an unpacked folder (faster to test) |
 | `npm run release` | same as `package`, plus uploads to GitHub Releases |
-| `npm run ship` | version bump + tag + push + `release`, in one command |
+| `npm run ship` | **the whole release**: preflight → commit → merge to main → bump/tag/push → `release` → verify ([scripts/ship.mjs](../scripts/ship.mjs)) |
+| `npm run ship:minor` | same, minor bump |
+| `npm run ship:dry` | every check, zero side effects — use this first |
 
 Output: `release/LivePatch-<version>-setup.exe` (~95 MB) plus `latest.yml` and
 a `.blockmap` — the last two are the update feed and must be published
@@ -80,12 +82,39 @@ changed" failure.
    assets need a token compiled into the shipped app.
 2. `setx GH_TOKEN "<token>"` **once** (a PAT with `repo` scope; takes effect in
    new terminals). Per-session instead: `$env:GH_TOKEN = "<token>"`.
-3. `npm run ship` — bumps the patch version, commits and tags it, pushes with
-   `--follow-tags`, builds, uploads, and goes live. `npm run ship:minor` for a
-   minor bump.
+3. `npm run ship`. That is the whole procedure. There is no manual gate — it
+   commits a dirty tree for you, merges to `main`, bumps, tags, pushes, builds,
+   uploads, and then verifies the release actually went live.
 
-`npm version` refuses to run on a dirty tree, so commit first — that is the
-only manual gate left.
+```
+npm run ship                     # patch bump
+npm run ship -- minor            # minor bump
+npm run ship -- -m "Room block"  # custom commit/release message
+npm run ship:dry                 # every check, nothing touched
+```
+
+### What ship.mjs does, and why each step is there
+
+Each of these existed as a tripwire that cost a release, so they are checked
+**before** the ~95 MB build runs rather than after:
+
+| step | guards against |
+|------|----------------|
+| GH_TOKEN present | build succeeds, upload fails at the very end |
+| tag `vX.Y.Z` unused locally + on GitHub | a half-finished earlier run |
+| **no existing draft for the tag** | the silent-swallow bug below — the one that costs a whole afternoon |
+| `main` in sync with `origin/main` | a merge conflict landing mid-release |
+| `npm run typecheck` | `releaseType: release` puts a broken build in users' hands instantly |
+| commit → push branch → merge `--no-ff` → bump on `main` → push `--follow-tags` | `npm version` refusing a dirty tree; `no upstream branch` on a fresh feature branch; tags cut where `main` never sees them |
+| feature branch fast-forwarded back to `main` | the next release starting from a branch that's already behind |
+| post-publish API check for `setup.exe`, `latest.yml`, `.blockmap` | electron-builder exits 0 whether or not the release is real |
+
+The verify step is not paranoia: electron-builder's exit code says the upload
+call returned, not that a complete, non-draft release exists. Missing
+`latest.yml` means every update check 404s; missing `.blockmap` means every
+update is a full ~95 MB instead of a few MB.
+
+Escape hatches: `--no-typecheck`, `--no-verify`, `--dry-run`.
 
 ### If a release uploads but never appears
 
@@ -111,14 +140,14 @@ its git tag behind, which is where stray tags come from.
 
 ### Rebuild these before shipping, or the release quietly loses them
 
-Neither is covered by `npm run ship`, and neither fails loudly:
-
-- **Touched `native/vsthost`?** Run `npm run build:vsthost`. The addon is
-  gitignored and packaged from your local `build/Release/`; the `filter` in
-  `electron-builder.yml` copies it *only when present*, so a stale or missing
-  addon ships a build where VST3 hosting is silently unavailable.
-- **Touched `brand/*.svg`?** Run `npm run brand`. `build/icon.ico` and
-  `brand/png/` are generated, and the README banner is served from `png/`.
+- **`native/vsthost` — now handled.** `npm run release` runs `build:vsthost`
+  first, and `electron-builder.yml` lists the addon as a direct file `from`, so
+  a missing addon is a hard error instead of a build with VST3 hosting silently
+  off. Nothing to do by hand.
+- **Touched `brand/*.svg`? Still manual.** Run `npm run brand` before shipping.
+  `build/icon.ico` and `brand/png/` are generated, and the README banner is
+  served from `png/`. This is the one pre-ship step `ship.mjs` does not do —
+  regenerating icons on every release would churn binaries for no reason.
 
 `publish.releaseType: release` means uploads go **live immediately** rather
 than sitting as a draft. That removes the last click, at the cost of the

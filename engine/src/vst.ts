@@ -36,7 +36,32 @@ interface HostAddon {
     chans?: number,
   ): void;
   resetup(handle: number, sampleRate: number, maxBlock: number, chans?: number): number;
+  /** Re-negotiate the processing setup on the addon's UI thread. The kernel must
+   *  use this: `resetup` deactivates the component and reallocates the process
+   *  buffers, and it was being called from inside `process()` (docs/13). */
+  resetupAsync?(
+    handle: number, sampleRate: number, maxBlock: number, chans: number,
+    cb: (err: Error | null, latency?: number | null) => void,
+  ): void;
   params(handle: number): Array<{ id: number; title: string; units: string; stepCount: number; def: number; canAutomate: boolean; readOnly: boolean; bypass: boolean; hidden: boolean }>;
+  /**
+   * Enumeration + current values, marshalled to the addon's UI thread.
+   *
+   * **The kernel must use this, never `params`/`getParam`.** Those run inline on
+   * the JS thread, which is the audio pump: one COM round trip per parameter
+   * (hundreds on an Ozone or a Raum), plus a race against an open editor
+   * (threading rule 1). That is what froze audio whenever a plugin parameter
+   * moved — a plugin signalling `restartComponent` on an ordinary knob turn is
+   * enough to trigger a full re-enumeration, and it does so at the flush rate.
+   *
+   * Optional for the same reason as `processMulti`: the addon is built
+   * separately and a stale `vsthost.node` is a real situation. The sync path
+   * remains as the fallback.
+   */
+  paramsAsync?(
+    handle: number,
+    cb: (err: Error | null, ps?: Array<{ id: number; title: string; units: string; stepCount: number; def: number; value: number; canAutomate: boolean; readOnly: boolean; bypass: boolean; hidden: boolean }>) => void,
+  ): void;
   setParam(handle: number, pid: number, v: number): void;
   getParam(handle: number, pid: number): number;
   paramDisplay(handle: number, pid: number, v: number): string;
@@ -58,6 +83,10 @@ interface HostAddon {
   takeEdits(handle: number): number[] | null;
   getState(handle: number): Buffer | null;
   setState(handle: number, state: Buffer): boolean;
+  /** State chunk read/write on the UI thread — see `paramsAsync`. Serializing a
+   *  plugin's whole state is the other call that stalls the pump outright. */
+  getStateAsync?(handle: number, cb: (err: Error | null, buf?: Buffer | null) => void): void;
+  setStateAsync?(handle: number, state: Buffer, cb: (err: Error | null, ok?: boolean) => void): void;
   destroy(handle: number): void;
   uiOpen(handle: number, popup: boolean): boolean;
   uiEmbed(handle: number, parentHwnd: number, x: number, y: number, w: number, h: number, clipX: number, clipY: number, clipW: number, clipH: number, visible: boolean): void;
@@ -174,6 +203,22 @@ class VstKernel implements Kernel {
   private stateDirtyAt = 0;
   private respawnT: NodeJS.Timeout | null = null;
   private wantUi = false;
+  /** A param sweep is in flight (see `sendInfo`); `infoAgain` remembers that
+   *  another became due while it was, so it collapses to one more read. */
+  private infoPending = false;
+  private infoAgain = false;
+  /** A state read is in flight — never start a second one behind it. */
+  private statePending = false;
+  /**
+   * Processing re-setups in flight on the UI thread; the plugin is being
+   * deactivated and rebuilt, so `process` must bypass it meanwhile.
+   *
+   * A **count**, not a flag: `setWidth` can force a second re-negotiation while
+   * the first is still queued, and a boolean would be cleared by the first
+   * completion while the second was still tearing the component down — putting
+   * `process` back into a plugin that is mid-`setActive(false)`.
+   */
+  private resetupInFlight = 0;
   private lastUiSig = '';
   private lastUiFrames = -1;
   private lastUiFramesAt = 0;
@@ -220,21 +265,36 @@ class VstKernel implements Kernel {
       // predates the multichannel fields.
       this.pluginIn = r.inChannels ?? 2;
       this.pluginOut = r.outChannels ?? 2;
-      if (this.state) {
-        try {
-          this.h!.setState(this.handle, Buffer.from(this.state, 'base64'));
-        } catch {
-          /* stale/foreign chunk — plugin keeps defaults */
-        }
-      }
-      // Scene param values win over the state chunk (knobs the user pinned).
-      for (const [pid, v] of this.pend) this.h!.setParam(this.handle, pid, v);
-      this.pend.clear();
-      this.sendInfo();
-      this.syncUiOpen();
+      // Scene param values win over the state chunk (knobs the user pinned), so
+      // they go on after it has landed — see `writeState`.
+      const applyPend = (): void => {
+        if (this.disposed || this.handle < 0) return;
+        for (const [pid, v] of this.pend) this.h!.setParam(this.handle, pid, v);
+        this.pend.clear();
+        this.sendInfo();
+        this.syncUiOpen();
+      };
+      if (this.state) this.writeState(this.state, applyPend);
+      else applyPend();
     });
   }
 
+  /**
+   * Push the plugin's parameter list to the renderer.
+   *
+   * Parameter enumeration is **not** a cheap call: one COM round trip per
+   * parameter into the plugin's edit controller, of which a mastering EQ has
+   * hundreds. It used to run inline here, on the JS thread — which is the audio
+   * pump — and `flush()` triggers it whenever the plugin raises `paramsDirty`,
+   * which many plugins do on every knob turn. So turning a knob re-enumerated
+   * every parameter, at the flush rate, on the audio thread: the audio froze
+   * for exactly as long as you kept moving the control. It goes to the addon's
+   * UI thread now (which owns the controller anyway, threading rule 1) and
+   * comes back asynchronously.
+   *
+   * `infoPending` collapses overlapping requests — a dirty flag arriving while
+   * a read is in flight must not queue a second sweep behind it.
+   */
   private sendInfo(error?: string): void {
     if (!this.nodeId) return; // assigned right after construction; edits re-push
     if (error || this.handle < 0) {
@@ -242,20 +302,46 @@ class VstKernel implements Kernel {
       return;
     }
     const h = this.h!;
-    const params = h.params(this.handle).map((p) => ({
-      id: 'p' + p.id,
-      pid: p.id,
-      title: p.title,
-      units: p.units,
-      stepCount: p.stepCount,
-      def: p.def,
-      value: h.getParam(this.handle, p.id),
-      canAutomate: p.canAutomate,
-      readOnly: p.readOnly,
-      hidden: p.hidden,
-      bypass: p.bypass,
-    }));
-    send({ op: 'vst-info', node: this.nodeId, name: this.pluginName, latency: this.latency, hasAudioIn: this.hasAudioIn, params });
+    if (!h.paramsAsync) {
+      // Stale addon: the synchronous path, warts and all.
+      const params = h.params(this.handle).map((p) => ({
+        id: 'p' + p.id, pid: p.id, title: p.title, units: p.units, stepCount: p.stepCount,
+        def: p.def, value: h.getParam(this.handle, p.id),
+        canAutomate: p.canAutomate, readOnly: p.readOnly, hidden: p.hidden, bypass: p.bypass,
+      }));
+      send({ op: 'vst-info', node: this.nodeId, name: this.pluginName, latency: this.latency, hasAudioIn: this.hasAudioIn, params });
+      return;
+    }
+    if (this.infoPending) {
+      this.infoAgain = true;
+      return;
+    }
+    this.infoPending = true;
+    const forHandle = this.handle;
+    h.paramsAsync(this.handle, (err, ps) => {
+      this.infoPending = false;
+      // The instance may have been swapped or disposed while this was in
+      // flight; a param list from a plugin that no longer exists is worse than
+      // none, because the renderer would cache it against the live node.
+      if (this.disposed || this.handle !== forHandle || !this.nodeId) return;
+      if (err || !ps) return;
+      send({
+        op: 'vst-info',
+        node: this.nodeId,
+        name: this.pluginName,
+        latency: this.latency,
+        hasAudioIn: this.hasAudioIn,
+        params: ps.map((p) => ({
+          id: 'p' + p.id, pid: p.id, title: p.title, units: p.units, stepCount: p.stepCount,
+          def: p.def, value: p.value,
+          canAutomate: p.canAutomate, readOnly: p.readOnly, hidden: p.hidden, bypass: p.bypass,
+        })),
+      });
+      if (this.infoAgain) {
+        this.infoAgain = false;
+        this.sendInfo();
+      }
+    });
   }
 
   out(port: string): StereoBuf | null {
@@ -316,13 +402,7 @@ class VstKernel implements Kernel {
       const next = str(v);
       if (!next || next === this.lastState) return;
       this.state = this.lastState = next;
-      if (this.handle >= 0) {
-        try {
-          this.h!.setState(this.handle, Buffer.from(next, 'base64'));
-        } catch {
-          /* ignore malformed chunk */
-        }
-      }
+      if (this.handle >= 0) this.writeState(next);
       return;
     }
     if (id === 'showUi') {
@@ -396,6 +476,38 @@ class VstKernel implements Kernel {
     }
   };
 
+  /**
+   * Kick off a processing re-setup at `sr` and the current width, off the audio
+   * thread. `instRate` is advanced immediately so `process` doesn't re-enter
+   * this every quantum while it is in flight; `resetupPending` bypasses the
+   * plugin until it lands.
+   */
+  private beginResetup(sr: number): void {
+    const h = this.h!;
+    this.instRate = sr;
+    if (!h.resetupAsync) {
+      // Stale addon: the old inline call, on the audio thread. Kept so an
+      // un-rebuilt vsthost.node still works, not because it is acceptable.
+      try {
+        this.latency = h.resetup(this.handle, sr, MAXQ, this.width);
+        const ch = h.channels?.(this.handle);
+        if (ch) { this.pluginIn = ch.in; this.pluginOut = ch.out; }
+      } catch {
+        /* plugin refused the rate/width — keep the old setup */
+      }
+      return;
+    }
+    this.resetupInFlight++;
+    const forHandle = this.handle;
+    h.resetupAsync(this.handle, sr, MAXQ, this.width, (_err, latency) => {
+      this.resetupInFlight--;
+      if (this.disposed || this.handle !== forHandle) return;
+      if (typeof latency === 'number') this.latency = latency;
+      const ch = h.channels?.(this.handle);
+      if (ch) { this.pluginIn = ch.in; this.pluginOut = ch.out; }
+    });
+  }
+
   process(ins: Ins, ctx: { sr: number; n: number }): void {
     const src = ins['in'];
     const n = ctx.n;
@@ -413,18 +525,26 @@ class VstKernel implements Kernel {
     }
     if (this.instRate !== ctx.sr) {
       // Device rate differs from creation-time guess (or changed), or setWidth
-      // asked for a new bus width — re-setup and re-read what was negotiated.
-      try {
-        this.latency = this.h!.resetup(this.handle, ctx.sr, MAXQ, this.width);
-        const ch = this.h!.channels?.(this.handle);
-        if (ch) {
-          this.pluginIn = ch.in;
-          this.pluginOut = ch.out;
-        }
-        this.instRate = ctx.sr;
-      } catch {
-        this.instRate = ctx.sr; // don't retry every quantum on a refusal
+      // asked for a new bus width. This USED TO CALL `resetup` right here —
+      // inside the audio callback — which deactivates the component, re-runs
+      // setupProcessing, re-negotiates buses and reallocates the process
+      // buffers. Allocation in the audio path (golden rule 1) plus however long
+      // the plugin takes to cycle, and it fires on every Channels change and on
+      // the first quantum after a load: a guaranteed dropout, sometimes a long
+      // one. It goes to the addon's UI thread now; audio passes through until
+      // it lands.
+      this.beginResetup(ctx.sr);
+    }
+    if (this.resetupInFlight > 0) {
+      // Mid re-negotiation: the plugin's processing setup is being torn down and
+      // rebuilt on another thread, so it must not be called. Pass through.
+      for (let c = 0; c < this.outBuf.length; c++) {
+        const d = this.outBuf[c];
+        const s = src && c < src.length ? src[c] : null;
+        if (s) for (let i = 0; i < n; i++) d[i] = s[i];
+        else d.fill(0, 0, n);
       }
+      return;
     }
     const inBuf = src ?? SILENT;
     if (this.width > 2 && this.h!.processMulti) {
@@ -438,12 +558,60 @@ class VstKernel implements Kernel {
     } else {
       this.h!.process(this.handle, inBuf[0], inBuf[1], this.outBuf[0], this.outBuf[1], n);
     }
+    this.scrub(n);
     const edits = this.h!.takeEdits(this.handle);
     if (edits) {
       for (let i = 0; i + 1 < edits.length; i += 2) this.editAcc.set(edits[i], edits[i + 1]);
       this.stateDirtyAt = Date.now();
     }
   }
+
+  /**
+   * Quarantine a quantum of plugin output that is not finite.
+   *
+   * **A hosted plugin is the one signal source in the engine we do not
+   * control.** Third-party VST3s emit NaN and ±Infinity for entirely ordinary
+   * reasons — a denormal blowup in an internal feedback path, an uninitialised
+   * tail on the first block after `setProcessing`, a parameter change that
+   * divides by zero — and until this existed, that value went straight into the
+   * graph as if it were audio.
+   *
+   * Downstream it is not a click, it is permanent: every kernel that carries
+   * state across quanta latches it and stops passing audio for the rest of the
+   * session. That is the bug this was found by — EQ Curve went dead first (it
+   * has its own trap now), then Upmix, and each "fix" only moved the corpse to
+   * the next block with a delay line in it. Those kernels self-heal now, but
+   * one quantum of silence per block is still worse than not letting the value
+   * out of the plugin in the first place, and a plugin that emits NaN once
+   * usually emits it steadily.
+   *
+   * Detection is a running sum: NaN and ±Infinity both poison a total, so this
+   * is one check per channel per quantum rather than a branch per sample. Only
+   * the offending channel is zeroed — a plugin with one bad bus should not
+   * silence the others.
+   */
+  private scrub(n: number): void {
+    const w = Math.min(this.width, this.outBuf.length);
+    for (let c = 0; c < w; c++) {
+      const b = this.outBuf[c];
+      let s = 0;
+      for (let i = 0; i < n; i++) s += b[i];
+      if (!Number.isFinite(s)) {
+        b.fill(0, 0, n);
+        // Say it once per plugin. A steady emitter would otherwise flood the
+        // IPC channel from the audio path, which is its own golden-rule
+        // violation (docs/10 rule 1: no logging in the callback).
+        if (!this.nanWarned) {
+          this.nanWarned = true;
+          send({
+            op: 'status',
+            info: `VST "${this.pluginName || this.plugin}" emitted non-finite audio; that quantum is muted`,
+          });
+        }
+      }
+    }
+  }
+  private nanWarned = false;
 
   /** Slow-path flush (100 ms timer): edits → renderer, settled state → scene,
    *  plugin-requested param re-scans. Never runs inside the audio callback.
@@ -494,18 +662,65 @@ class VstKernel implements Kernel {
     }
 
     if (!uiOpen) {
-      if (this.stateDirtyAt && Date.now() - this.stateDirtyAt > 1500) {
+      if (this.stateDirtyAt && !this.statePending && Date.now() - this.stateDirtyAt > 1500) {
         this.stateDirtyAt = 0;
-        const buf = this.h!.getState(this.handle);
-        if (buf) {
-          const b64 = buf.toString('base64');
-          if (b64 !== this.lastState) {
-            this.state = this.lastState = b64;
-            send({ op: 'vst-state', node: this.nodeId, state: b64 });
-          }
-        }
+        this.readState();
       }
       if (this.h!.paramsDirty(this.handle)) this.sendInfo();
+    }
+  }
+
+  /** Pull the settled state chunk for the scene. Off the JS thread where the
+   *  addon supports it — serializing a plugin's state is slow enough to be a
+   *  dropout on its own (docs/13). */
+  private readState(): void {
+    const h = this.h!;
+    const forHandle = this.handle;
+    const take = (buf: Buffer | null | undefined): void => {
+      if (this.disposed || this.handle !== forHandle || !this.nodeId || !buf) return;
+      const b64 = buf.toString('base64');
+      if (b64 === this.lastState) return;
+      this.state = this.lastState = b64;
+      send({ op: 'vst-state', node: this.nodeId, state: b64 });
+    };
+    if (!h.getStateAsync) {
+      take(h.getState(this.handle));
+      return;
+    }
+    this.statePending = true;
+    h.getStateAsync(this.handle, (_err, buf) => {
+      this.statePending = false;
+      take(buf);
+    });
+  }
+
+  /**
+   * Apply a state chunk (scene load / undo). Async where available: `setState`
+   * re-initializes every parameter in the plugin, same cost class as reading.
+   *
+   * `then` runs after the chunk has actually landed. It exists because the
+   * chunk and the scene's own pinned parameter values are applied in sequence
+   * and **the scene has to win** — making the write async without carrying the
+   * ordering would let the plugin's stored values overwrite the user's.
+   */
+  private writeState(b64: string, then?: () => void): void {
+    const h = this.h!;
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(b64, 'base64');
+    } catch {
+      then?.(); // malformed chunk — carry on with the rest
+      return;
+    }
+    try {
+      if (h.setStateAsync) h.setStateAsync(this.handle, buf, () => then?.());
+      else {
+        h.setState(this.handle, buf);
+        then?.();
+      }
+    } catch {
+      /* stale/foreign chunk — plugin keeps whatever it has */
+      then?.();
     }
   }
 

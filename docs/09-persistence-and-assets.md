@@ -1,8 +1,9 @@
 # 09 — Persistence, Assets, and the Tape System
 
-_Last verified: 2026-07-27. Files: `src/core/persist.ts`, `src/core/session.ts`,
+_Last verified: 2026-08-01. Files: `src/core/persist.ts`, `src/core/session.ts`,
 `src/core/cassettes.ts`, `src/core/rolls.ts`, `src/core/sampler.ts`,
-`src/core/customblocks.ts`, `src/core/prefs.ts`, `src/core/takehistory.ts`,
+`src/core/customblocks.ts`, `src/core/factory/*`,
+`src/core/prefs.ts`, `src/core/takehistory.ts`,
 `src/core/encode/*`,
 `src/ui/tape.ts`, `src/ui/clipview.ts`, `src/ui/pianoroll.ts`,
 `src/ui/imagepicker.ts`, `electron/main.cjs`._
@@ -37,6 +38,38 @@ stripped), stored in localStorage, shown in the Library's **Custom** tab.
 Instantiated via `doc.instantiateTemplate` (full id remap). Adding a new
 id-embedding field means updating that remap — see
 [`03-document-model.md`](03-document-model.md).
+
+## Factory content (`src/core/factory/`)
+
+The patches that ship with the app: preset scenes (Scenes panel → **Factory
+presets**) and built-in custom blocks (Library, under a **Factory** subheader),
+the largest of which is the Mavis panel. They are ordinary document data, built
+by the code in `factory/build.ts` rather than checked in as JSON — the reasons
+are at the top of that file, and the authoring rules are in
+[`08-extending.md`](08-extending.md).
+
+**They are merged on read, never seeded into the user's storage**, and that is
+the decision worth understanding. Copying the presets into localStorage on first
+run is the obvious implementation, and it means they belong to the user forever:
+improving one in a later build reaches nobody who has already launched the app
+once, and a preset that shipped half-finished is permanent. So
+`getCustomBlocks()` returns `[...user, ...factory]` and the factory entries
+carry `factory: true`.
+
+Read-only therefore has to be enforced in three places, because each of them
+would otherwise appear to work and be undone by the next launch:
+
+| | |
+|---|---|
+| `deleteCustomBlock` / `renameCustomBlock` | no-op on a factory key, and the Library's context menu omits both items |
+| `updateCustomBlock` | returns `undefined`, and the block menu drops `Save Custom Block "…"` so only **Save as Custom Block…** is offered |
+| `doLoadPreset` | loads with `savedAs = null` and `dirty = true`, exactly like an import, so Save asks for a name and writes a copy |
+
+The guarantee that falls out: **you can take any factory preset apart and you
+cannot lose it.** Which is the point — the Mavis exists to be opened.
+
+`node scripts/factory-preset-test.mjs` validates every template and scene
+structurally (see [`12-testing-checklist.md`](12-testing-checklist.md)).
 
 ## The Tape system — cassettes as audio assets
 
@@ -113,7 +146,8 @@ exactly the same four numbers, and nothing else in the app moves them —
   beside the reader (and they appear in the Cassettes tab).
 - **`tape-recorder`** — see "The take model" below. A deck that writes: it
   holds a live take, auditions it through an audio `out`, punches in at the
-  playhead, and is turned into a cassette by **Save As…**, never by ■.
+  playhead, hands the take out **live** on `tape` (see "The live take"), and is
+  turned into a cassette by **Save As…**, never by ■.
 - **`tape-writer`** — encodes the inserted cassette to disk; pick filename +
   format. Encoding runs renderer-side (`src/core/encode/`): WAV native, mp3/ogg
   via `wasm-media-encoders`, flac via `libflacjs` — all **lazy `import()`** so
@@ -135,7 +169,7 @@ branches on it:**
 |---|---|
 | `classic` | a **gate**: the region plays under an ADSR, and with Loop on it cycles `[loopStart, loopStart+loopLen]` for as long as the key is held |
 | `oneshot` | a **trigger**: the region plays through and note-off is ignored, so a hit cannot be cut short by a short key press |
-| `slice` | a **key in a kit**: the region is cut at the slice points and slice *i* answers to `root + i`, at its own pitch (a slice is a piece of the recording, not a note to transpose) |
+| `slice` | a **key**: the region is cut at the slice points and each piece answers to a key. `slicemap` decides which — see below |
 
 - Region = `start`/`end` (0..1 of the file, driven by the `sampleview` widget on
   the block face *and* by the play bars in the Clip tab — they are the same two
@@ -143,14 +177,38 @@ branches on it:**
   **performance** envelope. Both apply, and in the Web unit they are two gain
   nodes per voice on purpose: folding them into one curve would mean recomputing
   every ramp on note-off.
+- **Full velocity means unity, and how much velocity takes away is a knob**
+  (`velAmp` in `src/core/sampler.ts`, hand-copied into the kernel).
+  A voice is `material × envelope × velAmp(velocity, velamp) × gain`. It used to
+  be raw `velocity × gain` with `gain` defaulting to **0.8**, which put an
+  ordinary v80 press at **−6 dB** and v64 at −8 dB — reported as "recorded
+  samples play a lot quieter than they should" (2026-08-01) with nothing wrong
+  anywhere in the tape path: capture, commit and decode all measure bit-exact,
+  the instrument simply gave the level away before it started. `Vel → Amp` at
+  **0** makes every trigger full level, which is what a loop or one-shot lifted
+  off the tape recorder wants; at **1** it is the old linear response.
+  `scripts/slice-pitch-test.cjs` holds the numbers, and it is what catches the
+  two copies drifting apart.
 - **Loop points are clamped into the region at note-on**, in both engines, so
   dragging the region can never leave the loop pointing at audio the region
   excludes.
-- `loopFade` crossfades the loop seam by mixing in the material *before*
-  `loopStart` as the tail ramps out. **Native only.** An
+- `loopFade` crossfades the loop seam — the fade **between laps**, as opposed to
+  `fadein`/`fadeout`, which only bound the first and last one. It overlaps the
+  loop's own head (the tail fades out over the last `loopFade` while
+  `[loopA, loopA+fade)` fades in, and the lap wraps to `loopA + fade`), so it
+  needs no material outside the loop and works on the loop the Clip tab hands
+  you. It used to reach *backwards* into the run-up before `loopStart`, which is
+  the textbook shape but is zero-length on that loop — so the control silently
+  did nothing in the case everyone reaches. A lap is therefore the bracket minus
+  the fade, which the toolbar states. **Native only.** An
   `AudioBufferSourceNode` has loop points but no seam fade, and faking one needs
   a second source per lap; the Web engine is the fallback path, so it loops
   without the crossfade rather than growing a scheduler for it.
+- **Every mode runs the ADSR, including the slice modes**, and a voice's release
+  starts early enough to *finish* as its material runs out — cutting a voice off
+  with the envelope still open is a click, and it was what every slice ended on.
+  `slicehold` picks whether note-off releases a slice (Gate, the default) or it
+  plays out as a hit (One-Shot).
 - **Slice points are authored state, not derived** (`src/core/sampler.ts`): a
   JSON array of 0..1 positions on the `slices` string param, exactly the way
   `seqgrid` ships its steps — so `CompiledGraph` stays engine-agnostic and the
@@ -169,6 +227,33 @@ branches on it:**
   - **Detection awaits its scan** (`getCassettePeaksAsync`). The drawing only
     warms the bucket counts it needs, and a button that gave up when its own
     scan was cold did nothing the first time it was pressed.
+- **Which key a slice answers to is `slicemap`.** Dealing the pieces out in the
+  order they happen to appear is fine for a drum kit, where the keyboard is a
+  set of buttons; it is useless for anything played, because C3 gets whatever
+  came first and the instrument you get back has no relationship to the one
+  that was recorded.
+  - `Chromatic` — slice *i* on `root + i`, at its own pitch. A kit. The
+    original behaviour and still the default for a fresh block.
+  - `Pitched` — each slice carries the key it was **detected** to sound
+    (`slicekeys`, a JSON array parallel to the slice list, written by the Clip
+    tab's `♪ Keys`), and any note plays the slice whose key is nearest,
+    transposed onto it. Every key on the keyboard sounds, and it sounds the
+    sample that needs stretching least — which is how a sampled instrument is
+    built. Slices where nothing pitched was found keep their chromatic slot but
+    **lose every tie** to a detected one: a placeholder key must not steal a
+    note from a slice that was actually heard to play it.
+  - Detection is YIN's cumulative-mean-normalized difference function on the
+    decoded buffer, decimated to ~16 kHz (`detectPitchHz`). It has to be YIN
+    rather than plain autocorrelation because the cheap version answers an
+    octave low on anything with a strong second harmonic, and an octave error
+    here is not an inaccuracy — it lands the slice twelve keys away. Material
+    with no periodicity comes back as "none" rather than as a guess.
+  - The keys are **positional**, so re-cutting the region drops them: slice *i*
+    is now different audio, and keeping the old keys would map notes to
+    material nothing ever listened to.
+  - `sliceForNote` (`src/core/sampler.ts`) is the resolution both engines
+    implement — the native kernel carries a hand-copy, the same mirroring
+    arrangement as the rig and trajectory math. **Change one, change both.**
 
 ### The take model (both recorders)
 
@@ -209,17 +294,73 @@ live *take*, and the same four buttons mean what they do on any tape machine:
   than a slice per quantum, which is what the old accumulate-and-join recorder
   did. Capture has to put samples *somewhere*; this is the least the audio path
   can do it in, and the audition reads those chunks in place.
-- **Neither recorder has an asset output port any more.** `tape-recorder`'s
-  `tape` out and `midi-recorder`'s `roll` out were removed on 2026-07-23: a take
-  reaches the rest of the patch through the Library, once Save As… has named it.
-  `RETIRED_PORTS` in `persist.ts` drops them (and any wire that reached one)
-  from scenes saved before that — `backfillDefPorts` only ever *adds*, so a
-  retired port would otherwise live on forever in every existing scene, wired
-  and apparently working while the engine ignored it.
+- **`midi-recorder` has no asset output port.** Its `roll` out was removed on
+  2026-07-23: a MIDI take reaches the rest of the patch through the Library,
+  once Save As… has named it. `RETIRED_PORTS` in `persist.ts` drops it (and any
+  wire that reached it) from scenes saved before that — `backfillDefPorts` only
+  ever *adds*, so a retired port would otherwise live on forever in every
+  existing scene, wired and apparently working while the engine ignored it.
+  `tape-recorder`'s `tape` out went the same way and **came back on 2026-08-01**
+  as something else entirely — see below.
 - `node scripts/recorder-kernel-test.cjs` drives both kernels headless and
   asserts capture, the punch (before survives / middle replaced / after
-  survives), the same-id rewrite, audition output, Clear keeping the asset, and
-  that the MIDI recorder records at all.
+  survives), the same-id rewrite, audition output, Clear keeping the asset, the
+  live take, and that the MIDI recorder records at all. **The probe is async on
+  purpose**: committing streams the WAV to disk a slice at a time and the live
+  take is republished off a pump timer, so neither has happened when ■ returns.
+  Reading the cassette directory synchronously after ■ tests the race, not the
+  recorder — which is exactly what it used to do.
+
+### The live take — `tape-recorder`'s `tape` out
+
+The recorder's `tape` output is **not** "the cassette it committed". It is the
+capture buffer itself, published while recording, so a Sampler wired to it plays
+what you just played — no ■, no Save As…, no trip through the Library. That is
+the one thing the retired port could not do, and the reason it is back.
+
+- **Live assets are an in-memory overlay on the asset store**, keyed
+  `live_<nodeId>`: `AssetStore.setLive` (native, `engine/src/assets.ts`) and
+  `setLiveTake` (renderer, `src/core/cassettes.ts`). They shadow the disk store,
+  because between punches the take in memory is ahead of the file. The ids are
+  never persisted, never listed and never written.
+- **`tape` presents the live take while the recorder holds one**, and falls back
+  to the committed cassette when it does not — which is what a freshly loaded
+  scene has, and what Clear leaves behind. ■ therefore does **not** swap a
+  wired sampler onto the file it just wrote; that would re-decode the same audio
+  and then fall behind the next punch.
+- **The native mirror is incremental** (`LiveTake`, `engine/src/dsp.ts`). A
+  `Take` is chunked and a `DecodedAudio` is one flat array per channel, so the
+  mirror is a real copy — but the engine's event loop **is** the audio pump
+  (docs/10, the same fact that put the disk commit on a `WriteStream`), so a
+  whole-take memcpy on a pump pass is a quarter-second of xruns. Growth is
+  therefore *staged*: capacity doubles into a second array filled a slice at a
+  time while the old one stays published, and steady state copies only the
+  frames that arrived (`Take.mirrorFrom/mirrorTo`, its own dirty range so the
+  waveform picture and the mirror cannot rob each other). `channels[ch]` is a
+  `subarray` view, and **the published object identity never changes** — that is
+  what lets a sampler hold the take and watch it lengthen.
+- **The Web engine rebuilds instead**, because an `AudioBuffer` cannot grow and
+  cannot be viewed into. Every refresh is a full copy on the main thread, so the
+  rate self-limits: never more than ~5% of wall time (`liveCost * 20`). A phrase
+  refreshes every frame; a ten-minute take rarely, and a ten-minute take is not
+  what anyone is live-sampling. Fallback-engine behaviour, like the sampler's
+  loop crossfade.
+- **Growth is announced through `assetChanged`** — `AssetStore.onLiveChange` →
+  `GraphExec` sweeps every kernel (native), `UnitEnv.assetChanged` →
+  `WebAudioEngine.assetChanged` (web). A deck that re-hydrates must **keep its
+  playhead** when the id and the object are the same material that grew;
+  re-seating it at the start bar 16 times a second is what a naive re-hydrate
+  does.
+- **The Sampler is the block this is for.** It reads the region off
+  `channels[0].length` at note-on, so a growing take simply means the next note
+  reaches further; a sounding voice keeps the material it started on. A *deck*
+  fed from a live take also follows it, but its bars are fractions of the file,
+  so a take that is still growing moves the window under it — inherent, not a
+  bug, and the reason the port is documented as a sampling route.
+- **The UI does not draw a live take on a downstream block.** `resolveAssetFor`
+  hands the Clip tab a `live_…` id it has no peaks for, so a sampler wired to a
+  recording shows an empty waveform until the take is committed. The recorder's
+  own face and Clip tab are unaffected — they draw `VisualFeed.wave`.
 
 ### Tape routing
 
@@ -526,15 +667,52 @@ property of the room, not of a patch. Both save and load deep-copy, so a scene's
 subsequent speaker drags never write back into the preset. Every stored entry is
 re-validated through `parseRig` on read.
 
+**Calibrations travel with the rig** (2026-07-31) — into the scene file *and*
+into the saved preset, which is the point: a measurement is a property of the
+room, exactly like the layout, and re-measuring it in every new scene is the
+work presets exist to avoid.
+
+What is stored is **curves, not filter taps**: `resp` (the measured response)
+and `corr` (the correction), each ~121 numbers on the fixed 1/12-octave grid in
+`core/calibrate.ts`, plus a gain, a delay and the geometry baseline. About
+1.5 kB per speaker, so a 16-speaker saved rig is ~24 kB — comfortably inside the
+localStorage quota, which storing taps (4× the size) would start to threaten.
+The engine derives the actual FIR when the rig reaches it, so the same stored
+calibration is correct at any sample rate; taps would have to be rebuilt anyway.
+
+**The grid is a compatibility contract.** `CAL_F0` / `CAL_PPO` / `CAL_N` are
+duplicated in `engine/src/rig.ts`, and every calibration ever saved is a bare
+array of numbers against them. Appending points is safe; changing the start
+frequency or the resolution silently reinterprets every existing calibration as
+describing different frequencies. `parseCal` rejects a wrong-length or
+non-finite curve outright — it reads as "not calibrated", never as a filter.
+
 ## Application preferences (`src/core/prefs.ts`)
 
 The settings that belong to the *installation*, not to a scene: default device
 per hardware block type (`audio-in` / `audio-out` / `asio-in` / `asio-out`), the
 engine to start with, and whether audio comes up running. Top bar → **Options**.
 
-- `GraphDoc.makeBlock` applies `defaultDeviceFor(type)` to a new block's
+- `GraphDoc.makeBlock` applies `defaultDeviceFor(type, api)` to a new block's
   `device` param — so a hardware block arrives on the right interface instead of
   "(default)". No preference set leaves the def's default alone.
+- **A blank `device` resolves to the preference at COMPILE time, not just at
+  creation time** (`resolveDevice`, `compile.ts`, 2026-08-01). Applying it only
+  in `makeBlock` made the setting a template for *new* blocks: every block that
+  predated it — and every block in every scene shared, imported or built by the
+  factory presets — stayed on the operating system's default forever, and
+  changing the preference moved nothing. Resolving on the compiled node instead
+  keeps the document portable (the scene still says "(default)", so handing it
+  to someone else still means *their* default) while this machine opens the card
+  this machine was told to use. `onPrefsChange` raises `'structure'` so the
+  change actually reaches the engine, and Properties spells the resolved name
+  out — two blocks both reading "(default device)" could otherwise open
+  different cards with nothing on screen to say which.
+  Deliberately narrow: only the id `device`, only when it is empty, and only for
+  the types `defaultDeviceFor` names — MIDI In/Out also carry a `device` param
+  and must never be handed an audio endpoint. Multi In and Speaker Rig carry
+  both worlds on one block, so their `api` param picks which of the four
+  preferences applies.
 - `applyStartupPrefs()` (shell) runs **after the session scene is restored**;
   starting audio before that would spin the engine up on an empty graph and
   immediately rebuild it.
@@ -548,6 +726,31 @@ engine to start with, and whether audio comes up running. Top bar → **Options*
 - **An app preference never goes in the Scene, and scene state never goes in
   localStorage.** Devices, engine choice, UI scale, Library pins and saved rigs
   describe the machine; a patch handed to someone else must not carry them.
+- **The rig belongs to the room, not to the patch** (2026-08-01). A speaker
+  layout describes where the user's speakers physically are; opening a different
+  scene does not move them. It used to live only in `Scene.rig`, so loading a
+  patch — your own from yesterday, a factory preset, anything shared — silently
+  repointed every panner at somebody else's room, and the only way back was to
+  rebuild the layout by hand. So the *active* rig is app-level state
+  (`livepatch.rig`, beside saved rig presets) and `Scene.rig` becomes a record
+  of what the scene was authored against: still written, still exported, still
+  what a hand-built test scene compiles with, but overridden on load. The
+  calibration rides along, which is the other half of the point — two minutes of
+  sweeps per speaker is not something to redo per scene.
+  - Two write points and no others: `GraphDoc.setRig` (every route into the rig
+    already funnels through it — drag, inspector, preset, ±speaker) and
+    `restore`, because **undoing a rig edit is a rig edit** and Ctrl+Z would
+    otherwise move the speakers on screen while leaving the stored layout at the
+    value the next scene load would put straight back.
+  - **Discarding a scene's layout is not allowed to be silent.** It changes the
+    channel count and therefore how the patch sounds, so `loadScene` records
+    `rigOverride` and the shell banners it ("built for 9.1.6 (16 ch) — using
+    your rig …"). Reported only when the count or the name actually differs.
+  - The opt-out (Rig tab → *Same rig in every scene*) is a **switch**, not
+    "delete the stored rig": deleting would re-arm on the very next speaker
+    drag, since `setActiveRig` runs on every edit, and an opt-out that undoes
+    itself the first time you touch the editor is not an opt-out. Turning it
+    back on adopts what is on screen rather than whatever was stored last.
 - **Assets are never edited destructively.** Nothing in the app rewrites a
   cassette's samples. The one exception is a recorder acting on *its own take*,
   under an id it already owns: punching in, and (2026-07-25) the Clip tab's

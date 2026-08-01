@@ -17,10 +17,47 @@ export class AssetStore {
   private cache = new Map<string, DecodedAudio | null>();
   private requested = new Set<string>();
   private waiters = new Map<string, Array<(a: DecodedAudio | null) => void>>();
+  /**
+   * **Live assets** — samples that exist only in memory, in a kernel that is
+   * still producing them. Today that is a tape recorder's in-progress take,
+   * published so anything wired to its `tape` out can read the take *while it
+   * is being recorded* (docs/09, "The live take"). They shadow the disk store:
+   * a recorder's committed scratch file is stale the moment it punches in
+   * again, and the take in memory is always the truth while it holds one.
+   */
+  private live = new Map<string, DecodedAudio>();
+  /**
+   * Set by the graph executor. A live asset's samples changed under an
+   * unchanged id, which is exactly the case `Kernel.assetChanged` exists for —
+   * a deck that hydrated the take a second ago is holding a shorter one now.
+   */
+  onLiveChange: ((id: string) => void) | null = null;
+
+  /**
+   * Publish (or, with `null`, withdraw) a live asset.
+   *
+   * The `DecodedAudio` handed in is expected to be **the same object** every
+   * time for a given id, with its `channels` re-pointed as the material grows —
+   * that is what lets a sampler keep a reference across the growth instead of
+   * re-hydrating per note.
+   */
+  setLive(id: string, dec: DecodedAudio | null): void {
+    if (!id) return;
+    if (dec) this.live.set(id, dec);
+    else if (!this.live.delete(id)) return;
+    const arr = this.waiters.get(id);
+    if (arr && dec) {
+      this.waiters.delete(id);
+      for (const cb of arr) cb(dec);
+    }
+    this.onLiveChange?.(id);
+  }
 
   /** Sync lookup; kicks off a load / renderer decode when unknown. */
   get(id: string): DecodedAudio | null {
     if (!id) return null;
+    const live = this.live.get(id);
+    if (live) return live;
     const hit = this.cache.get(id);
     if (hit !== undefined) return hit;
     this.load(id);

@@ -34,6 +34,7 @@ import {
 import { SWAPPABLE_WIDGETS } from './layout';
 import { MenuItem, colorModal, promptModal, showContextMenu } from './menus';
 import { fitCanvasBacking, onUiScaleChange } from './uiscale';
+import { TwoPointerGesture, capture, isCoarse } from './input';
 import {
   SampleHandle,
   keyAt,
@@ -123,7 +124,7 @@ type Drag =
   | { kind: 'xy'; live: Live; spec: ParamSpec }
   | { kind: 'button'; live: Live; spec: ParamSpec }
   | { kind: 'sampleview'; live: Live; handle: SampleHandle }
-  | { kind: 'keys'; live: Live; octave: number; note: number | null }
+  | { kind: 'keys'; live: Live; octave: number; variant?: string; note: number | null }
   | { kind: 'wavedraw'; live: Live; spec: ParamSpec; samples: number[]; lastIdx: number }
   | { kind: 'seqgrid'; live: Live; spec: ParamSpec; steps: ReturnType<typeof parseSteps>; toggleCol: number | null };
 
@@ -440,14 +441,15 @@ function build(body: HTMLElement): DockTabHandle {
     }
     if (spec.widget === 'keys') {
       const octave = Number(t.params.octave ?? 4);
-      const note = keyAt(L.rect, octave, p.x, p.y);
+      const variant = L.dw.control?.variant;
+      const note = keyAt(L.rect, octave, p.x, p.y, variant);
       const set = pressedKeys.get(t.id) ?? new Set<number>();
       pressedKeys.set(t.id, set);
       if (note != null) {
         set.add(note);
         runtime.sendParam(L.r.nodeId, 'noteon', note - octave * 12);
       }
-      drag = { kind: 'keys', live: L, octave, note };
+      drag = { kind: 'keys', live: L, octave, variant, note };
       return true;
     }
     if (spec.widget === 'wavedraw') {
@@ -565,17 +567,34 @@ function build(body: HTMLElement): DockTabHandle {
 
   // ---- pointer handling ---------------------------------------------------
 
+  /**
+   * Two-finger scroll for the widget field.
+   *
+   * The canvas sets `touch-action: none` so that a one-finger drag *operates a
+   * widget* rather than scrolling the page — correct, but it also meant the
+   * field could not be scrolled by touch at all. A docked layout taller than
+   * the panel was simply unreachable below the fold. Two fingers scroll it,
+   * per the standard's "two-finger navigation is pan" rule; there is no zoom
+   * here because the field is a list, not a viewport.
+   */
+  const gesture = new TwoPointerGesture();
+
   canvas.addEventListener('pointerdown', (e) => {
     if (e.button === 2) return; // context menu handles its own hit test
     const p = toSurface(e);
     const L = hit(p);
-    // Capture keeps a drag alive past the canvas edge. It throws for a
-    // pointer id the element never saw (synthetic events, some pen stacks) —
-    // that must not abort the interaction.
-    try {
-      canvas.setPointerCapture(e.pointerId);
-    } catch {}
+    capture(canvas, e.pointerId);
     canvas.focus();
+
+    if (isCoarse(e)) {
+      gesture.add(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (gesture.count >= 2) {
+        // Two fingers supersede whatever the first one had grabbed — a widget
+        // that was mid-edit must not keep taking values while the user scrolls.
+        cancelDrag();
+        return;
+      }
+    }
 
     if (!arrange) {
       if (L && beginOperate(L, p, e.shiftKey)) {
@@ -615,6 +634,15 @@ function build(body: HTMLElement): DockTabHandle {
 
   canvas.addEventListener('pointermove', (e) => {
     const p = toSurface(e);
+    if (gesture.update(e.pointerId, { x: e.clientX, y: e.clientY }) && gesture.active) {
+      const f = gesture.frame();
+      // Fingers move the content, so the scroll offset moves the other way.
+      if (f) {
+        scroller.scrollLeft -= f.dx;
+        scroller.scrollTop -= f.dy;
+      }
+      return;
+    }
     if (drag.kind === 'none') {
       const L = hit(p);
       const id = L?.dw.id ?? null;
@@ -706,7 +734,7 @@ function build(body: HTMLElement): DockTabHandle {
         applySeq(drag, p);
         break;
       case 'keys': {
-        const note = keyAt(drag.live.rect, drag.octave, p.x, p.y);
+        const note = keyAt(drag.live.rect, drag.octave, p.x, p.y, drag.variant);
         if (note !== drag.note) {
           const set = pressedKeys.get(drag.live.r.target.id)!;
           if (drag.note != null) {
@@ -725,6 +753,26 @@ function build(body: HTMLElement): DockTabHandle {
     invalidate();
   });
 
+  /**
+   * Release whatever a single pointer was doing, without committing geometry.
+   * Used when a second finger promotes the interaction to a scroll: a knob
+   * mid-turn must stop taking values, and a held button must release.
+   */
+  const cancelDrag = (): void => {
+    if (drag.kind === 'button') {
+      runtime.sendParam(drag.live.r.nodeId, drag.spec.id, 0);
+      drag.live.r.target.params[drag.spec.id] = 0;
+      doc.touch('param');
+    } else if (drag.kind === 'keys' && drag.note != null) {
+      pressedKeys.get(drag.live.r.target.id)?.delete(drag.note);
+      runtime.sendParam(drag.live.r.nodeId, 'noteoff', drag.note - drag.octave * 12);
+    }
+    drag = { kind: 'none' };
+    hotRef = null;
+    guides = [];
+    invalidate();
+  };
+
   const endDrag = (): void => {
     if (drag.kind === 'button') {
       // Momentary: release on pointer-up, exactly like the canvas.
@@ -742,8 +790,17 @@ function build(body: HTMLElement): DockTabHandle {
     guides = [];
     invalidate();
   };
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
+  const releasePointer = (e: PointerEvent): void => {
+    if (gesture.count) {
+      const wasActive = gesture.active;
+      gesture.remove(e.pointerId);
+      // A lone remaining finger must not resume operating a widget mid-scroll.
+      if (wasActive || gesture.count >= 1) return;
+    }
+    endDrag();
+  };
+  canvas.addEventListener('pointerup', releasePointer);
+  canvas.addEventListener('pointercancel', releasePointer);
 
   // ---- context menu -------------------------------------------------------
 
@@ -849,6 +906,15 @@ function build(body: HTMLElement): DockTabHandle {
               label: (dw.control?.showValue === false ? '○ ' : '● ') + 'Show value',
               action: () => restyle((c) => (c.showValue = c.showValue === false ? undefined : false)),
             },
+            // Only where the spec actually declares one (see ParamSpec.mark).
+            ...(spec?.mark
+              ? [
+                  {
+                    label: (dw.control?.showMark === false ? '○ ' : '● ') + 'Show panel symbol',
+                    action: () => restyle((c) => (c.showMark = c.showMark === false ? undefined : false)),
+                  },
+                ]
+              : []),
             {
               label: 'Opacity…',
               action: async () => {
@@ -1067,6 +1133,7 @@ function variantsFor(spec: ParamSpec | undefined, cs?: ControlStyle): string[] {
   if (kind === 'fader' || kind === 'hfader') return ['track', 'slim', 'led'];
   if (kind === 'toggle') return ['switch', 'check', 'led', 'rocker', 'power'];
   if (kind === 'button') return ['rect', 'pill', 'round', 'flat'];
+  if (kind === 'keys') return ['piano', 'pad'];
   return [];
 }
 

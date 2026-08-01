@@ -107,6 +107,39 @@ export interface AssetReadyMsg { op: 'asset-ready'; id: string }
  * `device` = '' captures the ASIO master's own input (channel `channel`).
  */
 export interface MeasureLatencyMsg { op: 'measure-latency'; device?: string; channel?: number; runs?: number }
+/**
+ * Speaker calibration run: play a sweep out of each listed hardware channel in
+ * turn and send back what the microphone heard.
+ *
+ * **The engine does no analysis.** It copies the sweep out and the capture in,
+ * and ships the capture; the deconvolution, gating, smoothing and correction
+ * all happen in the renderer (`src/core/calibrate.ts`). The engine's event loop
+ * is the audio pump, so a quarter-million-point FFT here would be a dropout in
+ * the middle of the measurement it was supposed to produce.
+ *
+ * `sweep` is base64 float32 — generated once by the renderer and sent, rather
+ * than generated at both ends from the same formula. The deconvolution divides
+ * the capture by this exact signal, so two implementations that disagree in the
+ * last decimal produce a wrong answer that looks entirely plausible.
+ */
+export interface MeasureSpeakersMsg {
+  op: 'measure-speakers';
+  /** Capture device name; '' = the ASIO master's own input. */
+  device?: string;
+  /** Microphone channel on that device, 1-based. */
+  channel?: number;
+  /** Output route: the ASIO master's channels, or a named Windows endpoint. */
+  asioOut?: boolean;
+  outDevice?: string;
+  /** Speakers to measure, in order. `ch` is the 1-based hardware channel. */
+  speakers: Array<{ id: string; ch: number }>;
+  /** Base64 float32 sweep, at the engine's current sample rate. */
+  sweep: string;
+  /** Seconds of silence recorded after the sweep, for the room's tail. */
+  tail?: number;
+  /** Abort a run in progress. Everything else is ignored when set. */
+  cancel?: boolean;
+}
 /** Plugin editor UI control. 'show' opens the editor for embedding (hidden
  *  until the first vst-ui-rect arrives); 'popup' opens a floating window. */
 export interface VstUiMsg { op: 'vst-ui'; node: string; action: 'show' | 'popup' | 'close' }
@@ -131,7 +164,7 @@ export interface VstUiRectMsg {
 export type InMsg =
   | ConfigMsg | StartMsg | StopMsg | SetGraphMsg | SetParamMsg
   | MidiEventMsg | MidiLearnMsg | WatchVisualsMsg | AssetReadyMsg | MeasureLatencyMsg
-  | VstUiMsg | VstUiRectMsg;
+  | MeasureSpeakersMsg | VstUiMsg | VstUiRectMsg;
 
 // ---- engine → renderer ----
 export interface DeviceInfo {
@@ -249,6 +282,19 @@ export interface StatusMsg {
   latencyFrames?: number;
   /** Deepest standing input-ring backlog, frames (capture latency proxy). */
   inDepth?: number;
+  /**
+   * Capture streams whose ring has hit its ceiling and is still running dry —
+   * i.e. the source is not keeping up, and more latency cannot help. Absent
+   * when nothing is starving, so its presence in a log IS the finding.
+   */
+  starved?: string[];
+  /**
+   * Per-ASIO-bridge delivery: frames actually delivered per second, and the
+   * longest gap between deliveries. `fps` well under the sample rate is a rate
+   * deficit; `fps` at the sample rate with a wide `gapMs` is burstiness. See
+   * `IoManager.bridgeStats`.
+   */
+  bridges?: Array<{ name: string; fps: number; gapMs: number }>;
   xruns?: number;
   /** DSP time as a fraction of the quantum budget (0..1+). */
   load?: number;
@@ -259,6 +305,38 @@ export interface StatusMsg {
   jitterQ?: number;
   /** Callbacks that arrived later than 2 quanta since the last status. */
   late?: number;
+  /** Pre-clip peak of the master output since the last status. >1 means the
+   *  graph is driving into `clip()` and the "pop" is distortion. */
+  peak?: number;
+  /** Largest sample-to-sample step written to the master output since the last
+   *  status. A click IS a step discontinuity, and ordinary audio's slope is
+   *  bounded by its bandwidth (a full-scale 1 kHz sine steps 0.13 at 48 kHz),
+   *  so a `dMax` near 1 with `late: 0` and no xruns says the click is in the
+   *  audio the graph produced, not in the plumbing. See `IoManager.meterOut`. */
+  dMax?: number;
+  /** Samples actually clamped by `clip()`. Absent unless it happened. */
+  clip?: number;
+  /** Channel-quanta that contained a NaN/Infinity on the way out. Absent unless
+   *  it happened — its presence is the docs/10 NaN latch, observed rather than
+   *  inferred from "block X went silent". */
+  nonFinite?: number;
+  /**
+   * Deliberate splices, since the last status. Each is an audible discontinuity
+   * that moves NO other counter — the pump is on time and nothing runs dry
+   * while they happen — so all three are absent unless they occurred, and their
+   * presence in a log is the finding. See `IoManager.takeSplices`.
+   *
+   * `ringTrim`: capture surplus dropped by `Ring.capLatency`.
+   * `ringOver`: frames overwritten in a full ring by its producer.
+   * `asioSkip`: quanta whose write was skipped to drain the ASIO output queue.
+   */
+  ringTrim?: number;
+  ringOver?: number;
+  asioSkip?: number;
+  /** Which ring trimmed, and the arithmetic that made it: fill reached, frames
+   *  dropped, current setpoint, current delivery burst. Present with
+   *  `ringTrim`. `ring` is `in:<device>` or `out:<device>`. */
+  trimmed?: Array<{ ring: string; n: number; fill: number; drop: number; set: number; burst: number }>;
   /** Hardware MIDI is handled engine-side (renderer must not forward it). */
   midiDirect?: boolean;
   /** Estimated MIDI→DAC latency, ms: one quantum (sub-quantum note starts
@@ -282,9 +360,53 @@ export interface LatencyResultMsg {
   sampleRate?: number;
   error?: string;
 }
+/**
+ * One speaker's sweep capture, on its way to the renderer for analysis.
+ *
+ * **Sent in chunks, and that is not an optimisation.** `send` writes to stdout,
+ * which is *synchronous* on Windows for pipes as well as files (docs/06 — it is
+ * why the ASIO bridge uses a socket). A 300 kB write blocks the engine's event
+ * loop, and that loop is the audio pump: it would be a dropout of its own
+ * length, right next to a live ASIO stream whose watchdog is documented to kill
+ * the client over exactly this. So the capture goes out in `CAP_CHUNK`-sized
+ * pieces on a timer, one per tick, in the gap between speakers where there is
+ * nothing to hear anyway.
+ *
+ * Samples are int16 (`pcm` is base64 of little-endian int16) with a `scale`
+ * back to float. A room measurement's usable dynamic range is set by the
+ * microphone and the room's noise floor, both far above 16-bit quantisation,
+ * and it halves the bytes crossing the pipe.
+ */
+export interface SpeakerSweepMsg {
+  op: 'speaker-sweep';
+  /** Speaker this capture belongs to. */
+  id: string;
+  /** 0-based chunk index and the total, so the renderer can reassemble and
+   *  know when it is complete without depending on message ordering. */
+  chunk: number;
+  chunks: number;
+  /** Total samples in the whole capture (not this chunk). */
+  frames: number;
+  /** Multiply an int16 sample by this to get float. */
+  scale: number;
+  sampleRate: number;
+  pcm: string;
+}
+/** Progress / completion of a calibration run. One per speaker as it starts,
+ *  and one final `done`. Errors end the run. */
+export interface SpeakerCalMsg {
+  op: 'speaker-cal';
+  /** Speaker about to be measured, or '' on the final message. */
+  id?: string;
+  index?: number;
+  total?: number;
+  done?: boolean;
+  error?: string;
+}
 export type OutMsg =
   | DevicesMsg | LevelsMsg | ModsMsg | VisualsMsg
   | NeedAssetMsg | MidiSeenMsg | TapeCreatedMsg | StatusMsg | LatencyResultMsg
+  | SpeakerSweepMsg | SpeakerCalMsg
   | VstInfoMsg | VstEditsMsg | VstStateMsg | VstUiStateMsg;
 
 export const send = (m: OutMsg): void => {
