@@ -31,6 +31,7 @@ import { doc } from '../core/graph';
 import { DockTabHandle, registerDockTab } from './dockpanel';
 import { ResolvedRef, resolveRefAtPath } from './facepaint';
 import { faceItems } from './layout';
+import { buildTargetPicker } from './targetpicker';
 
 export interface AdvancedViewHandle {
   /** Point the editor at a (new) widget. Called on every selection change. */
@@ -105,6 +106,23 @@ function build(body: HTMLElement): DockTabHandle {
   label.className = 'dock-hint';
   bar.appendChild(label);
 
+  // On a canvas-less surface (phone / detached Dock) this is the ONLY way to
+  // choose what the deep editor edits — see targetpicker.ts.
+  const picker = buildTargetPicker(
+    (b, path) => {
+      for (const item of faceItems(b, doc.scene.theme)) {
+        if (item.ref === 'title' || item.ref.startsWith('text:') || item.ref.startsWith('image:')) continue;
+        const r = resolveRefAtPath(path, item.ref);
+        // Only blocks that actually have an editor registered — offering one
+        // that opens the placeholder is worse than not listing it.
+        if (r && isDeepCandidate(r) && advancedViewFor(r)) return `${b.name} · ${r.name}`;
+      }
+      return null;
+    },
+    () => update(),
+  );
+  if (picker) bar.appendChild(picker);
+
   const host = document.createElement('div');
   host.className = 'adv-host';
   body.append(bar, host);
@@ -134,6 +152,9 @@ function build(body: HTMLElement): DockTabHandle {
   host.appendChild(placeholder);
 
   const update = (): void => {
+    // Keep the picker in step: blocks can be added or removed, and the desktop
+    // can retarget under us.
+    (picker as (HTMLSelectElement & { refreshTargets(): void }) | null)?.refreshTargets();
     const cands = advancedCandidates();
     const withView = cands.find((c) => c.def);
     if (withView?.def) {

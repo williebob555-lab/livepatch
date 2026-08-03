@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>LivePatch Player</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <!--
+    The PLAYER: a baked scene, running, with only its Dock on screen.
+
+    Same skeleton as index.html and dock.html for the same reason — `dock.ts`,
+    `menus.ts` and every modal address these ids directly, so reproducing them
+    is what lets the Dock and its dialogs run here with no code change.
+
+    `body.dock-window` is reused rather than given a player-specific class:
+    the layout requirement is identical (collapse the topbar and workspace so
+    #dock-bottom fills the screen), and a second class would be a second thing
+    to keep in step with styles.css every time that layout changes.
+
+    Unlike dock.html this entry DOES drive audio — it is the only window there
+    is. See src/playerboot.ts.
+  -->
+  <body class="dock-window">
+    <div id="app">
+      <div id="topbar"></div>
+      <div id="workspace">
+        <div id="dock-left" class="dock-zone dock-v"></div>
+        <div id="center">
+          <div id="breadcrumb"></div>
+          <canvas id="canvas"></canvas>
+          <div id="statusbar"></div>
+        </div>
+        <div id="dock-right" class="dock-zone dock-v"></div>
+      </div>
+      <div id="dock-bottom" class="dock-zone dock-h"></div>
+      <div id="float-layer"></div>
+      <div id="menu-layer"></div>
+      <div id="modal-layer"></div>
+    </div>
+    <script type="module" src="/src/player.ts"></script>
+  </body>
+</html>

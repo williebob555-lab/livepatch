@@ -31,6 +31,16 @@
 html, body, #app { height: 100%; overflow: hidden; }
 body { background: var(--bg); color: var(--text); user-select: none; }
 
+/* Display cutouts and the gesture bar (Android, `viewport-fit=cover`).
+   Deliberately on `body`, OUTSIDE `#app` — `#app` carries the UI zoom, so an
+   inset applied inside it would be scaled by `--ui-scale` and stop matching the
+   hardware it is compensating for (docs/07-ui.md, the UI-scale trap).
+   `env()` is 0 everywhere else, so this costs desktop nothing. */
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  box-sizing: border-box;
+}
+
 /* Zoom scales layout, text and hit areas as one unit. Percentages inside a
    zoomed element already resolve in its zoomed space, so 100% is exactly one
    viewport — compensating for the zoom here would shrink the shell twice. */
@@ -86,6 +96,36 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 .dock-v { flex-direction: column; height: 100%; }
 .dock-h { flex-direction: row; width: 100%; }
 .dock-zone:empty { display: none; }
+/* Phone widths: drop the side zones entirely.
+   They are desktop furniture. On a 375 px screen the two of them take 114 px —
+   30% of the width — to show panels squeezed to ~55 px, which is narrower than
+   any of their contents can be read at, so it is a third of the screen spent on
+   two grey strips. `.dock-v .panel` sets `min-width: 0`, so nothing stops the
+   squeeze; the zones simply have no business being there at this size.
+   The Dock along the bottom is the control surface on a phone. Rotating to
+   landscape or running on a tablet brings the flanks back. */
+@media (max-width: 700px) {
+  #dock-left, #dock-right { display: none; }
+}
+
+/* ---- The detached Dock window (dock.html) ----
+   Same DOM skeleton as the main window so the panel manager, menus and modals
+   need no changes; this collapses everything that isn't the Dock.
+
+   #workspace goes away entirely, which takes the left/right zones, the
+   breadcrumb and the status bar with it. #canvas stays in the tree (hidden, so
+   0x0) because a real Renderer and Editor are still constructed on it — the
+   Clip, Advanced and Rig tabs call into both, and stubbing them would be a
+   second copy of widget painting, which golden rule 8 forbids. Renderer.resize
+   floors at 1x1, so a zero-size rect is harmless. */
+body.dock-window #workspace { display: none; }
+body.dock-window #dock-bottom { flex: 1 1 auto; height: auto; min-height: 0; }
+/* The Dock is the only panel here and it owns the window: no rounded float
+   look, no outer border doubling up with the window frame. */
+body.dock-window #dock-bottom > .panel { border: none; }
+/* Its own slim control strip (scale, fullscreen, reattach), built by
+   src/dockwindow.ts into the shared #topbar element. */
+body.dock-window #topbar { padding: 3px 6px; gap: 4px; }
 
 .panel {
   display: flex; flex-direction: column; background: var(--panel);
@@ -228,6 +268,17 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 }
 .lib-drag-ghost.over { border-color: var(--accent); color: var(--text); }
 
+/* A tile that has been held still long enough to lift for dragging. This is the
+   only feedback that the hold registered — before it, a press that has not yet
+   moved is indistinguishable from a press that did nothing, and the user has no
+   way to know the drag is armed and every direction is now available. */
+.lib-tile.lifting {
+  transform: scale(1.06);
+  border-color: var(--accent);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  transition: transform 90ms ease-out, box-shadow 90ms ease-out;
+}
+
 .lib-star {
   position: absolute; top: 2px; left: 2px; background: transparent; border: none;
   color: var(--text-dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 1px 3px; opacity: 0.5;
@@ -290,6 +341,15 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 .form-row button:hover, .form-actions button:hover { border-color: var(--accent); }
 .form-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .form-hint { color: var(--text-dim); font-size: 11px; margin: 4px 0; line-height: 1.4; }
+/* A consequence the user needs to read BEFORE committing (an export that cannot
+   carry its VST plugins, a calibration that will not travel). Deliberately not
+   `.form-hint` in a different colour: these are easy to skim past, and the
+   failures they describe surface much later and somewhere else. */
+.form-warn {
+  color: var(--text); font-size: 11px; line-height: 1.45; margin: 6px 0;
+  border-left: 3px solid var(--danger); background: var(--panel2);
+  border-radius: 0 4px 4px 0; padding: 6px 8px;
+}
 
 /* ---- Port / CV cards in Properties ---- */
 .port-card {
@@ -624,3 +684,15 @@ body { background: var(--bg); color: var(--text); user-select: none; }
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* Remote-surface connection indicator. Always visible on a canvas-less
+   surface: a dropped link and a broken rig look identical otherwise, because
+   every control still draws and silently does nothing. */
+.link-pill { font-variant-numeric: tabular-nums; }
+.link-pill.bad { color: var(--danger); border-color: var(--danger); }
+.link-diag {
+  position: fixed; left: 8px; right: 8px; top: 40px; z-index: 60;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font: 11px/1.5 ui-monospace, Consolas, monospace;
+  color: var(--text); white-space: pre-wrap; max-height: 45vh; overflow: auto;
+}

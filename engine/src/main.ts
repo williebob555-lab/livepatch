@@ -34,6 +34,9 @@ const services: Services = {
   pushAsioOut: (c, b, n) => io.pushAsioOut(c, b, n),
   hardwareChanged: () => scheduleReconfigure(),
   sendMidi: (device, data) => sendMidiOut(device, data),
+  // Injection is a blocking window-manager call, so it happens in the host
+  // process. This only posts a message (golden rule 1).
+  sendKey: (accel) => send({ op: 'send-key', accel }),
 };
 
 const graph = new GraphExec(services);
@@ -108,6 +111,9 @@ function handle(msg: InMsg): void {
       break;
     case 'watch-visuals':
       graph.watched = msg.nodes.slice(0, 32);
+      break;
+    case 'key-event':
+      graph.deliverKey(msg.accel, msg.down);
       break;
     case 'asset-ready':
       graph.assetReady(msg.id);

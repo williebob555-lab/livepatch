@@ -5,7 +5,7 @@
 // ============================================================================
 import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
-import { ParamSpec, getDef, paramSpec } from '../core/registry';
+import { ParamSpec, cvTriggerPorts, getDef, paramSpec } from '../core/registry';
 import { Block, FaceItem, ParamValue, Theme, Vec2, Wire } from '../core/types';
 import { parsePoints, samplePath } from '../core/trajectory';
 import { runtime } from '../engine/runtime';
@@ -1352,6 +1352,12 @@ export class Renderer {
 
     // ---- ports ----
     setFont(g, uiFont(theme.portLabelSize));
+    // Trigger inputs (clock / gate / trig / sync / reset) drive no knob, so
+    // there is no widget to put a CV marker on — the indicator goes on the
+    // PORT, which is the thing that actually fired. Memoized per block type,
+    // and the common case is an empty set, so a block with no triggers pays
+    // one map lookup for the whole loop.
+    const trigPorts = cvTriggerPorts(b.type);
     for (const port of b.ports) {
       const p = portPos(b, port);
       const col =
@@ -1386,6 +1392,28 @@ export class Renderer {
         g.beginPath();
         g.arc(p.x, p.y, theme.portRadius + 2.5, 0, Math.PI * 2);
         g.stroke();
+      }
+      // A wired trigger input glows with the level of the line feeding it: a
+      // clock pulses, a held gate stays lit, an idle line stays dark. Driven
+      // from the wire level both engines already publish rather than from a
+      // per-kernel edge counter — one rule, no kernel edits, and it cannot
+      // disagree with the cable's own colour because it is the same number.
+      if (trigPorts.size && port.dir === 'in' && trigPorts.has(port.id)) {
+        const wid = doc.wireIdAtPort(b.id, port.id);
+        const lvl = wid ? runtime.levelFor(wid) : null;
+        // Peak, not RMS: a trigger is a spike, and RMS over a window averages
+        // it away to nothing. Peak already decays on both engines, which is
+        // what makes the flash fade instead of switching.
+        const hot = lvl ? Math.min(1, Math.max(0, lvl.peak)) : 0;
+        if (hot > 0.02) {
+          g.globalAlpha = hot;
+          g.strokeStyle = theme.cvIndicatorColor;
+          g.lineWidth = 2;
+          g.beginPath();
+          g.arc(p.x, p.y, theme.portRadius + 3, 0, Math.PI * 2);
+          g.stroke();
+          g.globalAlpha = 1;
+        }
       }
       if (port.showLabel) {
         g.fillStyle = theme.portLabelColor;

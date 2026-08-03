@@ -1,6 +1,6 @@
 # 14 — Input Standard: Touch, Trackpad, Mouse and Pen
 
-_Last verified: 2026-08-01. Files: `src/ui/input.ts` (the implementation),
+_Last verified: 2026-08-03. Files: `src/ui/input.ts` (the implementation), `electron/keys.cjs`, `src/ui/keylearn.ts`,
 every `src/ui/*.ts` that owns a canvas or a drag handle, `src/styles.css`._
 
 > **This document is normative.** Any new interactive surface — a canvas, a deep
@@ -38,10 +38,11 @@ them.
 |---|---|
 | one finger on empty space | the surface's primary drag (marquee, scrub, pan — surface's choice) |
 | one finger on an object | move/operate that object |
+| one finger **held, then dragged** | drag an item out of a scrolling list (the Library) |
 | **two fingers** | **pan the view** — always, on every surface that has a view |
 | two fingers, spread past the deadzone | *additionally* zoom |
-| two-finger **tap** | context menu (touch's right-click over live widgets) |
-| one-finger **long-press** (500 ms) | context menu, off live widgets only |
+| two-finger **tap** | context menu (touch's right-click over widgets that own a held press) |
+| one-finger **long-press** (500 ms) | context menu — anywhere except a widget whose press *is* the interaction |
 
 ### Mouse and trackpad
 
@@ -255,6 +256,112 @@ Guard on the **drag** (`dragIsLive`), not on the event source, and include a
 ~250 ms tail because the synthesized event can arrive *after* the pointerup that
 ended the drag.
 
+### …and our own long-press timer needs the same guard, plus a live anchor
+
+Rule 9 was written for the *synthesized* menu and left the menu we open
+ourselves with two defects, found together on 2026-08-03. Both are easy to
+reintroduce, so both are written down.
+
+**1. The cancel-on-movement never ran.** `pointerdown` did this:
+
+```ts
+this.longPressAt = { x: e.clientX, y: e.clientY };
+this.clearLongPress();          // ← also nulls longPressAt
+this.longPressTimer = setTimeout(…);
+```
+
+`clearLongPress()` clears the anchor as well as the timer, so the anchor was
+null for the entire press — and `pointermove` cancels on
+`if (this.longPressAt && travel > SLOP)`, which can never be true. **No amount
+of movement stopped the menu.** 500 ms after any touch-down on the canvas the
+menu opened and `abortDrag()` discarded whatever was being drawn. Only block
+drags survived, through their own separate `moved` check.
+
+The symptom is not "long-press is slightly too eager", it is *"it pulls up the
+right-click menu whenever you are holding and moving"*, and the workaround users
+find is to draw every wire and every marquee fast enough to finish inside
+500 ms — precision made impossible by a guard that was supposed to protect it.
+**Clear stale state before recording the new press, never after.**
+
+**2. One distance cannot answer two questions.** `LONGPRESS_SLOP` (10 px) is the
+budget for a fingertip *rolling while it holds still*, so it must be generous.
+"Has a drag begun" is a different question with a much smaller answer, so there
+is now `LONGPRESS_NUDGE` (3 px). Between the two, the press stays a live drag
+*and* stops being a candidate for the menu — the gap the old code fell through,
+because it only checked `d.kind === 'blocks' && d.moved` and neither `marquee`
+nor `wireEnd` carries a `moved` flag. Those are the two most common touch
+gestures on the workspace.
+
+Verified 2026-08-03 by driving synthetic touch pointers: a 200 px marquee over
+2 s, a 40 px wire drag over 1.5 s and a 20 px drag over 2 s all keep their drag
+and open no menu; a motionless hold and a 10 px crawl over 3 s still open one.
+
+**3. `moved` is not a distance, and must never gate a hold.** Fixing (1) and (2)
+turned the complaint inside out: the menu stopped appearing when it *was* wanted,
+on blocks and on widgets — two different causes with the same symptom.
+
+*On blocks*, the timer still OR-ed in the old `d.kind === 'blocks' && d.moved`
+test. `moved` is set by the **first `pointermove` of a block drag at any
+distance**, because its real job is "is there something to commit or revert on
+release", where sub-pixel still counts. A resting finger emits `pointermove`
+constantly, so over a block the flag was true within milliseconds and the guard
+returned every time — the menu could not open on a block at all. Empty canvas
+kept working only because a marquee has no `moved` flag and so was judged by the
+3 px nudge, which is the correct test and is now the only one. Measured in the
+running app: after a **zero-pixel** `pointermove` on a block, `d.moved === true`
+while `longPressNudged === false`. Judge a hold by distance travelled, never by
+"did an event arrive".
+
+*On widgets*, the suppression was "any face item that is not the title", which is
+too wide by exactly the widgets faces are built out of. A knob, fader or hfader
+is a **relative** drag: pressing one changes nothing until the finger moves, and
+a finger that moves has already cancelled the long-press at the nudge. Yet under
+that rule a knob-covered block could never reach its own menu — and on a
+touchscreen the menu is the only route to delete, duplicate or open Advanced.
+Suppress only where the press *is* the interaction (`HOLD_WIDGETS` in
+`editor.ts`): `keys` sounds while held, `button` is momentary, `select` opens a
+modal, and `toggle`/`xy`/`wavedraw`/`seqgrid`/`sampleview` commit at the point
+touched before anyone knows it is a hold. Same for the three visuals that act on
+press (`eq`, `matrix`, `speakers`); an inert visual is holdable. Two-finger tap
+stays the escape hatch for the rest.
+
+Verified 2026-08-03 in the running renderer with synthetic touch pointers: hold
+on empty canvas, on a block title, on a block title with 1 px of jitter, and on a
+knob all open the menu; a 20 px drag over 700 ms from any of those opens none;
+a hold on a `select` opens none.
+
+## Rule 10 — In a scrolling list, hold-to-lift is what frees the other axis
+
+A list that scrolls vertically cannot also read a vertical drag as "drag this
+item out" — the two are the same gesture for their first several pixels.
+
+The Library first resolved this by **direction**: a drag whose first movement
+was more horizontal than vertical was a drag-out, anything else was handed back
+to the scroller. That makes the most natural gesture there is — straight down
+onto the canvas — impossible, and it decides on the first few px, so an arc that
+merely *starts* vertical is discarded no matter where it ends up. What was left
+was double-tap-to-centre, which is not drag-and-drop and cannot say *where*.
+
+**Hold still for ~300 ms, and the item lifts; from then on it drags in every
+direction.** Holding still is the one signal a scroll can never send, which is
+why every mobile OS uses it to pull an icon out of a list. Keep an immediate
+direction-based path as a fast option where one is unambiguous (sideways, in the
+Library), but never as the only path.
+
+Three things this depends on:
+
+- **The lift needs visible feedback** (`.lib-tile.lifting`). Before anything has
+  moved, a lift is indistinguishable from a press that did nothing.
+- **Refuse the scroll in `touchmove`, not `pointermove`.** `preventDefault` on a
+  pointer event does not stop scrolling in Chromium — pointer events are a
+  reporting layer over the touch stream that actually drives the scroll. This
+  works *because* lifting requires stillness: with no movement yet the
+  compositor has not committed to a scroll, so the first real `touchmove` is
+  still cancelable. A lift granted after motion could not make that promise.
+- **A lifted item that has not moved is not a drag**, so it must not suppress
+  the context menu — same principle as Rule 9 in reverse. Keep holding without
+  moving and the menu still arrives.
+
 ---
 
 ## Checklist for a new interactive surface
@@ -272,8 +379,14 @@ actually shipped.
       `deltaX` is not ignored.
 - [ ] Every value wheel has a touch equivalent.
 - [ ] Hit tolerances go through `grabSlop()`.
-- [ ] Long-press context menu, suppressed over live widgets; two-finger tap as
-      the escape hatch there.
+- [ ] Long-press context menu, suppressed **only** over widgets whose press is
+      itself the interaction (`HOLD_WIDGETS`); two-finger tap as the escape
+      hatch there. A hold on a knob or fader DOES open it.
+- [ ] The long-press anchor is recorded **after** any `clearLongPress()`, and a
+      slow drag that stays inside `LONGPRESS_SLOP` does **not** get a menu
+      (Rule 9). Test by dragging deliberately slowly, not quickly.
+- [ ] A motionless hold **on a block** opens the menu. Nothing that is merely
+      "an event arrived" (`d.moved`) may veto a hold — distance only.
 - [ ] No `movementX`/`movementY`.
 - [ ] Tested at UI scale 1.0 **and** ≠ 1.0 — see the UI-scale rule in
       [`07-ui.md`](07-ui.md).
@@ -292,7 +405,7 @@ actually shipped.
 | EQ Curve editor (`adveq.ts`) | drag band freq/gain | vertical = Q | Q (value wheel) |
 | Trajectory editor (`advpath.ts`) | place/drag waypoints | vertical = height | height (value wheel) |
 | Shape editor (`shapeeditor.ts`) | draw / drag vertices | — (fixed frame) | — |
-| Library tiles (`panels.ts`) | tap / sideways drag-out | native scroll | native scroll |
+| Library tiles (`panels.ts`) | sideways drag-out, or hold-to-lift then drag any direction | native scroll | native scroll |
 | Dock splitters & headers (`dock.ts`) | drag | — | — |
 
 ## Known gaps
@@ -308,3 +421,75 @@ Written down rather than left to be rediscovered:
 - **Rotation** is not a gesture we use. If a surface ever wants it, it belongs in
   `TwoPointerGesture` beside the zoom, with its own deadzone for the same reason
   zoom has one.
+
+---
+
+## The keyboard blocks (`key-in`, `key-out`)
+
+Two blocks that cross the boundary out of this app: one listens for a keystroke
+anywhere on the machine, one presses a key anywhere on the machine. They are
+how a patch drives — and is driven by — a DAW transport, OBS scenes, a media
+player, a lighting desk.
+
+**Neither goes near the audio thread.** `SendInput` and `globalShortcut` are
+both blocking window-manager calls; in an audio callback either is a dropout
+every single time (golden rule 1). So:
+
+```
+key-in    host registers hotkey → 'key-event' → GraphExec.deliverKey → kernel sets a number
+key-out   kernel edge-detects → sv.sendKey → 'send-key' → main process injects
+```
+
+`Services.sendKey` is the exact parallel of `Services.sendMidi`, for the same
+reason.
+
+### Listening: `globalShortcut`, not a low-level hook
+
+A deliberate trade, and the security half is the important part:
+
+- it works while LivePatch is unfocused, which is the whole requirement
+- it observes **only the accelerators we register**. A `WH_KEYBOARD_LL` hook
+  sees every keystroke on the machine, including passwords typed into other
+  applications. This app has no business being able to do that, and "we only
+  look at the ones we want" is not a property a reviewer can check.
+- but a registered accelerator is **consumed** — the app that would normally
+  receive it does not. Bind `key-in` to something with modifiers, not a bare
+  letter.
+
+`globalShortcut` reports a *press*, not a state, so there is no key-up. A press
+is delivered as down + up `GATE_MS` later; that is what makes Gate mode read as
+a short press instead of latching on forever.
+
+### Sending: one long-lived PowerShell host
+
+`SendInput` via P/Invoke, in a persistent process. Spawning a shell per
+keystroke costs hundreds of milliseconds; a persistent one costs about a
+millisecond and needs no C++ toolchain on the user's machine. `SendKeys` was
+rejected outright — it cannot express media keys, which are the main thing
+anyone wants this for.
+
+`key-out` has a `minGap` (default 150 ms) with hysteresis on the gate. This is
+a **safety limit, not a preference**: a CV gate can chatter around its
+threshold, and without a floor the block fires hundreds of keystrokes a second
+into whatever window has focus. That is not a glitch, it is the user losing
+control of their computer.
+
+`runtime.syncWatchedKeys` registers from the **compiled** graph, so a `key-in`
+inside a subpatch or a custom block counts — only the compile sees those. The
+press is delivered straight to the engine, never through the renderer, so it
+keeps working with the window minimised.
+
+### Check
+
+```
+LIVEPATCH_KEYS_SMOKE=1 npx electron .
+```
+
+Closes the loop: registers an accelerator, injects that same keystroke through
+the injector, and asserts the registration fired. F13 is the test key — it
+exists in Windows, no physical keyboard has it, and nothing binds it, so
+injecting it cannot disturb the machine.
+
+Verified 2026-08-01: 7/7, including `fired=1` for an injected keystroke and a
+clean unregister (a stale global registration swallows that shortcut for every
+other app until reboot).

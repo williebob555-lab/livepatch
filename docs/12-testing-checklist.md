@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-08-01._
+_Last verified: 2026-08-02._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -17,6 +17,17 @@ here and now doesn't, that's the bug.
 
 - [ ] Parity: `registerUnit` list == `registerKernel` list (the grep in
       [`08-extending.md`](08-extending.md)). Must be empty diff.
+- [ ] `node scripts/cv-indicator-test.mjs` passes. Mandatory whenever a port
+      list changes: every `role: 'cv'` **input** must declare `cvParam` (+ a
+      `cvLaw` matching the kernel), `cvTrigger`, or `cvSignal`.
+- [ ] **Patch the CV input and watch the widget it names.** The marker appears
+      when the cable goes in and disappears when it comes out — on **both**
+      engines, and web first because it is the default. This is the check that
+      six blocks silently failed: they compiled, sounded right, and drew
+      nothing. Passing the test above only proves the port was *declared*; only
+      this proves the declaration points at the right knob and the law moves it
+      the right way.
+- [ ] A trigger input (clock/gate/trig/sync/reset) flashes its **port** when fed.
 - [ ] **It is in the Library without searching for it.** Open its category chip
       *and* the `All` tab and find the tile. Search finding it proves nothing —
       a block missing from its own category tab is still registered, still
@@ -280,18 +291,30 @@ interface:
 Test on a real touchscreen — synthesized pointer events don't reproduce the
 OS-level gestures that cause most of these.
 
-- [ ] **Library drag-out by touch.** Press a tile and drag *sideways* onto the
-      canvas: a ghost chip follows the finger, highlights over the workspace,
-      and drops a block. HTML5 DnD is mouse-only, so this is a separate code
-      path (`beginTouchDrag`) and mouse drag must keep working too.
-- [ ] **Library scrolls by touch.** A predominantly *vertical* drag on a tile
-      scrolls the list and does NOT drag a block out.
-- [ ] **Slow block drags don't summon a menu.** Drag a block slowly and
-      precisely by touch, and again with a precision touchpad. No context menu,
-      and the block must not snap back to where it started. Both the OS and our
-      own long-press timer can cause this — see docs/07.
-- [ ] **Long-press still works.** Press and *hold* without moving: the context
-      menu opens as before. The fix above must not have killed the feature.
+- [ ] **Library drag-out by touch, sideways.** Press a tile and drag *sideways*
+      onto the canvas: a ghost chip follows the finger, highlights over the
+      workspace, and drops a block. HTML5 DnD is mouse-only, so this is a
+      separate code path (`beginTouchDrag`) and mouse drag must keep working too.
+- [ ] **Library drag-out by touch, straight DOWN.** Press a tile, *hold ~300 ms
+      until it lifts*, then drag straight down (and again straight up) onto the
+      canvas. Both must drop a block. This is the axis the scroller owns, and it
+      is only free because the hold came first — see Rule 10 in 14-input.md.
+- [ ] **Library scrolls by touch.** A predominantly *vertical* drag on a tile,
+      started *without* waiting for the lift, scrolls the list and does NOT drag
+      a block out. Run this one right after the test above: they are the same
+      gesture and only the hold separates them.
+- [ ] **A lifted tile still gives its context menu.** Hold a tile past the lift
+      and keep holding *without moving*: the tile menu (Pin / Rename / Delete)
+      must still open. Lifting arms a drag; it does not consume the press.
+- [ ] **Slow drags don't summon a menu — wires and marquees, not just blocks.**
+      By touch, draw a wire between two ports as slowly and precisely as you
+      can, and drag out a selection marquee the same way. No context menu, and
+      neither gesture may be discarded. Then repeat with a precision touchpad.
+      Test *slowly*: this whole class of bug is invisible at speed, and drawing
+      fast was the workaround users found instead of reporting it.
+- [ ] **Long-press still works.** Press and *hold* without moving on empty
+      canvas: the context menu opens as before. The fixes above must not have
+      killed the feature — check this on the same surfaces you just tested.
 - [ ] Ports, wire ends, roll notes, note stretch handles and rig speakers are
       all grabbable with a finger (tolerances widen ~2.6× for touch/pen).
       Verify mouse precision is *unchanged*.
@@ -562,6 +585,71 @@ dropout, start audio, and then:
       `Space` held, and a stale entry in `editor.pointers` (press read as a
       second finger). See docs/07-ui.md.
 
+## Detaching the Dock (`dock.html`, `src/dockwindow.ts`, `src/ui/docklink.ts`)
+
+Two automated harnesses cover this, because the interesting half is invisible
+from a browser — `window.livepatchNative` is absent there, so the detach button
+does not even render and none of the sync can run.
+
+```bash
+LIVEPATCH_DOCKWIN_SMOKE=1 npx electron . --user-data-dir=/tmp/lp-smoke
+```
+
+14 checks: both windows load, the dock window collapses its workspace, it runs
+**no `AudioContext`** and uses the `RemoteEngine`, the scene replicates, a
+structural edit reaches it, a param write returns, audio state propagates, and
+closing it re-attaches. Exits non-zero on any failure. **Always pass
+`--user-data-dir`** — the single-instance lock is per profile, so it otherwise
+refuses to start next to a running LivePatch, and a test has no business
+touching real scenes.
+
+```bash
+LIVEPATCH_DOCKWIN_PERF=1 npx electron . --user-data-dir=/tmp/lp-perf
+```
+
+Prices the mirrored Dock (118 widgets over a 67-block patch). Re-run before
+changing the mirror default; the numbers are in
+[`07-ui.md`](07-ui.md).
+
+- [ ] Both harnesses pass after any change to `docklink.ts`, `docktransport.ts`,
+      `dockwindow.ts` or the `dockwin:*` IPC.
+- [ ] **The dock window still creates no `AudioContext`.** This is the one that
+      matters: it is by construction the unfocused window, and an engine there
+      is [`10-performance.md`](10-performance.md) rule 8 in its worst form.
+- [ ] Detach, then edit in **both** windows — the replica converges and neither
+      window echoes an edit back into a loop.
+- [ ] Detach with a **second monitor unplugged since last run**: the window
+      opens somewhere reachable rather than at its saved off-screen position.
+- [ ] Go fullscreen, close from fullscreen, reopen — it comes back at its
+      normal size, not the screen size (`getNormalBounds`).
+- [ ] Set a different UI scale in each window; neither overwrites the other,
+      and the main window's panel layout survives (per-window storage keys).
+- [ ] Codec round-trip if `docktransport.ts` changed: a `Float32Array` after an
+      odd-length `Uint8Array` (the alignment hazard) survives JSON.
+
+### The LAN control surface — run the attack suite
+
+```bash
+node scripts/lanserver-security-test.cjs
+```
+
+28 cases on plain node, no Electron, so there is no excuse not to run it. Auth,
+cross-origin/DNS-rebinding, six path-traversal encodings, source-map exposure,
+frame-size and fragment-bomb DoS, connection limits, message validation, and
+that stopping actually tears down established sockets.
+
+- [ ] Passes after ANY change to `electron/lanserver.cjs`.
+- [ ] **The server is still off after a restart.** Not persisting the "on"
+      state is the feature, not an omission.
+- [ ] `main.cjs` still catches in the `dockwin:send` relay. A throw there runs
+      once per value frame and becomes an error dialog that respawns faster
+      than it can be dismissed — the app becomes unclosable. `node --check`
+      does not catch undefined references; this is the reference check:
+
+```bash
+node -e "const s=require('fs').readFileSync('electron/main.cjs','utf8'),m=require('./electron/lanserver.cjs');const u=[...new Set([...s.matchAll(/\blan\.(\w+)/g)].map(x=>x[1]))];const b=u.filter(x=>typeof m[x]!=='function');console.log(b.length?'MISSING: '+b:'all resolve');process.exit(b.length?1:0)"
+```
+
 ## The Dock (`src/ui/dockpanel.ts`, `clipview.ts`, `widgetdock.ts`)
 
 - [ ] Rail order is Clip → Widgets → Advanced, and the selected tab survives a
@@ -592,6 +680,21 @@ dropout, start audio, and then:
 - [ ] Delete the source block → its clones vanish. **Undo → they come back.**
 - [ ] Arrange mode: move/resize/multi-select, snap guides appear only for snaps
       that applied, geometry survives save/reload.
+- [ ] **Every widget docks on its own**, visuals included: right-click a
+      Matrix's grid, an EQ curve, a scope, a meter and a Speaker Monitor and
+      confirm each offers **Add to Dock**. Docking used to be offered only for
+      param widgets, so a visual could reach the Dock only via "Dock all
+      controls on this block".
+- [ ] **Docked visuals are operable, not just painted.** In the Dock: a Matrix
+      cell toggles on click (shift = half-open), an EQ band handle drags
+      (shift = Q), a Speaker Monitor bar mutes on click and solos on
+      shift-click. All three were inert behind one `if (!spec) return false`,
+      and only the Matrix got reported — check all three or the other two
+      regress silently.
+- [ ] Repeat the line above with the Dock **detached to its own window**, and
+      with the source block inside a **subgraph**. That combination is what
+      catches a write using the canvas's path-relative node id instead of the
+      absolute one — it works perfectly in a flat patch.
 
 ### Advanced tab
 
@@ -1303,39 +1406,40 @@ makes the whole voice wrong in a way that reads as some *other* block's fault:
   reset written as an inline arrow function is a closure allocated once per
   quantum — ~370 a second per block, in four of the seven kernels.
 
-## Sequential-logic probe — the Rule 110 preset (reusable)
+## Sequential-logic probe — the Calculator preset (reusable)
 
 ```
-npm run build:engine && node scripts/rule110-machine-test.mjs
+npm run build:engine && node scripts/calculator-machine-test.mjs
 ```
 
-Builds the "Rule 110 Automaton" preset, compiles it, runs the **real
-`GraphExec`** over it and compares the sixteen state bits against an
-independent Rule 110 simulation written from the truth table. It is the only
-end-to-end test of a *large synchronous graph* — 185 nodes, 173 nets, a
-feedback ring the executor has to break cycles in, and a clock fanned out to
-forty registers. Everything else in `scripts/` drives one kernel at a time.
+Builds "The Calculator" preset, compiles it, runs the **real `GraphExec`**
+over it, sets the A switches, lets the B counter run, and checks the Sum/Carry
+lamps against plain arithmetic (`A + B`, mod 16, with the correct overflow
+bit) at every step. It is the end-to-end test of a *synchronous logic graph*
+built the same way the retired Rule 110 preset was (master–slave S+H
+registers, a T-flip-flop counter with a carry chain) — kept because a wrong
+adder is exactly the kind of bug that would otherwise only show up as "the
+lamps look off" to a human.
 
 What it establishes, and the numbers worth knowing:
 
-- All 48 generations match the reference exactly, from a cold all-zero boot
-  (which also proves the 15-gate NOR watchdog and the seed path — without them
-  nothing ever happens).
-- The 4-bit carry chain counts 0..15 and wraps, on the same clock.
+- Cold boot: every register reads 0, so the counter starts clean with no reset
+  needed.
+- The 4-bit counter counts 0..15 and wraps, and the adder's Sum/Carry lamps
+  match `A + B` at every state observed (tens of transitions, not just one).
 - `RUN` is a clock **enable**: the machine freezes between states and resumes.
-- **Cost: ~10% of the audio budget at 128 frames / 48 kHz** for the whole
-  machine. Useful as a rough ceiling for "how big can a patch get".
-- **Clocked graphs need a clock period of many quanta.** Verified exact at 4,
-  20 and 50 Hz. The floor is *reported, not asserted* — past it the readback
-  merges generations, so the probe stops being separable from what it probes.
+  Param changes ramp smoothly (anti-click), so a test that flips `RUN` has to
+  let it settle before treating the state as "held" — capturing it too early
+  reads a stale value mid-ramp and looks like a bug that isn't one.
+- **Cost: ~3% of the audio budget at 128 frames / 48 kHz.**
 
-> **Two things this test corrected that had been assumed.** The preset's
-> registers are master–slave (two S+Hs, the second on the inverted clock), and
-> the original rationale was "single-stage would ripple round the ring and be
-> silently wrong". Rebuilding it with the gates reading the master stage
-> computes Rule 110 **exactly** — the executor's cycle break already covers it.
-> And the counter appeared broken until it turned out two blocks were both
-> named `C1`. Anything that resolves a block by name should reject duplicates.
+Replaces `rule110-machine-test.mjs`, which tested the "Rule 110 Automaton"
+preset (retired in the 0.1.5 factory-scene rework in favour of a machine that
+is legibly a computer — an adder you set switches on and read an answer back
+from — rather than a cellular automaton whose state happens to be sonified).
+The master–slave-register and clock-rate-floor findings from that test still
+hold for any clocked graph built this way; see the git history for the
+original writeup if you need the Rule 110 specifics.
 
 ## Factory content probe (reusable)
 
@@ -1458,3 +1562,42 @@ live click.
    just crashes. `0xC0000409` right after an `ASIO:` line was a stale WASAPI
    callback running against the new master's channel count (fixed 2026-07-30;
    both pumps now bail if they are not the current master).
+
+## Worklet parity and the system-audio path — REMOVED 2026-08-02
+
+Both suites went with the code they tested: the AudioWorklet engine
+(`scripts/worklet-parity.mjs`, `worklet-*.html`) and system-audio capture. See
+`docs/04-web-engine.md` and `docs/11-packaging.md` for what was learned and why
+neither should be rebuilt without reading it first.
+
+Two habits from those suites are worth keeping for anything that replaces them:
+
+- **A parity suite that compares two silences passes perfectly and proves
+  nothing.** Assert a non-trivial peak, not just equality.
+- **Serve worklet harnesses from a plain static server**, never the Vite dev
+  server: Vite caches its transform by path and ignores the query, so a rebuilt
+  bundle is still served as the old one — which looks exactly like new code
+  silently doing nothing.
+
+## The built APK
+
+```
+npm run test:apk       # asserts on the archive, not the sources
+npm run test:signing   # why assembleRelease will not sign (never prints a password)
+```
+
+### The feed must be clocked by the audio thread, not by `setInterval`
+
+Kept because it applies to **any** real-time audio harness, and it cost two
+debugging rounds before it was understood.
+
+A removed harness drove its injected PCM from a 20 ms `setInterval`. A
+**background tab** has its timers clamped to about 1 Hz, and pages run
+backgrounded under automation — so the feed delivered ~3 chunks instead of
+~150, the buffer never reached its priming target, and every assertion failed
+with a different misleading message: silence, 0 Hz, "never served". The code
+under test was fine both times.
+
+The fix was to feed one chunk per message from the output tap, which arrives on
+the audio thread's schedule and is throttled by nothing. Clock any such harness
+off something the audio thread drives, never off a timer.

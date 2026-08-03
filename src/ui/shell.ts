@@ -17,10 +17,14 @@ import { runtime } from '../engine/runtime';
 import type { LatencyResult } from '../engine/native';
 import { EngineName, prefs, resetPrefs, setPrefs } from '../core/prefs';
 import { dock } from './dock';
+import { doExportPlayer } from './exportplayer';
+import { drawQr, encodeQr } from './qr';
+import { markDockOpen, mirrorDock, setMirrorDock } from './docklink';
 import { Editor } from './editor';
 import { manageImages } from './imagepicker';
 import { MenuItem, buildModal, confirmModal, promptModal, showContextMenu } from './menus';
 import { checkForUpdatesFlow, checkForUpdatesQuietly } from './updates';
+import { installAndroidUpdateBridge, isAndroidApp } from './androidupdate';
 import { setEqDisplayRate } from './widgets';
 
 let ed: Editor;
@@ -251,38 +255,53 @@ function optionsMenu(): void {
     ['native', 'Native engine (ASIO / WASAPI)'],
     ['native-stub', 'Protocol stub (no audio)'],
   ];
+  // Android runs one engine and has no ASIO, so the device pickers and the
+  // engine chooser below are not "advanced options" there — they are settings
+  // that cannot do anything, which is worse than absent. The APK should read as
+  // its own app rather than the desktop build with dead controls in it.
+  const desktop = !isAndroidApp();
   showContextMenu(optionsAt.x, optionsAt.y, [
     { label: 'Default devices', disabled: true },
     deviceMenu('Audio in', 'audio-in', p.deviceIn, (v) => setPrefs({ deviceIn: v })),
     deviceMenu('Audio out', 'audio-out', p.deviceOut, (v) => setPrefs({ deviceOut: v })),
-    deviceMenu('ASIO in', 'asio-in', p.asioIn, (v) => setPrefs({ asioIn: v })),
-    deviceMenu('ASIO out', 'asio-out', p.asioOut, (v) => setPrefs({ asioOut: v })),
+    ...(desktop
+      ? [
+          deviceMenu('ASIO in', 'asio-in', p.asioIn, (v) => setPrefs({ asioIn: v })),
+          deviceMenu('ASIO out', 'asio-out', p.asioOut, (v) => setPrefs({ asioOut: v })),
+        ]
+      : []),
     { sep: true },
     { label: 'Startup', disabled: true },
-    {
-      label: `Default engine: ${ENGINES.find(([n]) => n === p.engine)?.[1] ?? p.engine} ▸`,
-      action: () =>
-        showContextMenu(
-          optionsAt.x,
-          optionsAt.y,
-          ENGINES.map(([name, title]) => ({
-            label: (name === p.engine ? '✓ ' : '    ') + title,
-            // Applying it now as well as saving it: a "default engine" that
-            // needs a restart to be believed is a setting nobody trusts.
-            action: () => {
-              setPrefs({ engine: name });
-              setEngine(name);
-            },
-          })),
-        ),
-    },
+    ...(desktop
+      ? [
+          {
+            label: `Default engine: ${ENGINES.find(([n]) => n === p.engine)?.[1] ?? p.engine} ▸`,
+            action: () =>
+              showContextMenu(
+                optionsAt.x,
+                optionsAt.y,
+                ENGINES.map(([name, title]) => ({
+                  label: (name === p.engine ? '✓ ' : '    ') + title,
+                  // Applying it now as well as saving it: a "default engine"
+                  // that needs a restart to be believed is a setting nobody
+                  // trusts.
+                  action: () => {
+                    setPrefs({ engine: name });
+                    setEngine(name);
+                  },
+                })),
+              ),
+          },
+        ]
+      : []),
     {
       label: (p.audioOnStart ? '✓ ' : '    ') + 'Start audio automatically',
       action: () => setPrefs({ audioOnStart: !p.audioOnStart }),
     },
     { sep: true },
     { label: 'Image library…', action: () => manageImages() },
-    { label: 'Native engine settings…', action: () => void nativeSettingsFlow() },
+    // Configures an engine that cannot exist on Android — see the Engine menu.
+    ...(isAndroidApp() ? [] : [{ label: 'Native engine settings…', action: () => void nativeSettingsFlow() }]),
     { sep: true },
     { label: 'Check for updates…', action: () => void checkForUpdatesFlow() },
     { sep: true },
@@ -325,14 +344,22 @@ async function nativeSettingsFlow(): Promise<void> {
 function setEngine(name: EngineName): void {
   runtime.useEngine(name);
   if (engineBtn)
-    engineBtn.textContent = 'Engine: ' + (name === 'webaudio' ? 'web' : name === 'native' ? 'native' : 'stub');
+    engineBtn.textContent =
+      'Engine: ' +
+      (name === 'webaudio' ? 'web' : name === 'native' ? 'native' : 'stub');
 }
 
 /** Apply the startup preferences. Called once, after the session is restored —
  *  starting audio before the scene exists would build the empty graph. */
 export async function applyStartupPrefs(): Promise<void> {
   const p = prefs();
-  if (p.engine !== 'webaudio') setEngine(p.engine);
+  // A `native` preference saved on the desktop follows the scene to a phone,
+  // where that engine cannot exist — the app then boots to "requires the
+  // desktop app" and silence, with the fix hidden two menus away. Substituted
+  // rather than reset, so the desktop keeps its choice.
+  const want: EngineName =
+    isAndroidApp() && (p.engine === 'native' || p.engine === 'native-stub') ? 'webaudio' : p.engine;
+  if (want !== 'webaudio') setEngine(want);
   if (p.audioOnStart) {
     await runtime.setAudio(true);
     if (audioBtn) {
@@ -340,6 +367,11 @@ export async function applyStartupPrefs(): Promise<void> {
       audioBtn.classList.add('active');
     }
   }
+  // Inside the APK there is no Electron bridge, so this publishes an Android
+  // one with the same four members — after which the Options ▸ Check for
+  // updates item and the quiet check below work here unchanged. No-op
+  // everywhere else.
+  installAndroidUpdateBridge();
   // Deliberately last and unawaited: a slow or unreachable update feed must
   // never delay audio coming up. Silent unless there is an update.
   setTimeout(() => void checkForUpdatesQuietly(), 3000);
@@ -384,6 +416,8 @@ export function initShell(editor: Editor): void {
         { sep: true },
         { label: 'Import from file…', action: () => void doImport() },
         { label: 'Export to file…', action: () => void doExport() },
+        { sep: true },
+        { label: 'Export as Player…', action: () => void doExportPlayer() },
       ]);
     }),
   );
@@ -444,13 +478,26 @@ export function initShell(editor: Editor): void {
 
   engineBtn = tbButton('Engine: web', 'Switch processing engine', (b) => {
     const r = b.getBoundingClientRect();
+    // The native engine is a separate `node.exe` process that Electron starts.
+    // On Android it cannot exist — `audify` is not there and there is no
+    // process to spawn — so offering it is offering a dead end: the status bar
+    // says "requires the desktop app" and the app makes no sound until you
+    // find your way back. Same for the two flows that only talk to it.
+    // Removed rather than disabled, because a greyed row invites a second try.
+    const desktopOnly = !isAndroidApp();
     showContextMenu(r.left, r.bottom + 2, [
       { label: 'Web Audio (in-app, WASAPI shared)', action: () => setEngine('webaudio') },
-      { label: 'Native engine (hardware ASIO / WASAPI, dedicated process)', action: () => setEngine('native') },
-      { label: 'Protocol stub (logs messages, no audio)', action: () => setEngine('native-stub') },
-      { sep: true },
-      { label: 'Measure round-trip latency…', action: () => void measureLatencyFlow() },
-      { label: 'Native engine settings…', action: () => void nativeSettingsFlow() },
+      ...(desktopOnly
+        ? [{ label: 'Native engine (hardware ASIO / WASAPI, dedicated process)', action: () => setEngine('native') }]
+        : []),
+      ...(desktopOnly
+        ? [
+            { label: 'Protocol stub (logs messages, no audio)', action: () => setEngine('native-stub') },
+            { sep: true },
+            { label: 'Measure round-trip latency…', action: () => void measureLatencyFlow() },
+            { label: 'Native engine settings…', action: () => void nativeSettingsFlow() },
+          ]
+        : []),
       { sep: true },
       // The persistent counterpart of the choice above — one click from where
       // the choice is actually made.
@@ -460,7 +507,12 @@ export function initShell(editor: Editor): void {
       },
     ]);
   });
-  bar.appendChild(engineBtn);
+  // Android has exactly one engine, so the picker there is a button that opens
+  // a menu offering the thing already selected. Hidden rather than shown with a
+  // single row: the APK should read as its own app, not as the desktop build
+  // with the Windows-only choices sawn off. The button is still CREATED, so the
+  // label update in `setEngine` needs no null dance.
+  if (!isAndroidApp()) bar.appendChild(engineBtn);
 
   const spacer = document.createElement('div');
   spacer.className = 'tb-spacer';
@@ -487,6 +539,169 @@ export function initShell(editor: Editor): void {
     };
     b.dataset.panel = id;
     bar.appendChild(b);
+  }
+
+  // ---------- detach the Dock to its own window ----------
+  //
+  // Sits next to the Dock toggle because it is the same panel, on a different
+  // display. Only offered when the native bridge is present: in a plain
+  // browser there is no second window to open.
+  {
+    const n = (window as any).livepatchNative;
+    if (n?.dockwinOpen) {
+      const b = tbButton('⧉', 'Move the Dock to its own window (second display / touchscreen)', () => {
+        void (async () => {
+          const open = await n.dockwinIsOpen();
+          if (open) {
+            await n.dockwinClose();
+            markDockOpen(false);
+          } else {
+            await n.dockwinOpen();
+            markDockOpen(true);
+          }
+          b.classList.toggle('active', !open);
+        })();
+      });
+      b.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showContextMenu(e.clientX, e.clientY, [
+          {
+            // Off by default because two painting surfaces share one rAF
+            // budget in the process holding the audio deadline — though it
+            // measured free, see docs/07-ui.md.
+            label: (mirrorDock() ? '✓ ' : '') + 'Keep a mirrored Dock in this window',
+            action: () => {
+              setMirrorDock(!mirrorDock());
+              // Apply immediately if the window is already detached.
+              void (async () => {
+                if (await n.dockwinIsOpen()) {
+                  if (mirrorDock()) dock.show('dockpanel');
+                  else dock.hide('dockpanel');
+                }
+              })();
+            },
+          },
+          { label: '▸ Control from a phone or tablet…', action: () => void lanDialog() },
+        ]);
+      });
+      bar.appendChild(b);
+      // The window can also be closed from its own title bar, which the button
+      // never hears about — main.cjs pushes that back so the two stay honest.
+      n.onDockwinAttached?.(() => b.classList.remove('active'));
+    }
+  }
+
+  /**
+   * The LAN control-surface dialog.
+   *
+   * Deliberately blunt about what it does. This opens a listener on the user's
+   * network that can drive their audio rig, on a machine that may not be a
+   * private one — so the dialog states the exposure in plain words, defaults
+   * to off, and never remembers being on. "Off by default" is only meaningful
+   * if it is also off after a restart.
+   */
+  async function lanDialog(): Promise<void> {
+    const n = (window as any).livepatchNative;
+    if (!n?.lanStatus) return;
+    const { body, footer, close } = buildModal('Control from a phone or tablet');
+
+    const render = (st: { on: boolean; urls: string[]; clients: number; port: number }): void => {
+      body.replaceChildren();
+      const p = (text: string, cls?: string): HTMLElement => {
+        const el = document.createElement('p');
+        el.textContent = text;
+        if (cls) el.className = cls;
+        el.style.margin = '0 0 8px';
+        return el;
+      };
+      body.append(
+        p(
+          st.on
+            ? `Serving on port ${st.port}. Connected surfaces: ${st.clients}.`
+            : 'Off. Nothing is listening on your network.',
+        ),
+        p(
+          'Opens a web server on this machine so a phone or tablet on the same network can ' +
+            'drive this patch — the same Dock, over WiFi. Anyone who can reach the address ' +
+            'AND has the link below gets full control of the patch. Only use this on a ' +
+            'network you trust, and turn it off when you are done.',
+          'dock-hint',
+        ),
+      );
+      if (st.on) {
+        for (const u of st.urls) {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px';
+          const a = document.createElement('input');
+          a.readOnly = true;
+          a.value = u;
+          a.style.cssText = 'flex:1 1 auto;min-width:0;font-family:monospace;font-size:12px';
+          a.addEventListener('focus', () => a.select());
+          // The URL carries the pairing token, so the code is generated HERE —
+          // handing this string to a QR web service would hand over the rig.
+          const qrBtn = document.createElement('button');
+          qrBtn.className = 'tb-btn';
+          qrBtn.textContent = 'QR';
+          qrBtn.title = 'Show a QR code for this address';
+          const holder = document.createElement('div');
+          holder.style.cssText = 'display:none;margin:0 0 10px';
+          qrBtn.addEventListener('click', () => {
+            const shown = holder.style.display !== 'none';
+            if (shown) {
+              holder.style.display = 'none';
+              holder.replaceChildren();
+              qrBtn.classList.remove('active');
+              return;
+            }
+            const code = encodeQr(u);
+            holder.replaceChildren();
+            if (!code) {
+              // Never silently show nothing — the text field is still usable.
+              const err = document.createElement('div');
+              err.className = 'dock-hint';
+              err.textContent = 'Address is too long to encode — type or copy it instead.';
+              holder.append(err);
+            } else {
+              const cv = document.createElement('canvas');
+              drawQr(code, cv, 240);
+              cv.style.cssText = 'display:block;image-rendering:pixelated';
+              holder.append(cv);
+            }
+            holder.style.display = 'block';
+            qrBtn.classList.add('active');
+          });
+          row.append(a, qrBtn);
+          body.append(row, holder);
+        }
+        body.append(
+          p('Open one of these on the device. The part after # is the key — treat it like a password.', 'dock-hint'),
+        );
+        if (!st.urls.length) body.append(p('No network address found — is this machine on a network?', 'dock-hint'));
+      }
+    };
+
+    let st = await n.lanStatus();
+    render(st);
+
+    const toggle = document.createElement('button');
+    toggle.className = 'tb-btn';
+    const label = (): void => {
+      toggle.textContent = st.on ? 'Turn off' : 'Turn on';
+      toggle.classList.toggle('active', st.on);
+    };
+    label();
+    toggle.addEventListener('click', () => {
+      void (async () => {
+        st = st.on ? await n.lanStop() : await n.lanStart({});
+        render(st);
+        label();
+      })();
+    });
+    const done = document.createElement('button');
+    done.className = 'tb-btn';
+    done.textContent = 'Close';
+    done.addEventListener('click', close);
+    footer.append(toggle, done);
   }
 
   // ---------- global shortcuts ----------
@@ -527,6 +742,10 @@ export function updateStatus(): void {
   );
   const el = document.getElementById('statusbar')!;
   const state = doc.dirty ? '<span class="dirty">unsaved</span>' : '<span class="saved">saved</span>';
+  // Name every engine explicitly; never let one fall through to 'stub'. A
+  // worklet engine once did exactly that, so the engine that was making sound
+  // reported itself as the one that makes none, and a debugging session went
+  // looking for a bundle-loading fault that did not exist.
   const engine =
     runtime.engine.name === 'webaudio' ? 'web' : runtime.engine.name === 'native' ? 'native' : 'stub';
   const backend = isNative ? 'desktop' : 'browser';
@@ -572,3 +791,4 @@ export function updateBreadcrumb(): void {
     mk(b.name, i + 1, i === crumbs.length - 1);
   });
 }
+

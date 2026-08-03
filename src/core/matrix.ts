@@ -75,6 +75,41 @@ export function serializeMatrix(grid: Float32Array, ins: number, outs: number): 
   return JSON.stringify(rows);
 }
 
+/**
+ * Set one crosspoint and return the new `grid` string, or null when the
+ * coordinates are out of range.
+ *
+ * The parse→mutate→serialize round trip was hand-written at three call sites
+ * (the block face in `ui/editor.ts`, the deep editor in `ui/advmatrix.ts`, and
+ * now the Dock), each re-deriving `crossIndex` and the 0..1 clamp. Three copies
+ * of an index calculation is how two surfaces end up disagreeing about which
+ * cell you clicked — the same reasoning that keeps `matrixGeom` in one place.
+ */
+export function setCrosspoint(
+  gridStr: unknown,
+  ins: number,
+  outs: number,
+  i: number,
+  o: number,
+  v: number,
+): string | null {
+  if (i < 0 || o < 0 || i >= ins || o >= outs) return null;
+  const grid = parseMatrix(gridStr, ins, outs);
+  grid[crossIndex(ins, i, o)] = Math.max(0, Math.min(1, v));
+  return serializeMatrix(grid, ins, outs);
+}
+
+/**
+ * What a click on a crosspoint should set it to: full off↔on, or (with shift)
+ * half-open↔off. Shared so the face and the Dock toggle identically — a cell
+ * that means something different depending on which copy of the widget you
+ * pressed is worse than one that is not clickable at all.
+ */
+export function toggledCrosspoint(cur: number, half: boolean): number {
+  if (half) return cur > 0.49 && cur < 0.51 ? 0 : 0.5;
+  return cur > 0.001 ? 0 : 1;
+}
+
 /** The identity patch: input k straight to output k, everything else off.
  *  What a freshly dropped Matrix starts as, so it passes signal on sight. */
 export function identityMatrix(ins: number, outs: number): Float32Array {

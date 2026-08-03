@@ -19,7 +19,7 @@ import { showContextMenu } from './menus';
 import { fitCanvasBacking } from './uiscale';
 // `capture` is aliased: this file already has a local `capture()` that
 // snapshots the EQ's params for the A/B slots.
-import { TwoPointerGesture, capture as capturePointer, isCoarse, release, wheelDelta } from './input';
+import { TwoPointerGesture, capture as capturePointer, grabSlop, isCoarse, release, wheelDelta } from './input';
 import {
   EQ_MAX_BANDS, EQ_TYPES, EQ_TYPE_LABELS, EQ_MODES, EQ_FMIN, EQ_FMAX, EQ_GMAX,
   EqChannel, eqBand, eqBandHandles, eqGlobals, eqEnabledBands, eqBusesDiffer,
@@ -258,13 +258,51 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
 
   // ---- canvas geometry + drawing -----------------------------------------
   const plotRect = (): Rect => {
-    const W = canvas.clientWidth || 600;
-    const H = canvas.clientHeight || 260;
+    // The WRAP, for the same reason `draw()` measures it: `fitCanvasBacking`
+    // pins the canvas's own style, so `canvas.clientWidth` is a value we wrote
+    // (minus its border) rather than a fresh measurement.
+    //
+    // These two must agree or the plot is DRAWN in one space and HIT-TESTED in
+    // another — the curve lands somewhere the band handles are not, and
+    // dragging a node does nothing. Worse when the tab has never been laid out:
+    // `canvas.clientWidth` is 0 there, so this fell back to 600 and drew a
+    // 600-wide plot into a 300-wide phone canvas, putting most of the curve
+    // off-screen.
+    const W = canvasWrap.clientWidth || 600;
+    const H = canvasWrap.clientHeight || 260;
     return { x: 36, y: 10, w: Math.max(20, W - 48), h: Math.max(20, H - 30) };
   };
   const freqBuf = new Uint8Array(256);
 
+  /**
+   * The last error thrown out of a frame, drawn on the canvas so a blank
+   * editor can SAY why it is blank.
+   *
+   * `paintFrame` clears at the top and then draws in one linear pass, so a
+   * throw halfway through leaves exactly what got drawn before it — here,
+   * background and grid — and then repeats that same partial frame forever.
+   * From the outside that is identical to a layout bug, and the two were
+   * chased for a long time on a remote surface before this said which.
+   */
+  let paintErr = '';
+
   function draw(): void {
+    try {
+      paintFrame();
+    } catch (e) {
+      paintErr = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      ((window as any).__lpdiag ??= {}).eqErr = paintErr;
+      // The transform is already set by paintFrame's first statements, so this
+      // lands in CSS px regardless of where the throw happened.
+      g.fillStyle = '#ff8a8a';
+      g.font = '600 11px Segoe UI, sans-serif';
+      g.textAlign = 'left';
+      g.textBaseline = 'top';
+      g.fillText('EQ draw failed: ' + paintErr.slice(0, 96), 40, 16);
+    }
+  }
+
+  function paintFrame(): void {
     // Measure the flex-sized wrap, not the canvas: fitCanvasBacking pins the
     // canvas's own style, so reading canvas.clientWidth back would go stale and
     // never track a resize (same pattern as clipview/rigview).
@@ -273,7 +311,36 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
     const ratio = fitCanvasBacking(canvas, W, H);
     g.setTransform(ratio, 0, 0, ratio, 0, 0);
     g.clearRect(0, 0, W, H);
-    if (!block) return;
+    // Last-frame facts, for the Dock's diagnostics readout. "It renders for one
+    // frame and then disappears" is only ever one of two things — the target
+    // went away, or the measured box collapsed — and they are indistinguishable
+    // from the outside. This is how a remote device can say which.
+    const diag = ((window as any).__lpdiag ??= {});
+    diag.eq = { W, H, ratio, hasBlock: !!block, backing: canvas.width + 'x' + canvas.height, frames: (diag.eq?.frames ?? 0) + 1 };
+    if (block) {
+      const R0 = plotRect();
+      const bands = eqEnabledBands(block.params);
+      diag.eq.plot = `${Math.round(R0.x)},${Math.round(R0.y)} ${Math.round(R0.w)}x${Math.round(R0.h)}`;
+      diag.eq.bands = bands.length;
+      diag.eq.band1 = bands.length ? `f${bands[0]}=${block.params['f' + bands[0]]} g${bands[0]}=${block.params['g' + bands[0]]}` : '(none)';
+      // Where 0 dB — and therefore a flat curve — actually lands, against the
+      // height of the box you can SEE. If y0 is past `visible`, the curve is
+      // being drawn correctly and simply off-screen.
+      diag.eq.y0 = Math.round(eqGainToY(0, R0.y, R0.h));
+      diag.eq.visible = (host.parentElement as HTMLElement | null)?.clientHeight ?? -1;
+    }
+    if (!block) {
+      // Never leave a silently blank canvas. "Cleared, then returned" is
+      // indistinguishable from a broken renderer, and that ambiguity is
+      // expensive — it reads as "the EQ doesn't work" when the real state is
+      // "nothing is selected". Say which.
+      g.fillStyle = 'rgba(210,216,226,0.55)';
+      g.font = '12px Segoe UI, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText('No EQ selected', W / 2, H / 2);
+      return;
+    }
     const R = plotRect();
     const params = P();
     // background
@@ -301,6 +368,11 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
     // visual (render.ts); the two engines fill different bin counts so an
     // Hz-exact overlay isn't portable, but the silhouette reads correctly.
     if (params.analyzer !== 'Off') {
+      // Isolated on purpose. On a remote surface this feed is REBUILT from
+      // frames pushed over the link rather than read from a live engine, so it
+      // is the one input here whose shape this file does not control. The
+      // silhouette is expendable; the curve underneath it is the editor.
+      try {
       const feed = runtime.visualFor(nodeId);
       if (feed?.freq) {
         freqBuf.fill(0);
@@ -317,6 +389,9 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
         g.closePath();
         g.fillStyle = 'rgba(120,200,140,0.16)';
         g.fill();
+      }
+      } catch (e) {
+        diag.eq.analyzerErr = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       }
     }
     // per-band curves (thin)
@@ -340,12 +415,19 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
     const curve = (bus: 'a' | 'b', color: string, dash: number[]): void => {
       g.strokeStyle = color; g.lineWidth = 2; g.setLineDash(dash);
       g.beginPath();
+      // A single non-finite coordinate makes canvas silently drop the WHOLE
+      // path — no throw, no partial line, just nothing where the curve was,
+      // with the grid still perfect around it. Count them so that failure is
+      // never again indistinguishable from "the curve is drawn off-screen".
+      let bad = 0;
       for (let px = 0; px <= R.w; px += 2) {
         const f = eqXToFreq(R.x + px, R.x, R.w);
         const y = eqGainToY(Math.max(-EQ_GMAX, Math.min(EQ_GMAX, eqResponseDbBus(params, f, bus))), R.y, R.h);
+        if (!Number.isFinite(y)) bad++;
         px === 0 ? g.moveTo(R.x + px, y) : g.lineTo(R.x + px, y);
       }
       g.stroke(); g.setLineDash([]);
+      if (bad) diag.eq['nan' + bus] = bad;
     };
     curve('a', '#5fb2ff', []);
     if (split) curve('b', '#ffaa5a', [4, 3]);
@@ -360,7 +442,9 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
       g.fillText('FLAT (dry) — press Flat again to return', R.x + 6, y0 - 4);
     }
     // handles
-    for (const h of eqBandHandles(params, R)) {
+    const handles = eqBandHandles(params, R);
+    diag.eq.handles = handles.map((h) => `${h.i}@${Math.round(h.x)},${Math.round(h.y)}`).join(' ') || '(none)';
+    for (const h of handles) {
       const hot = h.i === sel;
       g.beginPath(); g.arc(h.x, h.y, hot ? 7 : 5.5, 0, Math.PI * 2);
       g.fillStyle = hot ? '#9ecbff' : '#cfd6e2';
@@ -386,8 +470,18 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
     const rect = canvas.getBoundingClientRect();
     return { x: ((e.clientX - rect.left) / rect.width) * (canvas.clientWidth || 1), y: ((e.clientY - rect.top) / rect.height) * (canvas.clientHeight || 1) };
   };
-  const nearestBand = (p: { x: number; y: number }): number => {
-    let band = 0, best = 16;
+  /**
+   * The band under a pointer, or 0.
+   *
+   * The radius follows the POINTER (`grabSlop`, docs/14-input.md): 16 px is
+   * right for a cursor you can see through and hopeless for a fingertip ~10 mm
+   * across that hides its own target. With a fixed 16 px the editor draws
+   * perfectly on a phone and never registers a grab.
+   */
+  // `Event &` so a MouseEvent (dblclick) and a WheelEvent satisfy it too —
+  // neither carries `pointerType`, and both then correctly get the mouse radius.
+  const nearestBand = (p: { x: number; y: number }, e?: Event & { pointerType?: string }): number => {
+    let band = 0, best = e ? grabSlop(16, e) : 16;
     for (const h of eqBandHandles(P(), plotRect())) {
       const d = Math.hypot(p.x - h.x, p.y - h.y);
       if (d < best) { best = d; band = h.i; }
@@ -428,7 +522,7 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
         return;
       }
     }
-    const band = nearestBand(p);
+    const band = nearestBand(p, e);
     if (e.button === 2) {
       if (band) { sel = band; rebuildInspector(); bandMenu(e.clientX, e.clientY, band); }
       else plotMenu(e.clientX, e.clientY);
@@ -449,7 +543,7 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
   canvas.addEventListener('pointermove', (e) => {
     if (gesture.update(e.pointerId, { x: e.clientX, y: e.clientY }) && gesture.active) {
       const f = gesture.frame();
-      const band = sel || nearestBand(localPt(e));
+      const band = sel || nearestBand(localPt(e), e);
       if (f && band && f.dy) nudgeQ(band, f.dy * 3);
       return;
     }
@@ -470,7 +564,7 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
   canvas.addEventListener('pointercancel', endDrag);
   canvas.addEventListener('dblclick', (e) => {
     const p = localPt(e);
-    const band = nearestBand(p);
+    const band = nearestBand(p, e);
     if (band) { doc.pushHistory(); write('e' + band, false); if (sel === band) sel = 0; rebuildInspector(); }
     else addBandAt(p);
   });
@@ -489,7 +583,7 @@ function buildEqEditor(host: HTMLElement): AdvancedViewHandle {
   };
   canvas.addEventListener('wheel', (e) => {
     if (!block) return;
-    const band = sel || nearestBand(localPt(e));
+    const band = sel || nearestBand(localPt(e), e);
     if (!band) return;
     e.preventDefault();
     nudgeQ(band, wheelDelta(e).dy);

@@ -47,7 +47,8 @@ try {
 
 // `performance` exists on modern node; the module also touches nothing else.
 const mod = await import(pathToFileURL(join(out, 'input.js')).href);
-const { TwoPointerGesture, wheelIntent, wheelDelta, grabSlop, ZOOM_DEADZONE } = mod;
+const { TwoPointerGesture, wheelIntent, wheelDelta, grabSlop, ZOOM_DEADZONE, LONGPRESS_NUDGE, LONGPRESS_SLOP, LONGPRESS_MS } =
+  mod;
 
 // ---- 1. pan-first: translation must not zoom -------------------------------
 console.log('-- rule 1: a two-finger translation does not zoom --');
@@ -266,6 +267,23 @@ console.log('-- rule 3: hit targets scale with the pointer --');
   check(grabSlop(8, { pointerType: 'mouse' }) === 8, 'mouse tolerance is unchanged');
   check(grabSlop(8, { pointerType: 'touch' }) > 18, `touch tolerance widens (${grabSlop(8, { pointerType: 'touch' }).toFixed(1)})`);
   check(grabSlop(8, { pointerType: 'pen' }) > 18, 'pen is treated as coarse');
+}
+
+// ---- 8. the long-press distances stay two distinct distances ---------------
+//
+// Rule 9's second defect (docs/14-input.md): one distance cannot answer both
+// "is the finger holding still" and "has a drag begun". Collapsing NUDGE back
+// into SLOP — or reordering them — silently restores the bug where a slow,
+// precise wire or marquee gets a context menu dropped on top of it, and nothing
+// else in this file would notice.
+console.log('-- rule 9: a hold and a drag are separated by two distances --');
+{
+  check(LONGPRESS_NUDGE > 0, `nudge distance exists (${LONGPRESS_NUDGE})`);
+  check(
+    LONGPRESS_NUDGE < LONGPRESS_SLOP,
+    `nudge is strictly smaller than slop (${LONGPRESS_NUDGE} < ${LONGPRESS_SLOP}) — a press must be able to stop being a menu while still being a drag`,
+  );
+  check(LONGPRESS_MS >= 300, `hold time is long enough to be deliberate (${LONGPRESS_MS} ms)`);
 }
 
 rmSync(out, { recursive: true, force: true });

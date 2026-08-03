@@ -13,7 +13,7 @@
 // them through `Renderer.drawVisualAt`.
 // ============================================================================
 import { Block, ControlStyle, ParamValue, Theme } from '../core/types';
-import { ParamSpec, VisualKind, getDef, paramSpec } from '../core/registry';
+import { ParamSpec, VisualKind, cvInputsByParam, getDef, paramSpec } from '../core/registry';
 import { doc } from '../core/graph';
 import { runtime } from '../engine/runtime';
 import { getCassettePeaks } from '../core/cassettes';
@@ -224,15 +224,28 @@ export function cvPatched(b: Block, paramId: string, container: Block | null): b
 }
 
 /**
- * A **built-in** audio-rate CV input whose port id is the param id — the
- * Panner 3D's `x`/`y`/`z`, Ambi Encode's `x`/`y`/`z`, Ambi Rotate's `yaw`.
+ * Is a **built-in** audio-rate CV input — one declared by the block def, not
+ * added by the user — wired to something, and does it drive `paramId`?
  *
- * These are declared in the block def rather than added by the user, and the
- * kernel reads them straight out of its input buffers instead of going through
- * the `cv:<param>` modulation path — so nothing ever calls `setParam` for them.
- * Without this the XY pad on a Panner sat frozen on its knob value while an
- * Orbit swung the source right around the room: the modulation was audible and
- * invisible, which is the exact opposite of what this app is for.
+ * The kernel reads these straight out of its input buffers instead of going
+ * through the `cv:<param>` modulation path, so nothing ever calls `setParam`
+ * for them. Without this the XY pad on a Panner sat frozen on its knob value
+ * while an Orbit swung the source right around the room: the modulation was
+ * audible and invisible, which is the exact opposite of what this app is for.
+ *
+ * **The port id is not the param id, and assuming it was is why this was
+ * broken.** This used to test `p.id === paramId`, which is true for the three
+ * blocks that shipped with the feature (`panner3d` x/y/z, `amb-encode` x/y/z,
+ * `amb-rotate` yaw) and false for every one added since — Room's `x` drives
+ * `srcx`, Distance's `dist` drives `distance`, Ladder's `cut` drives `cutoff`,
+ * the VCO's `pitch` drives `freq`. Each of those blocks shipped a CV input that
+ * moved the audio and left the face perfectly still, and the identity check is
+ * the reason the bug kept arriving one block at a time.
+ *
+ * The relationship is now declared on the port (`PortSpec.cvParam`) and read
+ * back through `cvInputsByParam`, which memoizes per block TYPE — this runs
+ * once per widget per frame, so it cannot be a scan over `def.inputs`
+ * (docs/10-performance.md).
  *
  * **Patched in only**, like `hasCvPort` — these ports are declared by the block
  * def and so are always present, which would otherwise mean a permanent marker
@@ -246,9 +259,8 @@ export function cvPatched(b: Block, paramId: string, container: Block | null): b
  * into it already says that far more clearly than a 2 px dot.
  */
 function builtinCvPatched(b: Block, paramId: string): boolean {
-  return b.ports.some(
-    (p) => p.id === paramId && p.dir === 'in' && p.role === 'cv' && !p.modParam && doc.isPortWired(b.id, p.id),
-  );
+  const port = cvInputsByParam(b.type).get(paramId);
+  return !!port && doc.isPortWired(b.id, port.id);
 }
 
 /** Binding badges: corner dots showing what drives a widget — a **patched**
@@ -420,8 +432,26 @@ export function paintFaceWidget(
  * docked, and that one is Properties-only.
  */
 export function writeParam(r: ResolvedRef, spec: ParamSpec, v: ParamValue): void {
-  r.target.params[spec.id] = v;
-  runtime.sendParam(r.nodeId, spec.id, v);
+  writeParamId(r, spec.id, v);
+}
+
+/**
+ * `writeParam` for a param that has no `ParamSpec` to hand — the case a
+ * **visual** ref creates. A docked Matrix writes `grid`, a docked Speaker
+ * Monitor writes `mute`/`solo`, and `resolveRefAtPath` gives those refs a
+ * `visual` and no `spec` at all.
+ *
+ * Going through here rather than calling `runtime.sendParam` locally is what
+ * keeps the detached Dock window and the LAN control surface working: they
+ * resolve the write by **absolute path** (`r.nodeId`), where the canvas's own
+ * `runtime.nodeId(b.id)` is relative to whichever subgraph happens to be open.
+ * A local copy in the Dock would address the wrong node the moment the source
+ * block was not in the open graph — and would look fine in every test done
+ * with a flat patch.
+ */
+export function writeParamId(r: ResolvedRef, paramId: string, v: ParamValue): void {
+  r.target.params[paramId] = v;
+  runtime.sendParam(r.nodeId, paramId, v);
   doc.touch('param');
 }
 

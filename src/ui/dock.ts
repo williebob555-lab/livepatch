@@ -35,7 +35,12 @@ interface PanelState {
   float: { x: number; y: number; w: number; h: number };
 }
 
-const LS_KEY = 'livepatch.dock';
+// Per-WINDOW, not per-app. The detached Dock window (dock.html) is the same
+// origin as the main window and therefore shares localStorage, so a single key
+// would have the two windows overwriting each other's saved layout — and the
+// dock window's layout is one pinned panel in one zone, which would wipe the
+// main window's Library/Properties arrangement the first time it ran.
+const LS_KEY = document.body.classList.contains('dock-window') ? 'livepatch.dock.detached' : 'livepatch.dock';
 
 /**
  * A saved floating rect, or the default when it is missing or nonsense.
@@ -67,6 +72,21 @@ export class Dock {
   private zoneSizes = { left: 260, right: 300, bottom: 220 };
   onLayoutChange: (() => void) | null = null;
 
+  /**
+   * Fill mode — the detached Dock window (`dock.html`, docs/07-ui.md).
+   *
+   * There the bottom zone IS the window: no canvas to protect, no splitter to
+   * drag, so the zone simply takes all the height. That cannot be done from
+   * the stylesheet, because `applyZoneSizes` writes an *inline* height and
+   * inline styles win — hence a mode here rather than an `!important` there.
+   *
+   * Read from the body class, not from a setter, because `makeZoneSplitters`
+   * runs in this constructor and `dock` is a module-level singleton: any
+   * setter would necessarily be called too late to suppress the splitters.
+   * The class is in the HTML, so it is already true before the first script.
+   */
+  private readonly fill = document.body.classList.contains('dock-window');
+
   constructor() {
     this.zones = {
       left: document.getElementById('dock-left')!,
@@ -93,7 +113,14 @@ export class Dock {
     const closeBtn = document.createElement('button');
     closeBtn.title = 'Close';
     closeBtn.textContent = '✕';
-    header.append(...(def.pinned ? [closeBtn] : [dockBtn, closeBtn]));
+    // In fill mode the panel IS the window, so a close button is a trap: it
+    // empties the window and there is nothing left to reopen it from — no top
+    // bar, no panel manager, and on a phone no menu bar either. Reported from
+    // a phone as "closing the dock has no way of bringing it back".
+    // Re-attaching (or closing the window) is how you leave; that lives in the
+    // dock window's own control strip.
+    const closable = !(this.fill && def.pinned);
+    header.append(...(def.pinned ? (closable ? [closeBtn] : []) : [dockBtn, closeBtn]));
     const body = document.createElement('div');
     body.className = 'panel-body';
     el.append(header, body);
@@ -271,6 +298,13 @@ export class Dock {
   }
 
   private applyZoneSizes(): void {
+    // Fill mode: hand the bottom zone back to the stylesheet (flex: 1) by
+    // clearing the inline height, and leave the side zones alone — they are
+    // display:none in that window anyway.
+    if (this.fill) {
+      this.zones.bottom.style.height = '';
+      return;
+    }
     // Zone sizes are stored in CSS px, which the UI scale magnifies — at a
     // large scale on a small display the docks would otherwise squeeze the
     // canvas out of existence. Fit them to what the shell actually has.
@@ -335,6 +369,10 @@ export class Dock {
       });
       return sp;
     };
+    // Fill mode has exactly one zone and it is the whole window — every
+    // splitter would only ever shrink it away from an edge the user cannot
+    // then grab back.
+    if (this.fill) return;
     // Splitters sit on each zone's INNER edge (between panel and canvas), so
     // docked windows are grabbed/resized from the side facing the workspace.
     const ws = document.getElementById('workspace')!;

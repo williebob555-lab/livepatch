@@ -153,7 +153,21 @@ avoid stepping on the invariants that keep it fast and correct.
     a net sums its sources), which is what dragging a branch in the editor
     already produces. Hand-built graphs have to do it deliberately; see
     [`02-core-ir.md`](02-core-ir.md) and `scripts/factory-preset-test.mjs`.
-17. **All pointer, wheel and touch handling goes through `src/ui/input.ts`.**
+17. **Every `role: 'cv'` INPUT declares what it does, and the UI shows it.** A
+    cv input is read straight out of the kernel's input buffers, so nothing
+    calls `setParam` and the renderer cannot know which knob it moves unless the
+    def says. It used to guess by comparing the port id to the param id — true
+    for `panner3d`'s x/y/z and almost nothing else, so Room, Distance, Ladder,
+    Wave Folder, VCO and LFO each shipped a CV input that moved the audio and
+    left the face perfectly still. Because the check *looked* general, it
+    arrived as a separate bug report per block for months instead of as one
+    broken rule. Declare exactly one of `cvParam` (+ the `cvLaw` matching the
+    kernel), `cvTrigger` (an edge — the *port* flashes, there is no knob) or
+    `cvSignal` (the signal being processed). Kernels with a `cvParam` input
+    publish it through `liveParams()`, `NaN` when unwired;
+    `scripts/cv-indicator-test.mjs` fails the build on anything undeclared. See
+    [`08-extending.md`](08-extending.md) and [`07-ui.md`](07-ui.md).
+18. **All pointer, wheel and touch handling goes through `src/ui/input.ts`.**
     Two-finger drags pan before they scale; on a trackpad, scrolling pans and
     Ctrl/Shift scale; hit targets widen for a fingertip; `setPointerCapture` is
     always guarded. Eight surfaces once held eight different answers to those
@@ -192,4 +206,4 @@ avoid stepping on the invariants that keep it fast and correct.
   with the harnesses in [`12-testing-checklist.md`](12-testing-checklist.md)
   rather than trusting a stale figure.
 
-_Last verified against the codebase: 2026-08-01._
+_Last verified against the codebase: 2026-08-02._

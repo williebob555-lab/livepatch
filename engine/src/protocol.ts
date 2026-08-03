@@ -100,6 +100,14 @@ export interface MidiLearnMsg { op: 'midi-learn'; on: boolean }
 export interface WatchVisualsMsg { op: 'watch-visuals'; nodes: string[] }
 export interface AssetReadyMsg { op: 'asset-ready'; id: string }
 /**
+ * A learned keystroke went down or up (the `key-in` block).
+ *
+ * The HOST registers the system-wide hotkey and sends this — the engine never
+ * touches the keyboard, because both registration and injection are blocking
+ * window-manager calls and the audio callback blocks on nothing.
+ */
+export interface KeyEventMsg { op: 'key-event'; accel: string; down: boolean }
+/**
  * Round-trip latency probe. Emits a click on the master output and listens for
  * it coming back, so the result includes converters and driver buffers — the
  * real number, not our internal accounting. Requires a loopback: a physical
@@ -163,7 +171,7 @@ export interface VstUiRectMsg {
 }
 export type InMsg =
   | ConfigMsg | StartMsg | StopMsg | SetGraphMsg | SetParamMsg
-  | MidiEventMsg | MidiLearnMsg | WatchVisualsMsg | AssetReadyMsg | MeasureLatencyMsg
+  | MidiEventMsg | MidiLearnMsg | WatchVisualsMsg | AssetReadyMsg | KeyEventMsg | MeasureLatencyMsg
   | MeasureSpeakersMsg | VstUiMsg | VstUiRectMsg;
 
 // ---- engine → renderer ----
@@ -403,12 +411,39 @@ export interface SpeakerCalMsg {
   done?: boolean;
   error?: string;
 }
+/** `key-out` fired: press this accelerator on the host machine. */
+export interface SendKeyMsg { op: 'send-key'; accel: string }
+
 export type OutMsg =
   | DevicesMsg | LevelsMsg | ModsMsg | VisualsMsg
-  | NeedAssetMsg | MidiSeenMsg | TapeCreatedMsg | StatusMsg | LatencyResultMsg
+  | NeedAssetMsg | MidiSeenMsg | TapeCreatedMsg | StatusMsg | LatencyResultMsg | SendKeyMsg
   | SpeakerSweepMsg | SpeakerCalMsg
   | VstInfoMsg | VstEditsMsg | VstStateMsg | VstUiStateMsg;
 
-export const send = (m: OutMsg): void => {
+/**
+ * Emit a message to whoever is hosting this engine.
+ *
+ * Swappable, because the DSP now runs in two very different hosts: the native
+ * process (stdout JSON-lines, the original) and an **AudioWorklet** in a
+ * browser, where there is no `process` at all and the channel is
+ * `port.postMessage`.
+ *
+ * A mutable binding rather than a build-time module alias so that `dsp.ts` and
+ * `graph.ts` — 9,000 lines of kernels — stay completely unaware of which host
+ * they are in. The default is the stdout writer, so the native engine's
+ * behaviour is byte-for-byte what it was.
+ *
+ * Safe under this project's two module systems: the engine compiles to
+ * CommonJS, where `import { send }` becomes a property read at call time, and
+ * ESM named imports are live bindings. Neither captures the old value.
+ */
+let sendImpl = (m: OutMsg): void => {
   process.stdout.write(JSON.stringify(m) + '\n');
 };
+
+export const send = (m: OutMsg): void => sendImpl(m);
+
+/** Install a different transport. Called by the worklet host at startup. */
+export function setSend(fn: (m: OutMsg) => void): void {
+  sendImpl = fn;
+}

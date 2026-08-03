@@ -1,6 +1,6 @@
 # 08 — Extending: Adding Blocks, Widgets, Kernels, Visuals
 
-_Last verified: 2026-08-01._
+_Last verified: 2026-08-02._
 
 This is the how-to reference. Follow the checklists exactly — most of the steps
 prevent a specific silent failure (a block that does nothing on one engine, a
@@ -54,9 +54,48 @@ registerBlock({
   nothing?"; every arrow that *could* be drawn is not worth drawing.
 - `face: false` on a param hides its face widget (edited in Properties only) —
   use for hidden state like `asset`/`file`/`device`.
-- Port `role: 'cv'` colors a port purple; it's still an audio port.
+- Port `role: 'cv'` colors a port purple; it's still an audio port. **A `cv`
+  INPUT must also declare what it does** — see the next section, which is
+  enforced by a test.
 - Native-only blocks set `stubbed: true` (web engine passes through, shows a
   NATIVE badge) — but still add a kernel if the native engine implements it.
+
+#### Every `role: 'cv'` input declares what it does (2026-08-02)
+
+A cv input is read straight out of the kernel's input buffers — nothing calls
+`setParam` for it — so the renderer cannot know which knob it moves unless the
+def says. It used to guess, by comparing the port id to the param id, and that
+is true for `panner3d`'s `x`/`y`/`z` and almost nothing else. Room's `x` drives
+`srcx`, Distance's `dist` drives `distance`, Ladder's `cut` drives `cutoff`, the
+VCO's `pitch` drives `freq` — **every one of those blocks shipped with a CV
+input that moved the audio and left the face completely still.** It arrived as a
+bug report once per block, for months.
+
+Declare exactly one of three things on every cv input:
+
+| field | means | indicator |
+|---|---|---|
+| `cvParam: '<id>'` | modulates that param | the param's widget gets the live marker |
+| `cvTrigger: true` | an edge (clock/gate/trig/sync/reset) | the **port** flashes with the line's level |
+| `cvSignal: true` | carries the signal being processed | none — there is nothing to indicate |
+
+```ts
+{ id: 'cut', name: 'cutoff', kind: 'audio', dir: 'in', role: 'cv',
+  cvParam: 'cutoff', cvLaw: '1v/oct' },
+```
+
+`cvLaw` says **how** the CV combines with the knob, and it must match what the
+kernel actually does — `add` (default), `1v/oct` (`base × 2^cv`), `replace`
+(the CV takes over) or `replace-abs` (magnitude, e.g. Distance's metres, with
+`cvScale: 50`). The web engine has no way to read a worklet's internals, so it
+*reconstructs* the displayed value from (knob, voltage, law) via
+`src/core/cvlaw.ts`. A law that disagrees with its kernel produces a marker that
+moves the wrong way, which is worse than no marker at all.
+
+`scripts/cv-indicator-test.mjs` fails the build on a cv input that declares
+none of the three, on a `cvParam` naming a param that does not exist or has
+`face: false`, and on two inputs claiming the same param. Run it after touching
+any port list.
 
 ### 2. Implement it on the Web engine — `src/blocks/units.ts`
 
@@ -103,6 +142,16 @@ registerKernel('my-block', (params, sv) => {
   `Biquad`, `sumInto`, `copy`, `pushHistory` from the file.
 - Match the Web unit's semantics. Filters/math should produce the same numbers
   (A/B verifiable). Reverb/compressor are the *only* sanctioned divergences.
+- **A kernel with a built-in CV input implements `liveParams()`**, publishing
+  the post-CV value of each param a `cvParam` input drives. This is what makes
+  the face marker show the real number rather than a reconstruction. Two rules,
+  both load-bearing:
+  - **`NaN` when the input is unwired.** `engine/src/graph.ts` drops non-finite
+    values from the mods stream, which is what keeps an unpatched port from
+    lighting a permanent marker on every block of that type in the patch.
+  - **Latch it once per quantum, from the LAST frame** (`A[0][ctx.n - 1]`), the
+    way `posOf` does for the panner. The markers refresh at ~30 Hz, so a
+    per-sample write in the inner loop buys nothing and costs real time.
 - Then `npm run build:engine`.
 
 ### 4. THE PARITY CHECK (never skip)

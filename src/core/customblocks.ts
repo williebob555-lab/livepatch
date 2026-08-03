@@ -21,6 +21,20 @@ function notify(): void {
 }
 
 /**
+ * Re-read the registry from storage and tell everyone, WITHOUT writing back.
+ *
+ * The no-write half is the point: this is called when storage was replaced
+ * from outside (the dock link pushing the desktop's blocks to a remote
+ * surface), and `notify()` would immediately save the registry it just
+ * loaded — turning a one-way sync into a write loop against the thing that
+ * fed it.
+ */
+export function reloadCustomBlocks(): void {
+  registry = loadCustomBlocks();
+  for (const fn of listeners) fn();
+}
+
+/**
  * The user's saved blocks **plus the built-in ones**, merged on read rather
  * than seeded into storage (see `core/factory/index.ts` for why). The user's
  * come first so a block they made is never buried under the presets.

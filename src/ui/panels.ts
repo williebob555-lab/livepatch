@@ -3,6 +3,9 @@
 // schema-driven down to per-port placement), Appearance (full theme editor —
 // every visual parameter), Scenes (recent/all browser).
 // ============================================================================
+import { startKeyLearn } from './keylearn';
+import { hasUnit } from '../engine/webaudio';
+import { isAndroidApp } from './androidupdate';
 import { doc } from '../core/graph';
 import { BlockDef, ParamSpec, WidgetKind, allDefs, faceParams, getDef, paramSpec } from '../core/registry';
 import { Block, ControlStyle, Edge, Port, Theme, Vec2, defaultTheme } from '../core/types';
@@ -78,7 +81,7 @@ import {
   uiScale,
 } from './uiscale';
 import * as shell from './shell';
-import { capture, dragHandle, dragThreshold, isCoarse } from './input';
+import { LONGPRESS_NUDGE, capture, dragHandle, dragThreshold, isCoarse } from './input';
 
 let ed: Editor;
 /** Properties-panel filter text for the (possibly huge) plugin param list. */
@@ -247,15 +250,44 @@ function dropLibraryKey(key: string, clientX: number, clientY: number): boolean 
  * ("you can't pull blocks out of the library"); double-tap-to-centre was the
  * entire vocabulary.
  *
- * ### Why the threshold is horizontal
+ * ### Two ways in, because one direction was not enough
  *
- * The Library scrolls vertically and long-press already opens the tile's
- * context menu, so neither of the two obvious gestures is free. A drag that
- * starts out predominantly **sideways** is not a scroll and is not a hold, and
- * it happens to be the direction the canvas is in from either dock side. A
- * predominantly vertical start hands the gesture back to the scroller and never
- * captures the pointer, so the list still flicks normally.
+ * The Library scrolls vertically, so a vertical drag is ambiguous from its
+ * first pixel. This used to be settled by simply **abandoning** any drag whose
+ * first movement was more vertical than horizontal — sideways was a drag,
+ * everything else was a scroll.
+ *
+ * That made dragging a block out impossible for the most natural gesture there
+ * is: straight down (or up) onto the canvas. Worse, the ambiguity was resolved
+ * on the first few px, so an arc that *began* slightly vertical was thrown away
+ * even though it clearly ended up on the workspace. The reachable path was
+ * double-tap-to-centre, which is not drag and drop and does not let you say
+ * WHERE — and that is what "it should be drag and drop, not double tap" was.
+ *
+ * So intent is now declared two ways, and either is enough:
+ *
+ *   1. **Move sideways** past the threshold — instant, no wait. The fast path,
+ *      unchanged, because it was already right when the canvas is beside you.
+ *   2. **Hold still for `LIFT_MS`** — the tile lifts, and from that moment the
+ *      drag owns the gesture in EVERY direction. This is the same press-and-
+ *      lift every mobile OS uses to drag an icon out of a list, for the same
+ *      reason: holding still is the one signal a scroll can never send.
+ *
+ * A press that moves vertically *before* the hold elapses is still a scroll and
+ * is still handed straight back to the scroller, so flicking the list is
+ * untouched.
+ *
+ * ### The context menu still belongs to a motionless hold
+ *
+ * A lifted tile that has not moved does not suppress anything — keep holding
+ * without moving and the OS `contextmenu` arrives as before. Suppression starts
+ * only once the finger actually travels, which is the same rule the workspace
+ * canvas follows (docs/14-input.md, Rule 9): a menu on top of a live drag is
+ * wrong, and a hold that has not moved is not a drag yet.
  */
+/** How long a motionless press must last before the tile lifts for dragging. */
+const LIFT_MS = 300;
+
 function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent): void {
   const startX = down.clientX;
   const startY = down.clientY;
@@ -263,13 +295,23 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
   let ghost: HTMLElement | null = null;
   let active = false;
   let dead = false;
+  /** Held still long enough to lift: from here, any direction is a drag. */
+  let lifted = false;
+  let liftTimer = 0;
 
   const threshold = dragThreshold(down);
 
   const cleanup = (): void => {
+    if (liftTimer) {
+      clearTimeout(liftTimer);
+      liftTimer = 0;
+    }
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     window.removeEventListener('pointercancel', onUp);
+    // `touchmove` is where scrolling is actually refused (see `onTouchMove`).
+    tile.removeEventListener('touchmove', onTouchMove);
+    tile.classList.remove('lifting');
     ghost?.remove();
     ghost = null;
     try {
@@ -279,26 +321,66 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     }
   };
 
+  /**
+   * Refuse the scroll once the tile is lifted.
+   *
+   * `preventDefault` on `pointermove` does NOT stop scrolling in Chromium —
+   * pointer events are a reporting layer; the scroll is driven by the touch
+   * stream underneath. Without this the ghost follows the finger while the list
+   * scrolls behind it, which looks like the drag is fighting the panel.
+   *
+   * It works here specifically BECAUSE lifting requires holding still: with no
+   * movement yet, the compositor has not committed the gesture to a scroll, so
+   * the first real `touchmove` is still cancelable. A lift granted after motion
+   * could not make this promise.
+   */
+  function onTouchMove(ev: TouchEvent): void {
+    if (lifted || active) ev.preventDefault();
+  }
+
+  const lift = (): void => {
+    if (dead || active) return;
+    lifted = true;
+    liftTimer = 0;
+    // Feedback that the hold registered, before anything has moved. Without it
+    // a lift is indistinguishable from a press that did nothing, and the user
+    // has no way to know the drag is now armed.
+    tile.classList.add('lifting');
+    capture(tile, id);
+  };
+
+  const beginDrag = (): void => {
+    active = true;
+    capture(tile, id);
+    tile.classList.remove('lifting');
+    ghost = document.createElement('div');
+    ghost.className = 'lib-drag-ghost';
+    ghost.textContent = entry.title;
+    document.body.appendChild(ghost);
+    hideHoverCard();
+  };
+
   function onMove(ev: PointerEvent): void {
     if (ev.pointerId !== id || dead) return;
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
     if (!active) {
-      if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) return;
-      // Vertical intent → this is a scroll, not a drag. Bow out entirely.
-      if (Math.abs(dy) > Math.abs(dx)) {
-        dead = true;
-        cleanup();
+      if (!lifted) {
+        if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) return;
+        // Moved before the tile lifted. Predominantly vertical is a scroll —
+        // bow out entirely so the list flicks normally, exactly as before.
+        if (Math.abs(dy) > Math.abs(dx)) {
+          dead = true;
+          cleanup();
+          return;
+        }
+      } else if (Math.hypot(dx, dy) < LONGPRESS_NUDGE) {
+        // Lifted but still essentially motionless: not a drag yet, so a
+        // stationary hold can still become the context menu.
         return;
       }
-      active = true;
-      capture(tile, id);
-      ghost = document.createElement('div');
-      ghost.className = 'lib-drag-ghost';
-      ghost.textContent = entry.title;
-      document.body.appendChild(ghost);
+      beginDrag();
     }
-    // Once dragging, the page must not also pan/scroll under the finger.
     ev.preventDefault();
     if (ghost) {
       ghost.style.left = ev.clientX + 'px';
@@ -314,14 +396,16 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     if (ev.pointerId !== id) return;
     const wasActive = active;
     cleanup();
-    // A tap that never became a drag is left alone — click/dblclick/long-press
-    // all still reach the tile.
+    // A tap — or a lift that never moved — is left alone: click, dblclick and
+    // the long-press context menu all still reach the tile.
     if (wasActive) dropLibraryKey(entry.key, ev.clientX, ev.clientY);
   }
 
+  liftTimer = window.setTimeout(lift, LIFT_MS);
   window.addEventListener('pointermove', onMove, { passive: false });
   window.addEventListener('pointerup', onUp);
   window.addEventListener('pointercancel', onUp);
+  tile.addEventListener('touchmove', onTouchMove, { passive: false });
 }
 
 /**
@@ -353,7 +437,7 @@ export function quickAddMenuItems(pos: Vec2): { items: MenuItem[]; source: 'pinn
 export function paletteMenuItems(pos: Vec2): MenuItem[] {
   const items: MenuItem[] = [];
   let lastCat = '';
-  for (const def of allDefs()) {
+  for (const def of usableDefs()) {
     if (def.category !== lastCat) {
       if (lastCat) items.push({ sep: true });
       lastCat = def.category;
@@ -445,9 +529,61 @@ const CAT_ORDER = [
  *  asset gets in. */
 const ASSET_CATS = new Set(['Cassettes', 'Rolls', 'Plugins']);
 
+// ---------------------------------------------------------------------------
+// What the library is allowed to offer on this platform.
+//
+// Android runs the Web Audio engine and nothing else, and that engine stubs
+// roughly two dozen block types to a bare pass-through. Offering them is worse
+// than not having them: the block drops in, wires up, shows levels, and does
+// nothing — which reads as a broken app rather than an absent feature.
+//
+// Derived from the engine's own registry (`hasUnit`) rather than a hand-written
+// list, because a hand-written list is wrong the first time a kernel is ported
+// and its failure mode is silent in both directions.
+//
+// Three corrections the registry alone cannot make:
+//   • **A block with no audio or MIDI ports is not a DSP block at all**, so its
+//     missing unit means nothing. `tape-reader` and `tape-writer` are the
+//     reason this clause exists: they are no-op kernels on the NATIVE engine
+//     too (`out: () => null`), because their whole function is a file dialog in
+//     the UI layer. Judging them by `hasUnit` hid two working blocks.
+//   • Structural types never become audio nodes either. Portals compile to
+//     `pass` by design; `subgraph` and `comment` never reach the engine.
+//   • ASIO, VST and the key blocks have no Web Audio unit *and* no possible
+//     one — no ASIO driver, no VST host, no `globalShortcut`/`SendInput` in a
+//     WebView. Listed explicitly so they stay hidden even if a stub is ever
+//     registered for them.
+//
+// Desktop is untouched: it has the native engine, where these all work.
+// ---------------------------------------------------------------------------
+const STRUCTURAL_TYPES = new Set(['subgraph', 'comment', 'portal-in', 'portal-out', 'pass']);
+const NEVER_ON_ANDROID = new Set(['asio-in', 'asio-out', 'vst', 'key-in', 'key-out']);
+
+/** Does this block sit in the signal path, i.e. does a missing unit silence it? */
+function isSignalBlock(d: BlockDef): boolean {
+  return [...d.inputs, ...d.outputs].some((p) => p.kind === 'audio' || p.kind === 'midi');
+}
+
+/**
+ * `allDefs()` filtered for the running platform.
+ *
+ * Only the LIBRARY is filtered — `getDef` still resolves every type, so a scene
+ * built on the desktop still opens on a phone with its blocks intact rather
+ * than losing them on load.
+ */
+function usableDefs(): BlockDef[] {
+  const defs = allDefs();
+  if (!isAndroidApp()) return defs;
+  return defs.filter(
+    (d) =>
+      !NEVER_ON_ANDROID.has(d.type) &&
+      (STRUCTURAL_TYPES.has(d.type) || !isSignalBlock(d) || hasUnit(d.type)),
+  );
+}
+
 function paletteEntries(): LibEntry[] {
   const list: LibEntry[] = [];
-  for (const d of allDefs()) {
+  for (const d of usableDefs()) {
     const base = {
       key: d.type,
       title: d.title,
@@ -1316,6 +1452,31 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
               ed.setParamLive(b, spec, sel.value, null);
             });
             r.appendChild(sel);
+          } else if (spec.id === 'key' && (b.type === 'key-in' || b.type === 'key-out')) {
+            // A keystroke is captured, never typed. A free-text field here
+            // invites "Ctrl-Alt-K" or "ctrl+alt+k", neither of which registers,
+            // and the failure is silent — the block simply never fires.
+            const shown = document.createElement('input');
+            shown.type = 'text';
+            shown.readOnly = true;
+            shown.value = String(v ?? '') || '(none)';
+            shown.style.cursor = 'default';
+            const learn = document.createElement('button');
+            learn.textContent = 'Learn';
+            learn.title = 'Press a keystroke to bind';
+            learn.addEventListener('click', () => {
+              startKeyLearn(b, () => refreshPanels('props'));
+            });
+            const clear = document.createElement('button');
+            clear.textContent = '✕';
+            clear.title = 'Unbind';
+            clear.addEventListener('click', () => {
+              doc.pushHistory();
+              b.params.key = '';
+              doc.touch('structure');
+              refreshPanels('props');
+            });
+            r.append(shown, learn, clear);
           } else if (spec.type === 'string' && spec.id === 'device' && deviceOptions(b.type, String(b.params.api ?? '')).length) {
             // Hardware device picker, populated live by the native engine.
             const sel = document.createElement('select');

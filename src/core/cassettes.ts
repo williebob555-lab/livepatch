@@ -61,6 +61,43 @@ const native = (window as any).livepatchNative as (CassetteNative & { cassettesL
 const hasNative = !!native?.cassettesList;
 export const canImportFolders = hasNative;
 
+/**
+ * A remote surface can READ the host's library over HTTP.
+ *
+ * The library lives in `%APPDATA%`, so a phone driving the Dock over the LAN
+ * has none of it — the fallback below is a per-device IndexedDB, which is
+ * empty. The Clip tab draws nothing, the Library is bare and every tape widget
+ * resolves to no audio, with nothing on screen to say why. Same shape as the
+ * saved-rigs bug `core/appstate.ts` fixed: installation state that does not
+ * travel. `appstate` covers the localStorage half; this is the on-disk half.
+ *
+ * Decided HERE rather than by installing a fake `window.livepatchNative`.
+ * That was tried and is a trap: `persist.ts` and others read
+ * `!!window.livepatchNative` as "this is Electron", so a partial shim makes
+ * the whole app take the native path and the first missing method blanks the
+ * page.
+ *
+ * `remoteAssets` stays false until a probe succeeds, so a plain browser dev
+ * session — also http(s), but with no host serving `/library` — keeps its
+ * IndexedDB store instead of silently losing it.
+ */
+let remoteAssets = false;
+const canTryRemote = !hasNative && /^https?:$/.test(location.protocol);
+
+async function remoteList(): Promise<CassetteMeta[] | null> {
+  if (!canTryRemote) return null;
+  try {
+    const r = await fetch('/library/list', { cache: 'no-store' });
+    if (!r.ok) return null;
+    const list = await r.json();
+    if (!Array.isArray(list)) return null;
+    remoteAssets = true;
+    return list as CassetteMeta[];
+  } catch {
+    return null;
+  }
+}
+
 /** Native MIDI file/folder pickers, for `rolls.ts`. Null in a plain browser
  *  (which falls back to an `<input type=file multiple>`); folders are Electron
  *  only, exactly like the audio side. */
@@ -150,8 +187,14 @@ export async function initCassettes(): Promise<void> {
   if (hasNative) {
     metas = (await native!.cassettesList().catch(() => [])) ?? [];
   } else {
-    const all = (await idbOp<Array<{ meta: CassetteMeta }>>('readonly', (s) => s.getAll())) ?? [];
-    metas = all.map((r) => r.meta);
+    // The host's library first, when there is a host (see `remoteList`).
+    const remote = await remoteList();
+    if (remote) {
+      metas = remote;
+    } else {
+      const all = (await idbOp<Array<{ meta: CassetteMeta }>>('readonly', (s) => s.getAll())) ?? [];
+      metas = all.map((r) => r.meta);
+    }
   }
   metas.sort((a, b) => b.createdAt - a.createdAt);
   notify();
@@ -392,6 +435,17 @@ export async function getCassetteBytes(id: string): Promise<ArrayBuffer | null> 
   if (hasNative) {
     const r = await native!.cassettesLoad(id).catch(() => null);
     return r ? toArrayBuffer(r.data) : null;
+  }
+  // Only once the index came from the host — otherwise this is a plain browser
+  // whose assets are in IndexedDB, and a wasted 404 per lookup.
+  if (remoteAssets) {
+    try {
+      const r = await fetch('/library/' + encodeURIComponent(id), { cache: 'no-store' });
+      if (r.ok) return await r.arrayBuffer();
+    } catch {
+      /* fall through to the local store */
+    }
+    return null;
   }
   const rec = await idbOp<{ data: ArrayBuffer }>('readonly', (s) => s.get(id));
   return rec?.data ?? null;

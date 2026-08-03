@@ -76,8 +76,8 @@ import {
   xyAxes,
 } from './widgets';
 import { toggleSpeakerMute } from '../core/rig';
-import { crossIndex, matrixPorts, parseMatrix, serializeMatrix } from '../core/matrix';
-import { LONGPRESS_SLOP, TwoPointerGesture, capture, grabSlop, wheelIntent } from './input';
+import { crossIndex, matrixPorts, parseMatrix, setCrosspoint, toggledCrosspoint } from '../core/matrix';
+import { LONGPRESS_NUDGE, LONGPRESS_SLOP, TwoPointerGesture, capture, grabSlop, wheelIntent } from './input';
 
 const BRANCH_DEADZONE = 28; // px of trunk arc kept clear near endpoints
 const BRANCH_DRAG_MIN = 8;
@@ -86,6 +86,25 @@ const WIRE_HIT_TOL = 6;
 /** Mouse-sized radius for grabbing a wire end; scaled up for touch/pen at the
  *  call site, where the pointer type is known. */
 const BASE_END_GRAB = 11;
+
+/**
+ * Widget kinds for which a press is already the interaction, so a touch
+ * long-press over one belongs to the widget and not to the context menu.
+ * See `ownsHeldPress` for why the rest — knob, fader, hfader — are not here.
+ */
+const HOLD_WIDGETS: ReadonlySet<string> = new Set([
+  'keys',
+  'button',
+  'select',
+  'toggle',
+  'xy',
+  'wavedraw',
+  'seqgrid',
+  'sampleview',
+]);
+
+/** Block visuals that act on press (`widgetDown` has a branch for each). */
+const PRESS_VISUALS: ReadonlySet<string> = new Set(['eq', 'matrix', 'speakers']);
 
 type DragState =
   | { kind: 'none' }
@@ -239,6 +258,17 @@ export class Editor {
   private longPressTimer = 0;
   private longPressAt: Vec2 | null = null;
   private longPressFired = false;
+  /**
+   * Has this press travelled far enough to be a drag rather than a hold?
+   *
+   * Deliberately a much smaller distance than `LONGPRESS_SLOP`. The slop is the
+   * budget for a fingertip ROLLING while it holds still, so it has to be
+   * generous; this is the question "did the user start moving something", where
+   * a few px of deliberate travel is already a yes. Between the two distances
+   * the press stays a live drag AND stops being a candidate for the menu, which
+   * is the gap the old code fell through.
+   */
+  private longPressNudged = false;
   /** Suppress the OS-synthesized contextmenu right after our own long-press. */
   private suppressNativeCtxUntil = 0;
   /** When the last drag ended — see `dragIsLive`. */
@@ -708,13 +738,47 @@ export class Editor {
     this.renderer.invalidate();
   }
 
-  /** Does a canvas point land on an interactive (held) face widget? Such spots
-   *  suppress long-press so holding a note/knob/button isn't hijacked. */
-  private overWidget(p: Vec2): boolean {
+  /**
+   * Does a canvas point land on a widget that OWNS a held press — one whose
+   * press has already sounded, latched, or committed a value, so that opening a
+   * context menu 500 ms later would land on top of something that already
+   * happened?
+   *
+   * This used to be "any face item that isn't the title", and that was too
+   * wide by exactly the widgets people actually build faces out of. A knob, a
+   * fader and an hfader are RELATIVE drags: `widgetDown` records where the
+   * value started and changes nothing at all until the finger moves — and a
+   * finger that moves has already cancelled the long-press at `LONGPRESS_NUDGE`
+   * long before the timer fires. So a still finger on a knob is doing nothing,
+   * yet under the old rule it could not reach the block menu, and most block
+   * faces are knobs. On a touchscreen, where the menu is the only way to
+   * delete, duplicate or open a block's Advanced tab, that made a knob-covered
+   * block unreachable — one half of "it doesn't pop up when I want it to".
+   *
+   * The other kinds genuinely do own the press, for three different reasons,
+   * all of them visible in `widgetDown` right below:
+   *   - `keys` sounds a note for as long as the finger is down.
+   *   - `button` is momentary: held at 1 until release.
+   *   - `select` opens a prompt modal; a canvas menu behind a modal is wrong.
+   *   - `toggle`, `xy`, `wavedraw`, `seqgrid`, `sampleview` all commit on
+   *     press, at the point touched, before anyone knows it will be a hold.
+   * Two-finger tap stays the documented way to reach the menu over those.
+   */
+  private ownsHeldPress(p: Vec2): boolean {
     const b = blockAt(doc.graph, p);
     if (!b) return false;
-    const item = faceItemAt(b, doc.scene.theme, p);
-    return !!item && item.ref !== 'title';
+    const item = this.tangibleItemAt(b, p);
+    if (!item) return false;
+    // The three visuals that act on press. Mirrors `widgetDown`'s own branches
+    // — an inert visual (scope, spectrogram) falls through to a block drag
+    // there, and so may be held here.
+    if (item.ref === 'visual') return PRESS_VISUALS.has(getDef(b.type).visual ?? '');
+    const w = this.widgetAt(b, p);
+    // Not a param widget at all (title, silkscreen, a label) — nothing to own
+    // the press. `SWAPPABLE_WIDGETS` only ever swaps knob/fader/hfader for each
+    // other, all three of which are relative, so the override cannot change the
+    // answer and does not need resolving here.
+    return !!w && HOLD_WIDGETS.has(w.spec.widget);
   }
 
   /** Open the context menu at a client point (two-finger tap has no MouseEvent). */
@@ -805,22 +869,67 @@ export class Editor {
     }
 
     // Touch has no right-click. A stationary one-finger press opens the context
-    // menu — but ONLY off interactive widgets, so holding a note button, key,
-    // knob, or fader is never hijacked. Over widgets, use a two-finger tap.
-    if (e.pointerType === 'touch' && !this.overWidget(p)) {
-      this.longPressAt = { x: e.clientX, y: e.clientY };
-      this.longPressFired = false;
+    // menu — everywhere except on a widget whose press is itself the
+    // interaction (a key, a momentary button, anything that commits where you
+    // touched). Holding a knob or fader DOES open it: those change nothing
+    // until the finger moves. See `ownsHeldPress`. Two-finger tap reaches the
+    // menu over the rest.
+    if (e.pointerType === 'touch' && !this.ownsHeldPress(p)) {
+      // ORDER MATTERS, and getting it wrong is invisible.
+      //
+      // `clearLongPress()` nulls `longPressAt` as well as killing the timer, so
+      // calling it *after* setting the anchor — which is what this did — left
+      // the anchor null for the whole press. `pointerMove` cancels on
+      // `if (this.longPressAt && …)`, so the cancel never ran and NO amount of
+      // movement could stop the menu: 500 ms after any touch-down on the
+      // canvas, the menu opened and `abortDrag()` threw away whatever was being
+      // drawn. Only block drags survived, via their separate `moved` check.
+      //
+      // That is the whole of "it pulls up the right click menu when you are
+      // holding AND moving", and why the workaround was to draw every wire and
+      // every marquee fast enough to finish inside 500 ms. Stale state cleared
+      // FIRST, then the new press recorded.
       this.clearLongPress();
+      this.longPressAt = { x: e.clientX, y: e.clientY };
+      this.longPressNudged = false;
+      this.longPressFired = false;
       this.longPressTimer = window.setTimeout(() => {
         this.longPressTimer = 0;
-        // The finger has stayed within 10 px (or the move handler would have
-        // cancelled this), but it has already NUDGED the block — `moved` is set
-        // by the first pointermove of a drag, at any distance. Firing here
-        // would `abortDrag()`, snapping the block back to where it started, and
-        // put a menu over it: a careful, slow reposition punished for being
-        // careful. If the user has begun moving something, they are moving it.
+        // The finger has stayed within LONGPRESS_SLOP (or the move handler
+        // would have cancelled this) — but staying inside the slop is NOT the
+        // same as not having started. Firing on top of a drag that is already
+        // under way `abortDrag()`s it and puts a menu over the wreckage: a
+        // careful, slow gesture punished for being careful.
+        //
+        // This used to check only `d.kind === 'blocks' && d.moved`, which left
+        // the two gestures you make most often on a touchscreen unprotected —
+        // dragging a WIRE and dragging a MARQUEE, neither of which carries a
+        // `moved` flag. Both begin the moment the finger lands, so a slow,
+        // deliberate connection or selection sat inside the slop for 500 ms and
+        // got a menu instead. The workaround was to make every wire and every
+        // selection FAST, which is exactly backwards: precision is the thing
+        // that needs slowness. Hence a general "has this press moved at all"
+        // flag, applied to whatever the drag happens to be.
+        //
+        // The rule is now the same one docs/14-input.md states for the
+        // OS-synthesized menu (Rule 9): a menu on top of a live drag is wrong,
+        // whatever kind of drag it is. Perfectly still still opens the menu —
+        // that is the gesture — but "still" now means still, not "within 10 px".
+        //
+        // `d.moved` USED TO BE OR-ED IN HERE, AND THAT IS WHY THE MENU STOPPED
+        // WORKING ON BLOCKS. `moved` is set by the first `pointermove` of a
+        // block drag at ANY distance — there is no threshold on it, because its
+        // real job is "is there something to commit / revert on release", where
+        // sub-pixel is still a move. A finger emits pointermove constantly, so
+        // over a block the flag was true within milliseconds of touching down
+        // and this guard returned every single time. Empty canvas kept working
+        // purely because a marquee has no `moved` flag and so was judged by the
+        // 3 px nudge instead — which is the correct test, and is now the only
+        // test. `moved` still exists for the two jobs that want it (reverting an
+        // aborted drag, and deciding whether a release is a drop); it just no
+        // longer has a vote on whether a press is a hold.
         const d = this.drag;
-        if (d.kind === 'blocks' && d.moved) return;
+        if (d.kind !== 'none' && this.longPressNudged) return;
         this.longPressFired = true;
         this.suppressNativeCtxUntil = performance.now() + 800;
         this.abortDrag();
@@ -1048,11 +1157,10 @@ export class Editor {
       const gm = matrixGeom(matrixFaceRect({ x: o.x + item.x, y: o.y + item.y, w: item.w, h: item.h }), ins, outs);
       const cell = matrixCellAt(gm, p.x, p.y);
       if (!cell) return false;
+      const cur = parseMatrix(b.params.grid, ins, outs)[crossIndex(ins, cell.i, cell.o)];
+      const next = setCrosspoint(b.params.grid, ins, outs, cell.i, cell.o, toggledCrosspoint(cur, shift));
+      if (next == null) return false;
       doc.pushHistory();
-      const grid = parseMatrix(b.params.grid, ins, outs);
-      const k = crossIndex(ins, cell.i, cell.o);
-      grid[k] = shift ? (grid[k] > 0.49 && grid[k] < 0.51 ? 0 : 0.5) : grid[k] > 0.001 ? 0 : 1;
-      const next = serializeMatrix(grid, ins, outs);
       b.params.grid = next;
       runtime.sendParam(runtime.nodeId(b.id), 'grid', next);
       doc.touch('param');
@@ -1593,9 +1701,15 @@ export class Editor {
   // ---------- pointer move ----------
   private pointerMove(e: PointerEvent): void {
     this.gesture.update(e.pointerId, this.localPt(e));
-    // A moving finger is a pan/drag, not a long-press.
-    if (this.longPressAt && Math.hypot(e.clientX - this.longPressAt.x, e.clientY - this.longPressAt.y) > LONGPRESS_SLOP)
-      this.clearLongPress();
+    // A moving finger is a pan/drag, not a long-press. Two distances, because
+    // there are two different questions (see `longPressNudged`): past the
+    // NUDGE the press has begun moving something and may no longer become a
+    // menu; past the SLOP it is unambiguously a drag and the timer is dropped.
+    if (this.longPressAt) {
+      const travel = Math.hypot(e.clientX - this.longPressAt.x, e.clientY - this.longPressAt.y);
+      if (travel > LONGPRESS_NUDGE) this.longPressNudged = true;
+      if (travel > LONGPRESS_SLOP) this.clearLongPress();
+    }
     if (this.gesture.active) {
       this.applyGesture();
       return;
@@ -2513,25 +2627,6 @@ export class Editor {
                 },
           );
         items.push({ sep: true });
-        if (fi && dockable(fi.ref))
-          items.push(
-            isWidgetDocked(path, fi.ref)
-              ? {
-                  label: 'Remove from Dock',
-                  action: () => {
-                    doc.pushHistory();
-                    removeWidgetFromDock(path, fi.ref);
-                  },
-                }
-              : {
-                  label: 'Add to Dock',
-                  action: () => {
-                    doc.pushHistory();
-                    addWidgetToDock(path, fi.ref);
-                    showDockTab('widgets');
-                  },
-                },
-          );
         // Mirror onto the parent custom block, from either side of the seam.
         if (linkable)
           items.push({
@@ -2578,6 +2673,40 @@ export class Editor {
           ? [
               { label: 'Bring to front', action: () => this.reorderFaceItem(b, fi.ref, true) },
               { label: 'Send to back', action: () => this.reorderFaceItem(b, fi.ref, false) },
+            ]
+          : [];
+
+      /**
+       * Dock the item under the cursor.
+       *
+       * **Keyed on the face item, not on `w`.** This used to live inside
+       * `widgetItems()`, which is only spliced in when `w` — a *param* widget —
+       * resolved. A visual is a face item with no `ParamSpec`, so a Matrix, an
+       * EQ curve, a scope, a meter or a speaker display could not be docked on
+       * its own at all: the only route was "Dock all controls on this block",
+       * which drags along every knob you didn't want. Nothing below the menu
+       * needed changing — `resolveRefAtPath` has always returned a `visual`
+       * ref and `refSize` has always had sizes for them.
+       */
+      const dockItems: MenuItem[] =
+        fi && dockable(fi.ref)
+          ? [
+              isWidgetDocked(path, fi.ref)
+                ? {
+                    label: 'Remove from Dock',
+                    action: () => {
+                      doc.pushHistory();
+                      removeWidgetFromDock(path, fi.ref);
+                    },
+                  }
+                : {
+                    label: 'Add to Dock',
+                    action: () => {
+                      doc.pushHistory();
+                      addWidgetToDock(path, fi.ref);
+                      showDockTab('widgets');
+                    },
+                  },
             ]
           : [];
 
@@ -2828,6 +2957,7 @@ export class Editor {
         // burying them one level down cost a click every time.
         numeric ? { label: `Set ${wName}…`, action: () => this.promptWidgetValue(b, w!) } : {},
         ...(w ? widgetItems() : []),
+        ...dockItems,
         dockAllItem,
         kindItems.length ? { label: `Type: ${curKind} ▸`, action: () => sub(kindItems) } : {},
         { sep: true },

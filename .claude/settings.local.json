@@ -16,7 +16,15 @@
       "Bash(ls -la \"C:\\\\Users\\\\willi\\\\AppData\\\\Roaming\\\\LivePatch\\\\diagnostics\\\\\" | tail -20)",
       "PowerShell(npm run typecheck 2>&1)",
       "Bash(node -e \"for\\(const k of ['GH_TOKEN','GITHUB_TOKEN','GH_TOKEN_FILE']\\)console.log\\(k, process.env[k]?'SET':'unset'\\)\")",
-      "Bash(gh auth *)"
+      "Bash(gh auth *)",
+      "Bash(ls -la \"C:/Users/willi/Downloads/session-export-1785630931181.zip\" 2>/dev/null || echo \"NOT FOUND\")",
+      "Bash(ls -la \"/c/Users/willi/Downloads/session-export-1785678236395.zip\")",
+      "Bash(mkdir -p \"/c/Users/willi/AppData/Local/Temp/claude/C--SurroundApp-2/9f98c8fb-6aa1-4159-b483-2b6d2ac1ee8c/scratchpad/export\")",
+      "Read(//c/Users/willi/AppData/Local/Temp/claude/C--SurroundApp-2/9f98c8fb-6aa1-4159-b483-2b6d2ac1ee8c/scratchpad/**)",
+      "Bash(unzip -o \"/c/Users/willi/Downloads/session-export-1785678236395.zip\")",
+      "Bash(ls -la \"C:/Users/willi/Downloads/session-export-1785702225028.zip\")",
+      "Bash(mkdir -p \"C:/Users/willi/AppData/Local/Temp/claude/C--SurroundApp-2/88d99766-3a7b-48e4-a429-884348e35963/scratchpad/sx\")",
+      "Bash(unzip -o \"C:/Users/willi/Downloads/session-export-1785702225028.zip\")"
     ]
   }
 }

@@ -26,8 +26,9 @@ import './ui/adveq';
 import './ui/advpath';
 import './ui/advmatrix';
 import './ui/rigview';
-import { dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
+import { DOCK_PANEL_ID, dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
 import { initWidgetDock } from './ui/widgetdock';
+import { initMainDockLink, mirrorDock, sendParamToDock, setDockRevealHandler, valueFramePump } from './ui/docklink';
 
 function buildDemoScene(): void {
   const t = doc.scene.theme;
@@ -248,7 +249,46 @@ function boot(): void {
     }
   });
 
-  (window as any).__lp = { doc, renderer, editor, runtime };
+  // ---- the detached Dock window (docs/07-ui.md) ----
+  //
+  // This window stays the sole authority for the document and the audio; the
+  // detached one holds a replica driven from here.
+  initMainDockLink((detached) => {
+    // The Dock moved to the other display, so by default this window reclaims
+    // the height for the canvas — which is the point of having a second
+    // screen. Opt into `dockMirror` to keep a live copy here as well; see
+    // `docs/07-ui.md` for the measured cost of doing so.
+    if (detached && !mirrorDock()) dock.hide(DOCK_PANEL_ID);
+    else dock.show(DOCK_PANEL_ID);
+    renderer.resize();
+    renderer.invalidate();
+  });
+  // Every param write made here also reaches the replica. A hook on the
+  // runtime rather than an interception at each widget: there are dozens of
+  // call sites and one of them would inevitably be missed.
+  runtime.onParamSent = sendParamToDock;
+  // "Source: …" in the detached window raises this one and shows the block.
+  setDockRevealHandler((path) => {
+    editor.revealBlockAt(path);
+    renderer.invalidate();
+  });
+
+  /**
+   * Optional frame-WORK accounting, off unless a harness turns it on.
+   *
+   * How long the frame's work takes is not the same thing as the gap between
+   * frames: with two windows on one display, rAF intervals are set by
+   * compositor scheduling, which swamps the cost you are trying to see. The
+   * first attempt at pricing the mirrored Dock measured intervals and produced
+   * a confident, entirely backwards answer. `LIVEPATCH_DOCKWIN_PERF` reads
+   * this instead.
+   *
+   * Declared here, above `__lp`, because it is published on it — a `const`
+   * declared after the assignment is in its temporal dead zone and throws.
+   */
+  const frameStats: { on: boolean; samples: number[] } = { on: false, samples: [] };
+
+  (window as any).__lp = { doc, renderer, editor, runtime, frameStats };
 
   // Render on demand: always while audio runs (live meters/visuals), otherwise
   // only when something changed. Keeps idle CPU near zero.
@@ -256,6 +296,7 @@ function boot(): void {
   // for the rest of the session while the rest of the UI keeps working.
   let lastDrawErr = '';
   const tick = (): void => {
+    const t0 = frameStats.on ? performance.now() : 0;
     if (renderer.dirty || runtime.audioOn) {
       try {
         runtime.poll();
@@ -272,6 +313,12 @@ function boot(): void {
     // The Dock's canvases ride this one loop — they must never start their own
     // rAF (docs/10-performance.md). A closed Dock costs one lookup per frame.
     dockFrame(runtime.audioOn);
+    // Ship the detached window its value frame. Internally rate-limited to the
+    // rates the engine actually produces (meters ~20 Hz, mods ~30 Hz, visuals
+    // ~15 Hz) — sending at 60 would spend IPC on information that does not
+    // exist, from the renderer holding the audio deadline. No-op when attached.
+    valueFramePump(runtime.audioOn);
+    if (frameStats.on) frameStats.samples.push(performance.now() - t0);
   };
   const frame = (): void => {
     tick();

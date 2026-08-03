@@ -7,6 +7,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
+// LAN control surface. Requiring it starts nothing — the module only listens
+// once `startLanServer` is called, which the app never does at boot.
+const lan = require('./lanserver.cjs');
+const keys = require('./keys.cjs');
 
 const SCENE_EXT = '.lps'; // LivePatch Scene (JSON)
 
@@ -371,6 +375,20 @@ function pushToRenderer(msg) {
   // funnels through here, so this one line captures the whole stream without
   // touching the engine or the audio path.
   diagFromEngine(msg);
+  // `key-out` fired. Handled HERE rather than forwarded to the renderer,
+  // because injection must work with the window minimised or unfocused — and
+  // because the renderer has no way to press a key anyway. A failure is
+  // swallowed on purpose: this runs once per gate edge, and a throw in this
+  // path would take out the engine message pump (the modal-loop lesson,
+  // docs/11).
+  if (msg && msg.op === 'send-key') {
+    try {
+      keys.sendKey(String(msg.accel || ''));
+    } catch (err) {
+      diagWrite('keys', { error: String(err && err.message), accel: String(msg.accel || '') });
+    }
+    return;
+  }
   if (engineWin && !engineWin.isDestroyed()) engineWin.webContents.send('engine:message', msg);
 }
 
@@ -630,6 +648,150 @@ function createWindow() {
   if (devUrl) win.loadURL(devUrl);
   else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   engineWin = win;
+  // The detached Dock is a CONTROLLER for this window, not an independent app.
+  // If the main window goes, it has nothing left to control — and leaving it
+  // open would hold the whole process alive past `window-all-closed`, giving
+  // the user a dock with no editor behind it and no way to get one back.
+  win.on('closed', () => closeDockWindow());
+}
+
+// ============================================================================
+// The detached Dock window (dock.html).
+//
+// A second BrowserWindow showing only the Dock, meant for a second display —
+// typically a touchscreen. See docs/07-ui.md.
+//
+// It is deliberately NOT a `parent:` child window: a child is always-on-top of
+// its parent and follows it around, which is the opposite of what a panel
+// parked on another monitor should do.
+// ============================================================================
+let dockWin = null;
+
+function dockStateFile() {
+  return path.join(app.getPath('userData'), 'dockwindow.json');
+}
+
+function loadDockState() {
+  try {
+    return JSON.parse(fs.readFileSync(dockStateFile(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveDockState() {
+  if (!dockWin || dockWin.isDestroyed()) return;
+  try {
+    // `getNormalBounds` and not `getBounds`: the latter returns the *screen*
+    // rect while fullscreen, so closing from fullscreen would save the
+    // fullscreen rect as the restore size and the window could never be small
+    // again. Same family as the floating-panel size bug in docs/07-ui.md.
+    const b = dockWin.getNormalBounds();
+    fs.writeFileSync(dockStateFile(), JSON.stringify({ bounds: b, fullScreen: dockWin.isFullScreen() }), 'utf8');
+  } catch {
+    /* a window position is not worth failing a close over */
+  }
+}
+
+/**
+ * Keep saved bounds only if they still land on a display that exists.
+ *
+ * The whole point of this window is that it lives on a second monitor, so
+ * "that monitor is not plugged in today" is the normal case, not the edge
+ * case — and restoring those coordinates would open the window somewhere the
+ * user cannot see or reach.
+ */
+function boundsOnSomeDisplay(b) {
+  if (!b || ![b.x, b.y, b.width, b.height].every((n) => typeof n === 'number' && Number.isFinite(n))) return false;
+  if (b.width < 200 || b.height < 150) return false;
+  const { screen } = require('electron');
+  // Require the window's top-left region to intersect a work area, not merely
+  // to touch it — a 1 px overlap is still unusable.
+  return screen.getAllDisplays().some((d) => {
+    const w = d.workArea;
+    return b.x + b.width > w.x + 40 && b.x < w.x + w.width - 40 && b.y + 80 > w.y && b.y < w.y + w.height - 40;
+  });
+}
+
+function createDockWindow() {
+  if (dockWin && !dockWin.isDestroyed()) {
+    if (dockWin.isMinimized()) dockWin.restore();
+    dockWin.show();
+    dockWin.focus();
+    return;
+  }
+  const saved = loadDockState();
+  const useSaved = boundsOnSomeDisplay(saved.bounds);
+  dockWin = new BrowserWindow({
+    ...(useSaved ? saved.bounds : { width: 1100, height: 520 }),
+    minWidth: 420,
+    minHeight: 220,
+    backgroundColor: '#14161a',
+    title: 'LivePatch — Dock',
+    ...(app.isPackaged ? {} : { icon: path.join(__dirname, '..', 'build', 'icon.ico') }),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // NOT optional here, and more load-bearing than on the main window.
+      //
+      // This window is on the OTHER monitor: it is, by construction, the one
+      // that is not focused. Chromium throttles a window it thinks nobody is
+      // watching, and a throttled dock is one whose meters freeze and whose
+      // knobs stop tracking the finger — on the surface the user is actually
+      // touching. The process-wide switches at the top of this file cover
+      // backgrounding; this covers the window. Both are needed
+      // (docs/10-performance.md rule 8).
+      backgroundThrottling: false,
+    },
+  });
+  if (saved.fullScreen) dockWin.setFullScreen(true);
+  dockWin.webContents.once('did-finish-load', () => pushConsumerCount());
+
+  for (const ev of ['minimize', 'restore', 'focus', 'blur', 'hide', 'show']) {
+    dockWin.on(ev, () => diagWrite('dockwindow', { state: ev }));
+  }
+  // Save on the *events*, not only on close: a crash or a kill would otherwise
+  // lose the placement, and placement is the entire convenience of this window.
+  for (const ev of ['moved', 'resized', 'enter-full-screen', 'leave-full-screen']) {
+    dockWin.on(ev, () => saveDockState());
+  }
+
+  const devUrl = process.env.LIVEPATCH_DEV_URL;
+  if (devUrl) dockWin.loadURL(devUrl.replace(/\/?$/, '/') + 'dock.html');
+  else dockWin.loadFile(path.join(__dirname, '..', 'dist', 'dock.html'));
+
+  dockWin.on('close', () => saveDockState());
+  dockWin.on('closed', () => {
+    dockWin = null;
+    // Tell the main window so it can put the Dock back in its bottom zone.
+    if (engineWin && !engineWin.isDestroyed()) engineWin.webContents.send('dockwin:attached');
+    // …and separately, that one consumer went away. These are different facts:
+    // re-attaching the panel is a UI change, while the value-frame pump must
+    // keep running if a phone is still connected.
+    pushConsumerCount();
+  });
+}
+
+function closeDockWindow() {
+  if (dockWin && !dockWin.isDestroyed()) dockWin.close();
+  dockWin = null;
+}
+
+/**
+ * Tell the main window how many surfaces are listening.
+ *
+ * The renderer used to gate its value-frame pump on a boolean set when the
+ * detached window opened — which meant closing that window stopped the feed to
+ * every connected PHONE as well, and connecting a phone with no detached
+ * window fed it nothing at all. The number of consumers is a fact only this
+ * process has, so it is this process's job to report it.
+ */
+function pushConsumerCount() {
+  if (!engineWin || engineWin.isDestroyed()) return;
+  const n = (dockWin && !dockWin.isDestroyed() ? 1 : 0) + lan.lanStatus().clients;
+  engineWin.webContents.send('dockwin:message', { t: 'consumers', n });
 }
 
 /**
@@ -818,6 +980,45 @@ app.whenReady().then(() => {
     return r.filePath;
   });
 
+  // ---- Export as Player ----
+  // Writes the bake bundle produced by `src/core/bake.ts`. Assembling it into a
+  // standalone .exe needs the player runtime (a node build + the player UI),
+  // which is built separately — so this reports WHICH artifact it wrote rather
+  // than quietly producing something other than what the button offered.
+  ipcMain.handle('dialog:exportPlayer', async (e, name, data, opts) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    const safe = String(name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') || 'Player';
+    // One exe per scene = the template + this bake appended. The template is
+    // built separately (`node scripts/build-player.mjs`) because it is ~116 MB
+    // and identical for every scene; baking a second scene must copy a file and
+    // write a tail, not re-run a build.
+    const template = path.join(__dirname, '..', 'build', 'player', 'livepatch-player.exe');
+    const canExe = !!(opts && opts.singleExe) && fs.existsSync(template);
+    const ext = canExe ? 'exe' : 'lpplayer';
+    const r = await dialog.showSaveDialog(win, {
+      title: 'Export as Player',
+      defaultPath: safe + '.' + ext,
+      filters: canExe
+        ? [{ name: 'Windows Executable', extensions: ['exe'] }]
+        : [{ name: 'LivePatch Player Bundle', extensions: ['lpplayer'] }],
+    });
+    if (r.canceled || !r.filePath) return null;
+    const bake = Buffer.from(data);
+    if (!canExe) {
+      fs.writeFileSync(r.filePath, bake);
+      return { path: r.filePath, bytes: bake.length, kind: 'bundle' };
+    }
+    // Footer read back by `findBake()` in player/server.cjs. Windows PE images
+    // ignore trailing bytes, so the exe still runs with this on the end.
+    const FOOTER_MAGIC = 'LPBAKEND';
+    const footer = Buffer.alloc(FOOTER_MAGIC.length + 4);
+    footer.write(FOOTER_MAGIC, 0, 'latin1');
+    footer.writeUInt32LE(bake.length, FOOTER_MAGIC.length);
+    fs.copyFileSync(template, r.filePath);
+    fs.appendFileSync(r.filePath, Buffer.concat([bake, footer]));
+    return { path: r.filePath, bytes: fs.statSync(r.filePath).size, kind: 'exe' };
+  });
+
   // ---- Cassette store ----
   ipcMain.handle('cassettes:list', () => {
     return fs
@@ -906,6 +1107,92 @@ app.whenReady().then(() => {
     engineSendRaw(msg);
     return true;
   });
+
+  // ---- Detached Dock window ----
+  ipcMain.handle('dockwin:open', () => {
+    createDockWindow();
+    return true;
+  });
+  ipcMain.handle('dockwin:close', () => {
+    closeDockWindow();
+    return true;
+  });
+  ipcMain.handle('dockwin:isOpen', () => !!(dockWin && !dockWin.isDestroyed()));
+  ipcMain.handle('dockwin:setFullScreen', (_e, on) => {
+    if (dockWin && !dockWin.isDestroyed()) dockWin.setFullScreen(!!on);
+    return true;
+  });
+  ipcMain.handle('dockwin:isFullScreen', () => !!(dockWin && !dockWin.isDestroyed() && dockWin.isFullScreen()));
+
+  /**
+   * Window-to-window relay.
+   *
+   * `ipcMain.on` + `webContents.send`, not `handle`/`invoke`: this carries the
+   * document sync and the live value stream, so it runs many times a second
+   * and must not pay for a promise round trip per message. Payloads go through
+   * structured clone, so the typed arrays that visuals are made of survive
+   * without being flattened to JSON.
+   *
+   * Direction is inferred from the sender rather than passed in, which is what
+   * keeps the two renderers from having to know they are two.
+   */
+  ipcMain.on('dockwin:send', (e, msg) => {
+    // Wrapped, and this is not defensive padding — it is a lesson.
+    //
+    // An earlier version of this handler referenced an undefined symbol. This
+    // runs on EVERY value frame, so the throw became Electron's "A JavaScript
+    // error occurred in the main process" dialog, reappearing the instant it
+    // was dismissed, dozens of times a second: the app could not be closed by
+    // the person using it. A bug in a hot relay must degrade into a dropped
+    // message, never into a modal loop that locks the user out of their own
+    // machine.
+    try {
+      const from = BrowserWindow.fromWebContents(e.sender);
+      const to = from === dockWin ? engineWin : dockWin;
+      if (to && !to.isDestroyed()) to.webContents.send('dockwin:message', msg);
+      // The main window's half of the conversation also goes to every remote
+      // control surface. They are additional listeners on the same link, not a
+      // second protocol — which is the entire reason the phone works at all.
+      if (from === engineWin) lan.lanBroadcast(msg);
+    } catch (err) {
+      diagWrite('dockwin', { relayError: String((err && err.message) || err) });
+    }
+  });
+
+  // ---- LAN control surface (phone / tablet) ----
+  //
+  // Off until asked. See electron/lanserver.cjs for the security posture.
+  ipcMain.handle('lan:start', (_e, opts) =>
+    lan.startLanServer({
+      distDir: path.join(__dirname, '..', 'dist'),
+      port: (opts && opts.port) || 8731,
+      host: opts && opts.localOnly ? '127.0.0.1' : '0.0.0.0',
+      onRequest: serveAssets,
+      // A remote surface speaks the same link protocol as the detached window,
+      // so its messages are handed to the main window through the same channel.
+      relay: (msg) => {
+        if (engineWin && !engineWin.isDestroyed()) engineWin.webContents.send('dockwin:message', msg);
+      },
+      onClientsChanged: pushConsumerCount,
+    }),
+  );
+  ipcMain.handle('lan:stop', () => {
+    lan.stopLanServer();
+    return lan.lanStatus();
+  });
+  ipcMain.handle('lan:status', () => lan.lanStatus());
+
+  // ---- Keyboard blocks ----
+  // The renderer owns the document, so it is what knows which accelerators the
+  // scene's `key-in` blocks want. It calls this on structural changes; the
+  // press is delivered straight to the ENGINE, never back through the renderer,
+  // so a `key-in` keeps working with the window minimised.
+  ipcMain.handle('keys:watch', (_e, accels) =>
+    keys.setWatchedKeys(Array.isArray(accels) ? accels : [], (accel, down) =>
+      engineSendRaw({ op: 'key-event', accel, down }),
+    ),
+  );
+  ipcMain.handle('keys:send', (_e, accel) => keys.sendKey(String(accel || '')));
 
   // ---- In-app updates ----
   ipcMain.handle('updates:check', async () => {
@@ -1095,14 +1382,424 @@ app.whenReady().then(() => {
     return;
   }
 
+  // Detached-Dock check (dev aid): LIVEPATCH_DOCKWIN_SMOKE=1 opens both
+  // windows, drives the real detach path and the real IPC relay, prints one
+  // PASS/FAIL line per assertion, and exits non-zero on any failure.
+  //
+  // It exists because the interesting half of that feature is unobservable
+  // from a browser: `window.livepatchNative` is absent there, so the detach
+  // button does not even render, and document sync, the value frame and the
+  // watch set are all untestable. Everything below needs two real renderers
+  // and a real main process between them. See docs/12-testing-checklist.md.
+  if (process.env.LIVEPATCH_DOCKWIN_SMOKE) {
+    void runDockWindowSmoke();
+    return;
+  }
+
+  // Keyboard-blocks check (dev aid): LIVEPATCH_KEYS_SMOKE=1 closes the loop —
+  // register a global accelerator, inject that same keystroke through the
+  // Win32 injector, and see whether the registration fires.
+  //
+  // It has to run in a real Electron main process: `globalShortcut` does not
+  // exist anywhere else, and neither half of this feature is observable from a
+  // renderer. F13 is the test key on purpose — it exists in Windows, no
+  // physical keyboard has it, and essentially nothing binds it, so injecting it
+  // cannot disturb whatever else the machine is doing.
+  if (process.env.LIVEPATCH_KEYS_SMOKE) {
+    void runKeysSmoke();
+    return;
+  }
+
+  // Detached-Dock cost (dev aid): LIVEPATCH_DOCKWIN_PERF=1 measures the main
+  // window's frame budget attached / detached+collapsed / detached+mirrored.
+  if (process.env.LIVEPATCH_DOCKWIN_PERF) {
+    void runDockWindowPerf();
+    return;
+  }
+
+  // Remote-surface check (dev aid): LIVEPATCH_LAN_SMOKE=1 boots the app, turns
+  // the LAN server on, prints the URL, and stays up so a real browser (or a
+  // real phone) can connect. Exercises the WebSocket transport end to end —
+  // the attack suite covers the server, but not the client half.
+  if (process.env.LIVEPATCH_LAN_SMOKE) {
+    createWindow();
+    engineWin.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        // Seed a saved rig so the harness can prove INSTALLATION state
+        // reaches a fresh device — the "user presets aren't showing, the
+        // factory ones are" case. Factory rigs are hardcoded and would show
+        // even with the sync broken, so testing with them proves nothing.
+        void engineWin.webContents.executeJavaScript(
+          `localStorage.setItem('livepatch.rigpresets', JSON.stringify([
+             { name: 'SMOKE_TEST_RIG', rig: { name: 'SMOKE_TEST_RIG', speakers: [
+               { name:'L', az: 30, el: 0, dist: 2, out: 1 },
+               { name:'R', az:-30, el: 0, dist: 2, out: 2 } ] } }
+           ]));`,
+        );
+        const st = lan.startLanServer({
+          distDir: path.join(__dirname, '..', 'dist'),
+          port: 8731,
+          host: '127.0.0.1', // a test binds to loopback, never the LAN
+          relay: (msg) => {
+            if (engineWin && !engineWin.isDestroyed()) engineWin.webContents.send('dockwin:message', msg);
+          },
+          onClientsChanged: pushConsumerCount,
+        });
+        process.stdout.write(`LAN_URL http://127.0.0.1:${st.port}/#${st.token}\n`);
+      }, 1500);
+    });
+    return;
+  }
+
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
+/** Resolve once a window has finished loading its document. */
+function whenLoaded(win) {
+  return new Promise((resolve) => {
+    if (!win.webContents.isLoading()) return resolve();
+    win.webContents.once('did-finish-load', () => resolve());
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function runDockWindowSmoke() {
+  let failures = 0;
+  const check = (name, ok, detail) => {
+    if (!ok) failures++;
+    process.stdout.write(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail === undefined ? '' : `  — ${detail}`}\n`);
+  };
+
+  try {
+    createWindow();
+    await whenLoaded(engineWin);
+    // The renderer boots asynchronously (session restore, cassette index).
+    await sleep(1500);
+
+    const mainJs = (src) => engineWin.webContents.executeJavaScript(src);
+    const dockJs = (src) => dockWin.webContents.executeJavaScript(src);
+
+    // ---- detach via the real control, not a back door ----
+    const clicked = await mainJs(
+      `(() => { const b = document.querySelector('.tb-btn[title*="own window"]'); if (!b) return false; b.click(); return true; })()`,
+    );
+    check('detach button exists in the main window', clicked === true);
+    await sleep(1200);
+
+    check('dock window was created', !!(dockWin && !dockWin.isDestroyed()));
+    if (!dockWin || dockWin.isDestroyed()) throw new Error('no dock window — cannot continue');
+    await whenLoaded(dockWin);
+    await sleep(1200);
+
+    check(
+      'dock window loaded dock.html',
+      (await dockJs(`document.body.classList.contains('dock-window')`)) === true,
+    );
+    check('dock window has no workspace', (await dockJs(`getComputedStyle(document.getElementById('workspace')).display`)) === 'none');
+    // Mirroring is ON by default (measured free — see docs/07-ui.md), so the
+    // main window KEEPS its Dock. Both modes are asserted, because the default
+    // is a decision that could reasonably be revisited and the opt-out has to
+    // keep working when it is.
+    check('main window kept its mirrored Dock (default)', (await mainJs(`!!document.querySelector('#dock-bottom .panel')`)) === true);
+    await mainJs(`localStorage.setItem('livepatch.dock.mirror','0'); window.__lp && document.querySelector('#dock-bottom .panel') && document.querySelector('.tb-btn[data-panel="dockpanel"]').click();`);
+    await sleep(400);
+    check('opting out of mirroring collapses it', (await mainJs(`!document.querySelector('#dock-bottom .panel')`)) === true);
+    await mainJs(`localStorage.setItem('livepatch.dock.mirror','1'); document.querySelector('.tb-btn[data-panel="dockpanel"]').click();`);
+    await sleep(400);
+
+    // ---- the window must NOT have an engine (docs/10 rule 8) ----
+    check('dock window runs no AudioContext', (await dockJs(`!window.__lpdock.runtime.webaudio.ctx`)) === true);
+    check('dock window uses the RemoteEngine', (await dockJs(`window.__lpdock.runtime.engine.name`)) === 'remote');
+
+    // ---- main → dock: the initial scene snapshot ----
+    const mainBlocks = await mainJs(`window.__lp.doc.scene.root.blocks.length`);
+    const dockBlocks = await dockJs(`window.__lpdock.doc.scene.root.blocks.length`);
+    check('scene replicated to the dock window', mainBlocks > 0 && mainBlocks === dockBlocks, `main=${mainBlocks} dock=${dockBlocks}`);
+
+    // ---- main → dock: a structural edit ----
+    await mainJs(`window.__lp.doc.addBlock('gain', { x: 40, y: 40 }); window.__lp.doc.touch('structure');`);
+    await sleep(700);
+    const after = await dockJs(`window.__lpdock.doc.scene.root.blocks.length`);
+    check('structural edit reached the dock window', after === mainBlocks + 1, `expected ${mainBlocks + 1}, got ${after}`);
+
+    // ---- dock → main: a parameter write ----
+    const target = await dockJs(
+      `(() => { const b = window.__lpdock.doc.scene.root.blocks.find(b => 'value' in b.params || 'gain' in b.params); if (!b) return null; const p = 'gain' in b.params ? 'gain' : 'value'; window.__lpdock.runtime.sendParam(b.id, p, 0.3125); return { id: b.id, p }; })()`,
+    );
+    check('found a block to write a param on', !!target);
+    if (target) {
+      await sleep(700);
+      const got = await mainJs(`window.__lp.doc.scene.root.blocks.find(b => b.id === ${JSON.stringify(target.id)}).params[${JSON.stringify(target.p)}]`);
+      check('param write reached the main window', got === 0.3125, `got ${got}`);
+    }
+
+    // ---- main → dock: the value frame carries audio state ----
+    await mainJs(`window.__lp.runtime.audioOn = true;`);
+    await sleep(400);
+    check('audio state reached the dock window', (await dockJs(`window.__lpdock.runtime.audioOn`)) === true);
+    await mainJs(`window.__lp.runtime.audioOn = false;`);
+
+    // ---- closing the window re-attaches the Dock ----
+    closeDockWindow();
+    await sleep(900);
+    check('main window re-attached its Dock', (await mainJs(`!!document.querySelector('#dock-bottom .panel')`)) === true);
+  } catch (err) {
+    failures++;
+    process.stdout.write(`FAIL  smoke threw — ${String((err && err.message) || err)}\n`);
+  }
+
+  process.stdout.write(failures ? `\n${failures} check(s) failed\n` : `\nall checks passed\n`);
+  // `exit` rather than `quit`: quit unwinds asynchronously and would let the
+  // exit code be overwritten by a later lifecycle handler.
+  app.exit(failures ? 1 : 0);
+}
+
+/**
+ * What this measures, and what it deliberately does not.
+ *
+ * It measures the MAIN window's rAF frame budget, which is the resource
+ * mirroring actually contends for: two Dock surfaces painting the same widgets
+ * out of one loop, in the process that also runs the web engine and applies CV
+ * on every poll (docs/10-performance.md rule 8).
+ *
+ * It does NOT measure DSP load, and does not pretend to — no audio device is
+ * opened. `audioOn` is forced true so the Dock takes its live-meter path and
+ * repaints every frame instead of only when dirty; that is the honest worst
+ * case, and without it an idle Dock makes mirroring look free.
+ */
+async function runDockWindowPerf() {
+  const SECONDS = 6;
+  const sample = async (label) => {
+    // Sample the app's own per-frame WORK, not the rAF interval. See the
+    // `frameStats` comment in src/main.ts for why the interval is useless here.
+    const r = await engineWin.webContents.executeJavaScript(
+      `new Promise(res => {
+         const fs = window.__lp.frameStats;
+         fs.samples.length = 0; fs.on = true;
+         setTimeout(() => {
+           fs.on = false;
+           const g = fs.samples.slice().sort((a,b) => a-b);
+           const at = q => g[Math.min(g.length-1, Math.floor(g.length*q))];
+           res({ n: g.length, mean: g.reduce((a,b)=>a+b,0)/(g.length||1), p50: at(0.5), p95: at(0.95), max: g[g.length-1] });
+         }, ${SECONDS * 1000});
+       })`,
+    );
+    process.stdout.write(
+      `${label.padEnd(28)} frames=${String(r.n).padStart(4)}  mean=${r.mean.toFixed(2)}ms  p50=${r.p50.toFixed(2)}  p95=${r.p95.toFixed(2)}  max=${r.max.toFixed(2)}\n`,
+    );
+    return r;
+  };
+
+  try {
+    createWindow();
+    await whenLoaded(engineWin);
+    await sleep(1500);
+
+    // Give the Dock real work.
+    //
+    // The demo patch yields about ten numeric params, which is not a load and
+    // makes every configuration look identical — a measurement that only
+    // proves the harness runs. Build a control surface the size of one someone
+    // would actually put on a touchscreen, then mirror every parameter on it.
+    const widgets = await engineWin.webContents.executeJavaScript(
+      `(() => {
+        try {
+         const d = window.__lp.doc; const s = d.scene;
+         // Types taken from the demo patch, so they are known to exist.
+         for (let k = 0; k < 60; k++) {
+           d.addBlock(['osc','gain','mix2','noise','knob-ctl'][k % 5], { x: (k % 10) * 140, y: Math.floor(k / 10) * 120 });
+         }
+         s.dock = s.dock || { widgets: [] };
+         s.dock.widgets.length = 0;
+         let i = 0;
+         for (const b of s.root.blocks) {
+           for (const p of Object.keys(b.params)) {
+             if (typeof b.params[p] !== 'number') continue;
+             s.dock.widgets.push({ id: 'perf' + (i), path: [b.id], ref: 'param:' + p,
+               x: 8 + (i % 16) * 78, y: 8 + Math.floor(i / 16) * 66, w: 70, h: 58 });
+             i++;
+           }
+         }
+         window.__lp.runtime.audioOn = true;   // force the live-repaint path
+         d.touch('structure');
+         return i;
+        } catch (e) { return 'ERR: ' + (e && e.message || e); }
+       })()`,
+    );
+    if (typeof widgets === 'string') throw new Error(widgets);
+    process.stdout.write(`\ndocked widgets under test: ${widgets}\n`);
+    await engineWin.webContents.executeJavaScript(`window.__lp.doc.scene.dock.widgets.length`);
+    // Make sure the Dock is actually open in the main window.
+    await engineWin.webContents.executeJavaScript(
+      `(() => { const b = document.querySelector('.tb-btn[data-panel="dockpanel"]'); if (b && !document.querySelector('#dock-bottom .panel')) b.click(); })()`,
+    );
+    await sleep(800);
+    const attached = await sample('attached (baseline)');
+
+    // Detach, collapsed (the current default).
+    await engineWin.webContents.executeJavaScript(
+      `(() => { localStorage.setItem('livepatch.dock.mirror','0');
+                document.querySelector('.tb-btn[title*="own window"]').click(); })()`,
+    );
+    await sleep(2500);
+    await whenLoaded(dockWin);
+    await sleep(1200);
+    const collapsed = await sample('detached + collapsed');
+
+    // Same detached window, but keep a live copy here too.
+    await engineWin.webContents.executeJavaScript(
+      `(() => { localStorage.setItem('livepatch.dock.mirror','1');
+                const b = document.querySelector('.tb-btn[data-panel="dockpanel"]');
+                if (!document.querySelector('#dock-bottom .panel')) b.click(); })()`,
+    );
+    await sleep(1200);
+    const mirrored = await sample('detached + mirrored');
+
+    const pct = (a, b) => (((a - b) / b) * 100).toFixed(1) + '%';
+    process.stdout.write(
+      `\nmirrored vs collapsed:  mean ${pct(mirrored.mean, collapsed.mean)}   p95 ${pct(mirrored.p95, collapsed.p95)}\n` +
+        `detached vs attached:   mean ${pct(collapsed.mean, attached.mean)}   p95 ${pct(collapsed.p95, attached.p95)}\n` +
+        `\n(frame budget only — no audio device is opened; see the function comment)\n`,
+    );
+  } catch (err) {
+    process.stdout.write(`perf run threw — ${String((err && err.message) || err)}\n`);
+  }
+  app.exit(0);
+}
+
 app.on('window-all-closed', () => {
   stopEngine();
   if (process.platform !== 'darwin') app.quit();
 });
-app.on('before-quit', () => stopEngine());
+app.on('before-quit', () => {
+  stopEngine();
+  // Global accelerators outlive the window otherwise, and a stale registration
+  // silently swallows that shortcut for every other app until reboot.
+  keys.disposeKeys();
+});
+
+/**
+ * Closed-loop test for the `key-in` / `key-out` host halves.
+ *
+ * Injects a keystroke with the same code path `key-out` uses, and catches it
+ * with the same code path `key-in` uses. If both directions work, the
+ * registration fires; if either is broken, it does not — and the two are
+ * distinguished by whether registration succeeded at all.
+ */
+async function runKeysSmoke() {
+  let fails = 0;
+  const check = (name, cond, detail = '') => {
+    if (!cond) fails++;
+    console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+  };
+
+  // Parsing is pure and worth asserting separately: a wrong VK injects the
+  // WRONG key onto the user's machine, which is worse than injecting nothing.
+  check('parses a media key', keys.parseAccel('Media Play/Pause')?.key === 0xb3);
+  check('parses a modified key', JSON.stringify(keys.parseAccel('Ctrl+Alt+K')) === JSON.stringify({ mods: [0x11, 0x12], key: 0x4b }));
+  check('rejects nonsense', keys.parseAccel('not-a-key') === null);
+
+  let fired = 0;
+  const reg = keys.setWatchedKeys(['F13'], (accel, down) => {
+    if (accel === 'F13' && down) fired++;
+  });
+  check('registers a global accelerator', reg.ok && reg.active.includes('F13'), JSON.stringify(reg));
+
+  // Injector needs a moment to compile its P/Invoke types.
+  keys.sendKey('F13');
+  await new Promise((r) => setTimeout(r, 1500));
+  const sent = keys.sendKey('F13');
+  check('injector accepts a keystroke', sent === true);
+
+  await new Promise((r) => setTimeout(r, 1200));
+  check('injected keystroke reached the global listener', fired > 0, `fired=${fired}`);
+
+  // Unregistering must actually release the accelerator — a stale global
+  // registration swallows that shortcut for every other app until reboot.
+  const after = keys.setWatchedKeys([], () => {});
+  check('unregisters cleanly', after.active.length === 0, JSON.stringify(after.active));
+
+  keys.disposeKeys();
+  console.log('');
+  console.log(fails ? `${fails} FAILED` : 'all checks passed');
+  app.exit(fails ? 1 : 0);
+}
+
+/**
+ * Cassette index + bytes, for a remote surface.
+ *
+ * The library lives in `%APPDATA%`, so a phone has none of it — the same shape
+ * of bug as the saved rigs (`src/core/appstate.ts`): installation state that
+ * does not travel, surfacing as small confusing gaps rather than as an error.
+ * The Clip tab draws nothing and the Library is empty, with nothing on screen
+ * to say why.
+ *
+ * Served rather than pushed over the link: takes are tens of megabytes and the
+ * link is a control channel carrying value frames many times a second. HTTP
+ * gets range-free streaming, browser caching and backpressure for free.
+ *
+ * Only reachable once the LAN server is on, which is off by default and token
+ * gated — and read-only: a remote surface can look at the library, never write
+ * to it.
+ */
+function serveAssets(req, res, p) {
+  if (p === '/library/list') {
+    let list = [];
+    try {
+      list = fs
+        .readdirSync(cassettesDir())
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => readCassetteMeta(f.slice(0, -5)))
+        .filter(Boolean);
+    } catch {
+      /* an unreadable store is an empty one, not a 500 */
+    }
+    const body = Buffer.from(JSON.stringify(list), 'utf8');
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': body.length,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(req.method === 'HEAD' ? undefined : body);
+    return true;
+  }
+
+  if (p.startsWith('/library/')) {
+    // `safeId` strips everything that is not [A-Za-z0-9_-], so the id can never
+    // contribute a separator, a dot segment or a drive letter — the filename is
+    // rebuilt from the META's extension, never from anything in the URL.
+    const id = safeId(p.slice('/library/'.length));
+    const meta = id && readCassetteMeta(id);
+    if (!meta) {
+      res.writeHead(404).end('not found');
+      return true;
+    }
+    const f = path.join(cassettesDir(), id + '.' + String(meta.ext).replace(/[^a-z0-9]/gi, ''));
+    if (!fs.existsSync(f)) {
+      res.writeHead(404).end('not found');
+      return true;
+    }
+    const stat = fs.statSync(f);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': stat.size,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+      return true;
+    }
+    // Streamed: a take can be hundreds of megabytes, and reading it into a
+    // Buffer would spike the main process — the one supervising the audio
+    // engine — every time a phone opened the Clip tab.
+    fs.createReadStream(f).pipe(res);
+    return true;
+  }
+  return false;
+}
