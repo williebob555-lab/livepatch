@@ -31,6 +31,7 @@ import {
   matrixPorts,
   parseMatrix,
   serializeMatrix,
+  setCrosspoint,
 } from '../core/matrix';
 
 /** Gutter for the row/column labels, in canvas px. */
@@ -284,12 +285,12 @@ function buildMatrixEditor(host: HTMLElement): AdvancedViewHandle {
   const gesture = new TwoPointerGesture();
 
   const setCell = (i: number, o: number, v: number): void => {
-    const ni = ins();
-    const gr = grid();
-    const k = crossIndex(ni, i, o);
-    if (k < 0 || k >= gr.length) return;
-    gr[k] = Math.max(0, Math.min(1, v));
-    commit(gr);
+    if (!block) return;
+    // Shared with the block face and the Dock (`core/matrix.ts`) so all three
+    // agree on the index and the clamp.
+    const next = setCrosspoint(block.params.grid, ins(), outs(), i, o, v);
+    if (next == null) return;
+    write('grid', next);
     refreshCell();
     draw();
   };

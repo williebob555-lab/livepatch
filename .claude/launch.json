@@ -6,6 +6,18 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "port": 5199
+    },
+    {
+      "name": "repo-static",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--yes", "http-server", ".", "-p", "5244", "-c-1"],
+      "port": 5244
+    },
+    {
+      "name": "android-www",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--yes", "http-server", "build/android-www", "-p", "5233", "-c-1"],
+      "port": 5233
     }
   ]
 }

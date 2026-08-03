@@ -74,10 +74,43 @@ export const grabSlop = (mousePx: number, e: { pointerType?: string }): number =
 export const dragThreshold = (e: { pointerType?: string }): number => (isCoarse(e) ? 10 : 3);
 
 /**
- * Movement, in px, that cancels a pending long-press. Deliberately smaller than
- * `dragThreshold` so that starting to move always wins over the timer.
+ * The two long-press distances, in **mouse px** — pass them through the helpers
+ * below rather than using them raw.
+ *
+ * A press has to answer two different questions, and one distance cannot do it:
+ *
+ *   `longPressNudge(e)`  has the press STARTED MOVING something? Past this it
+ *                        may no longer become a context menu, because putting a
+ *                        menu on top of a live drag aborts the drag (Rule 9).
+ *   `longPressSlop(e)`   has it moved so far that it is unambiguously a drag?
+ *                        Past this the pending timer is dropped outright.
+ *
+ * Between them the press is a live drag that is no longer a menu candidate.
+ * That gap is what lets a slow, precise wire or marquee be drawn without a menu
+ * landing on it — which is the whole point, since precision is the thing that
+ * wants to be slow.
+ *
+ * ### Why the nudge is NOT scaled up for touch, despite Rule 3
+ *
+ * It looks like it should be: `dragThreshold` right above says a 3 px threshold
+ * is too small for a finger, "a fingertip rolls a few px during any deliberate
+ * press", and 3 px is what this is. That argument was made and it was wrong,
+ * and the reason is worth keeping.
+ *
+ * These two thresholds face opposite ways. `dragThreshold` guards against a
+ * false POSITIVE — calling a still finger a drag — so it must be generous.
+ * This one guards against a false NEGATIVE: failing to notice a drag has begun
+ * and dropping a menu on it. Widening it does not make holds easier, it makes
+ * the original complaint come back, because a deliberate 5 px-per-half-second
+ * drag would once again be treated as a hold and aborted.
+ *
+ * Measured on the real device, a held finger stays inside 3 px: with this value
+ * a long-press on empty canvas opens the menu reliably. When holds *did* stop
+ * working it was never this number — see `longPressNudged` in `editor.ts` for
+ * the flag that actually caused it.
  */
 export const LONGPRESS_SLOP = 10;
+export const LONGPRESS_NUDGE = 3;
 /** Hold time for touch's stand-in for right-click. */
 export const LONGPRESS_MS = 500;
 

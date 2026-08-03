@@ -30,20 +30,39 @@ import {
   refSize,
   resolveRefAtPath,
   writeParam,
+  writeParamId,
 } from './facepaint';
+import {
+  crossIndex,
+  matrixPorts,
+  parseMatrix,
+  setCrosspoint,
+  toggledCrosspoint,
+} from '../core/matrix';
+import { toggleSpeakerMute } from '../core/rig';
 import { SWAPPABLE_WIDGETS } from './layout';
 import { MenuItem, colorModal, promptModal, showContextMenu } from './menus';
 import { fitCanvasBacking, onUiScaleChange } from './uiscale';
-import { TwoPointerGesture, capture, isCoarse } from './input';
+import { LONGPRESS_MS, LONGPRESS_SLOP, TwoPointerGesture, capture, isCoarse } from './input';
 import {
   SampleHandle,
+  eqBand,
+  eqBandHandles,
+  eqPlotRect,
+  eqTypeUsesGain,
+  eqXToFreq,
+  eqYToGain,
   keyAt,
+  matrixCellAt,
+  matrixFaceRect,
+  matrixGeom,
   norm2val,
   parseSteps,
   parseWaveStr,
   pressedKeys,
   sampleHandleAt,
   seqCellAt,
+  speakerBarAt,
   val2norm,
   WAVE_LEN,
   xyAxes,
@@ -126,7 +145,8 @@ type Drag =
   | { kind: 'sampleview'; live: Live; handle: SampleHandle }
   | { kind: 'keys'; live: Live; octave: number; variant?: string; note: number | null }
   | { kind: 'wavedraw'; live: Live; spec: ParamSpec; samples: number[]; lastIdx: number }
-  | { kind: 'seqgrid'; live: Live; spec: ParamSpec; steps: ReturnType<typeof parseSteps>; toggleCol: number | null };
+  | { kind: 'seqgrid'; live: Live; spec: ParamSpec; steps: ReturnType<typeof parseSteps>; toggleCol: number | null }
+  | { kind: 'eq'; live: Live; band: number; plot: Rect; mode: 'fg' | 'q'; startY: number; startQ: number };
 
 function build(body: HTMLElement): DockTabHandle {
   body.classList.add('dock-widgets');
@@ -380,11 +400,111 @@ function build(body: HTMLElement): DockTabHandle {
 
   // ---- widget operation ---------------------------------------------------
 
+  /**
+   * Operate a docked **visual**.
+   *
+   * Visuals are face items with no `ParamSpec`, and `beginOperate` below opens
+   * by returning false when there is no spec — so every docked visual was
+   * inert. Not just the Matrix that was reported: the EQ curve and the Speaker
+   * Monitor's bars were dead in the Dock too, all three from that one guard.
+   * A control surface that paints a live matrix and ignores every press reads
+   * as broken, and on a detached touchscreen — the whole reason the Dock
+   * exists — there is no canvas to fall back to.
+   *
+   * Every hit test reuses the exported geometry the canvas uses (`widgets.ts`),
+   * so a cell is in the same place on both surfaces, and every write goes
+   * through `facepaint.ts` with the **absolute** node id (see `writeParamId`).
+   */
+  const beginOperateVisual = (L: Live, p: Vec, shift: boolean): boolean => {
+    const t = L.r.target;
+    const rect = L.rect;
+
+    if (L.r.visual === 'matrix') {
+      const ins = matrixPorts(t.params.ins, 4);
+      const outs = matrixPorts(t.params.outs, 4);
+      const gm = matrixGeom(matrixFaceRect(rect), ins, outs);
+      const cell = matrixCellAt(gm, p.x, p.y);
+      if (!cell) return false;
+      const cur = parseMatrix(t.params.grid, ins, outs)[crossIndex(ins, cell.i, cell.o)];
+      const next = setCrosspoint(t.params.grid, ins, outs, cell.i, cell.o, toggledCrosspoint(cur, shift));
+      if (next == null) return false;
+      doc.pushHistory();
+      writeParamId(L.r, 'grid', next);
+      // A click, not a drag: nothing is left on `drag` for pointerup to finish.
+      // Gain painting is the Advanced editor's job, deliberately — see the tab.
+      hotRef = { id: L.dw.id };
+      return true;
+    }
+
+    if (L.r.visual === 'eq') {
+      const plot = eqPlotRect(rect);
+      const hs = eqBandHandles(t.params, plot);
+      let best: (typeof hs)[number] | null = null;
+      let bd = Infinity;
+      for (const h of hs) {
+        const d = Math.hypot(h.x - p.x, h.y - p.y);
+        if (d < bd) {
+          bd = d;
+          best = h;
+        }
+      }
+      // Same 14 px tolerance as the canvas. Missing every handle falls through
+      // so the clone can still be selected/moved rather than swallowing the press.
+      if (!best || bd > 14) return false;
+      doc.pushHistory();
+      hotRef = { id: L.dw.id };
+      drag = { kind: 'eq', live: L, band: best.i, plot, mode: shift ? 'q' : 'fg', startY: p.y,
+        startQ: Number(t.params['q' + best.i] ?? 1) };
+      if (!shift) applyEq(drag, p);
+      return true;
+    }
+
+    // Mute / solo, on the Speaker Monitor only — `speaker-rig` has neither
+    // param, exactly as on the canvas.
+    if (L.r.visual === 'speakers' && t.type === 'speaker-monitor') {
+      const n = Math.max(2, doc.scene.rig?.speakers.length ?? 0);
+      const i = speakerBarAt(rect, p, n);
+      if (i < 0) return false;
+      doc.pushHistory();
+      if (shift) {
+        const cur = Number(t.params.solo ?? 0);
+        writeParamId(L.r, 'solo', cur === i + 1 ? 0 : i + 1);
+      } else {
+        writeParamId(L.r, 'mute', toggleSpeakerMute(t.params.mute, i));
+      }
+      hotRef = { id: L.dw.id };
+      return true;
+    }
+
+    return false;
+  };
+
+  /** Drag an EQ band handle — the Dock's copy of `Editor.applyEq`, writing
+   *  through `facepaint` so the detached window's edits reach the engine. */
+  const applyEq = (d: Extract<Drag, { kind: 'eq' }>, p: Vec): void => {
+    const t = d.live.r.target;
+    if (d.mode === 'q') {
+      // Vertical drag scales Q logarithmically, same feel as the canvas.
+      const q = Math.max(0.1, Math.min(18, d.startQ * Math.pow(2, (d.startY - p.y) / 60)));
+      setEqParam(d.live, 'q' + d.band, Math.round(q * 100) / 100);
+      return;
+    }
+    const f = eqXToFreq(Math.max(d.plot.x, Math.min(d.plot.x + d.plot.w, p.x)), d.plot.x, d.plot.w);
+    const gDb = eqYToGain(Math.max(d.plot.y, Math.min(d.plot.y + d.plot.h, p.y)), d.plot.y, d.plot.h);
+    setEqParam(d.live, 'f' + d.band, Math.round(f));
+    // Through `eqBand` rather than off the raw param: it is the one place that
+    // knows how a band's type is stored, and a cut filter's gain is ignored by
+    // the DSP — writing it would move a number nothing reads.
+    if (eqTypeUsesGain(eqBand(t.params, d.band).type))
+      setEqParam(d.live, 'g' + d.band, Math.round(gDb * 10) / 10);
+  };
+  const setEqParam = (L: Live, id: string, v: number): void => writeParamId(L.r, id, v);
+
   /** Start operating (not moving) a widget — the Dock's counterpart of
    *  `Editor.beginWidgetOp`, sharing all of its hit geometry via widgets.ts. */
   const beginOperate = (L: Live, p: Vec, shift: boolean): boolean => {
     const spec0 = L.r.spec;
-    if (!spec0) return false;
+    if (!spec0) return L.r.visual ? beginOperateVisual(L, p, shift) : false;
     // Hot-swapped controls drag as whatever the clone actually renders.
     const eff = controlOfStyle(spec0, L.dw.control);
     const spec: ParamSpec = SWAPPABLE_WIDGETS.has(spec0.widget) ? { ...spec0, widget: eff.kind } : spec0;
@@ -733,6 +853,9 @@ function build(body: HTMLElement): DockTabHandle {
       case 'seqgrid':
         applySeq(drag, p);
         break;
+      case 'eq':
+        applyEq(drag, p);
+        break;
       case 'keys': {
         const note = keyAt(drag.live.rect, drag.octave, p.x, p.y, drag.variant);
         if (note !== drag.note) {
@@ -809,17 +932,84 @@ function build(body: HTMLElement): DockTabHandle {
   let menuAt = { x: 0, y: 0 };
   const subMenu = (items: MenuItem[]): void => showContextMenu(menuAt.x, menuAt.y, items);
 
+  /** Open the widget/field menu at a viewport point. */
+  const openMenuAt = (clientX: number, clientY: number, surfacePt: Vec): void => {
+    const L = hit(surfacePt);
+    menuAt = { x: clientX, y: clientY };
+    showContextMenu(clientX, clientY, L ? widgetMenu(L) : fieldMenu());
+  };
+
   canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    // A long-press we already handled will be followed by the OS synthesizing
+    // its own contextmenu for the same press — don't open a second menu.
+    if (performance.now() < suppressNativeCtxUntil) return;
     // Never over a live drag — touch press-and-hold and touchpad tap-and-hold
     // both synthesize this event with loose movement slop, so a careful knob
     // turn would be interrupted by its own menu (see editor.ts).
     if (drag.kind !== 'none') return;
-    const p = toSurface(e);
-    const L = hit(p);
-    menuAt = { x: e.clientX, y: e.clientY };
-    showContextMenu(e.clientX, e.clientY, L ? widgetMenu(L) : fieldMenu());
+    openMenuAt(e.clientX, e.clientY, toSurface(e));
   });
+
+  // ---------------------------------------------------------------------------
+  // Long-press → the same menu, for touch.
+  //
+  // **Without this the entire widget menu is unreachable on a phone**, which is
+  // most of what the Dock can do: Arrange mode, restyling, CV ports, MIDI
+  // learn, "Source: …". The canvas editor has had a long-press path since the
+  // touch pass (editor.ts), but this surface only ever listened for
+  // `contextmenu` — and a finger landing on a widget starts a *drag*, so the
+  // browser never synthesizes one. It looked like a working touch surface
+  // right up until you needed to change something.
+  //
+  // Same shape as `editor.ts` on purpose (docs/14-input.md is normative):
+  // cancel on movement past LONGPRESS_SLOP, never fire once a drag is live,
+  // and suppress the OS's follow-up `contextmenu` so one press is one menu.
+  // ---------------------------------------------------------------------------
+  let lpTimer = 0;
+  let lpAt: { x: number; y: number } | null = null;
+  let suppressNativeCtxUntil = 0;
+
+  const cancelLongPress = (): void => {
+    if (lpTimer) {
+      clearTimeout(lpTimer);
+      lpTimer = 0;
+    }
+    lpAt = null;
+  };
+
+  canvas.addEventListener(
+    'pointerdown',
+    (e) => {
+      if (!isCoarse(e)) return; // mouse and pen already have a real right-click
+      cancelLongPress();
+      const at = { x: e.clientX, y: e.clientY };
+      const surf = toSurface(e);
+      lpAt = at;
+      lpTimer = window.setTimeout(() => {
+        lpTimer = 0;
+        lpAt = null;
+        // Invariant 6 (docs/07-ui.md): a hold on a hold-to-operate widget is
+        // the interaction, not a request for a menu. If the press already
+        // became a drag, the user is turning something — leave them alone.
+        if (drag.kind !== 'none') return;
+        suppressNativeCtxUntil = performance.now() + 800;
+        openMenuAt(at.x, at.y, surf);
+      }, LONGPRESS_MS);
+    },
+    // Passive: this only ever sets a timer. The drag handling that must call
+    // preventDefault lives in the main pointerdown handler above.
+    { passive: true },
+  );
+  canvas.addEventListener(
+    'pointermove',
+    (e) => {
+      if (lpAt && Math.hypot(e.clientX - lpAt.x, e.clientY - lpAt.y) > LONGPRESS_SLOP) cancelLongPress();
+    },
+    { passive: true },
+  );
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave'] as const)
+    canvas.addEventListener(ev, cancelLongPress, { passive: true });
 
   const widgetMenu = (L: Live): MenuItem[] => {
     const dw = L.dw;
@@ -1093,9 +1283,19 @@ function build(body: HTMLElement): DockTabHandle {
     if (!on) sel.clear();
     arrangeBtn.classList.toggle('on', on);
     arrangeBtn.textContent = on ? '✥ Arrange' : '✥ Arrange';
+    // Touch has no right-click and often no keyboard, so the hint has to name
+    // the gesture that actually exists on the device reading it. Telling a
+    // phone user to "press E or right-click" describes two things they cannot
+    // do, which reads as the feature being missing rather than as the hint
+    // being wrong — which is how it was reported.
+    const touch = matchMedia('(pointer: coarse)').matches;
     hintEl.textContent = on
-      ? 'Drag to move · corner to resize (Shift keeps shape) · right-click to restyle'
-      : 'Widgets are live — press E or right-click for Arrange mode';
+      ? touch
+        ? 'Drag to move · corner to resize · long-press to restyle'
+        : 'Drag to move · corner to resize (Shift keeps shape) · right-click to restyle'
+      : touch
+        ? 'Widgets are live — long-press for Arrange mode and options'
+        : 'Widgets are live — press E or right-click for Arrange mode';
     invalidate();
   };
   arrangeBtn.addEventListener('click', () => setArrange(!arrange));

@@ -16,6 +16,20 @@
 
 const KEY = 'livepatch.prefs';
 
+/**
+ * `native` is the full DSP and needs a real node process, so it is desktop
+ * only. Everywhere else — a browser, and the Android APK — that leaves
+ * `webaudio`, where the 25 spatial kernels (`upmix`, `distance`, `binaural`,
+ * the ambisonics chain, `chan-*`, `room`, `orbit`, `path`, `spectral-scatter`
+ * …) are silent pass-throughs: a surround patch loads fine and plays nothing
+ * recognisable.
+ *
+ * A `worklet` engine used to close that gap by hosting the native `dsp.ts` on a
+ * browser audio thread. It was removed 2026-08-02 along with the system-audio
+ * capture built on top of it. If spatial DSP off the desktop is ever wanted
+ * again, that is the shape of the answer — not a second port of the kernels
+ * into Web Audio nodes, which would violate the one-kernel-per-block rule.
+ */
 export type EngineName = 'webaudio' | 'native' | 'native-stub';
 
 export interface Prefs {
@@ -65,6 +79,13 @@ export function setPrefs(patch: Partial<Prefs>): void {
   } catch {
     /* storage disabled — the preference still applies for this session */
   }
+  for (const fn of listeners) fn();
+}
+
+/** Drop the memoised copy so the next `prefs()` re-reads storage. For the dock
+ *  link, which replaces storage from outside (see `core/appstate.ts`). */
+export function reloadPrefs(): void {
+  cache = null;
   for (const fn of listeners) fn();
 }
 

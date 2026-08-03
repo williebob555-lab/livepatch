@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>LivePatch — Dock</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <!--
+    The detached Dock window.
+
+    The skeleton is DELIBERATELY identical to index.html. `src/ui/dock.ts` (the
+    panel manager), `menus.ts` and every modal address these ids directly, so
+    reproducing them here is what lets the Dock, its context menus and its
+    dialogs run in this window with no code change at all. `body.dock-window`
+    is the only difference: styles.css uses it to collapse the topbar and
+    workspace so #dock-bottom fills the screen.
+
+    #canvas still exists and still carries a real Renderer + Editor — they are
+    hidden, not stubbed. The Clip, Advanced and Rig tabs call into both
+    (Renderer.drawVisualAt, Editor.startMidiLearn/runDockAction), and a stub
+    would be a second implementation of exactly the thing golden rule 8 says
+    must never be duplicated.
+  -->
+  <body class="dock-window">
+    <div id="app">
+      <div id="topbar"></div>
+      <div id="workspace">
+        <div id="dock-left" class="dock-zone dock-v"></div>
+        <div id="center">
+          <div id="breadcrumb"></div>
+          <canvas id="canvas"></canvas>
+          <div id="statusbar"></div>
+        </div>
+        <div id="dock-right" class="dock-zone dock-v"></div>
+      </div>
+      <div id="dock-bottom" class="dock-zone dock-h"></div>
+      <div id="float-layer"></div>
+      <div id="menu-layer"></div>
+      <div id="modal-layer"></div>
+    </div>
+    <script type="module" src="/src/dockwindow.ts"></script>
+  </body>
+</html>

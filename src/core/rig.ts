@@ -375,6 +375,24 @@ export function onSavedRigsChange(fn: () => void): () => void {
   return () => savedListeners.delete(fn);
 }
 
+/**
+ * Re-read the saved rigs from storage and tell everyone.
+ *
+ * For a remote control surface (a phone running `dock.html` over the LAN).
+ * Saved rigs are **installation** state, not scene state — they live in
+ * localStorage, which is per-device — so a phone starts with an empty list and
+ * shows only the built-in presets. That is exactly how it was reported: "the
+ * user presets aren't showing, the factory ones are."
+ *
+ * The link pushes the desktop's copy across and calls this. It exists because
+ * `saved` is memoised: writing localStorage underneath a populated cache
+ * changes nothing anyone can see.
+ */
+export function reloadSavedRigs(): void {
+  saved = null;
+  for (const fn of savedListeners) fn();
+}
+
 const writeSaved = (): void => {
   try {
     localStorage.setItem(SAVED_KEY, JSON.stringify(saved ?? []));

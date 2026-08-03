@@ -64,6 +64,16 @@ export interface Services {
   hardwareChanged: () => void;
   /** Send raw MIDI bytes to a hardware/virtual output port (midi-out block). */
   sendMidi?: (device: string, data: number[]) => void;
+  /**
+   * Press a key on the host machine (`key-out`).
+   *
+   * A seam for exactly the same reason as `sendMidi`: injecting a keystroke is
+   * a blocking OS call into the window manager, and the audio callback
+   * allocates nothing and blocks on nothing (golden rule 1). The kernel
+   * edge-detects and hands the accelerator over; whoever owns the process does
+   * the injection, off this thread.
+   */
+  sendKey?: (accel: string) => void;
 }
 
 export interface Kernel {
@@ -94,6 +104,14 @@ export interface Kernel {
   midiOut?: ((ev: MidiEvent, offset?: number) => void) | null;
   /** Hardware MIDI / renderer-forwarded events (midi-in kernel). */
   externalMidi?(device: string, ev: MidiEvent, offset?: number): void;
+  /**
+   * A learned keystroke went down or up (`key-in`).
+   *
+   * Delivered from OUTSIDE the audio thread — the host registers the hotkey and
+   * calls this between renders. Implementations assign a value and nothing
+   * more; the smoothing happens in `process` where the sample rate is known.
+   */
+  deliverKey?(down: boolean): void;
   /** Assigned by the graph for tape net sources: push a cassette id to sinks. */
   tapeOut?: ((id: string) => void) | null;
   /** Current cassette id for tape sources (static resolution at set-graph). */
@@ -929,11 +947,14 @@ registerKernel('distance', (params) => {
     return ch[i0 % LEN] + (ch[(i0 + 1) % LEN] - ch[i0 % LEN]) * f;
   };
 
+  let liveDistance = NaN;
+
   return {
     out: () => buf,
     setParam: (id, v) => {
       p[id] = v;
     },
+    liveParams: () => ({ distance: liveDistance }),
     process: (ins, ctx) => {
       const n = ctx.n;
       const src = ins.in;
@@ -945,6 +966,10 @@ registerKernel('distance', (params) => {
       const dopAmt = num(p.doppler, 0.5);
       // Distance for this quantum (CV overrides the knob).
       const dTarget = dcv ? Math.abs(dcv[0][n - 1]) * 50 : num(p.distance, 3);
+      // The knob reads in metres, so the marker shows metres — and only while
+      // the input is wired, or every Distance block in the patch would wear a
+      // permanent marker saying exactly what its own knob already says.
+      liveDistance = dcv ? Math.min(50, dTarget) : NaN;
       // Air-absorption cutoff closes as the source recedes (only recompute on
       // change — a biquad update per sample is wasteful and zippers).
       const fc = Math.max(500, 20000 * Math.exp(-airAmt * dCur * 0.15));
@@ -1415,6 +1440,7 @@ registerKernel('spectral-scatter', (params) => {
   let buf = allocBuf(8);
   const p: Record<string, ParamValue> = { ...params };
   const gain = new Smooth(num(params.gain, 1));
+  let liveRot = NaN;
 
   // Band split scratch. `mono` is the folded input, `run` the signal still
   // travelling down the crossover chain, `band[i]` each extracted band.
@@ -1506,6 +1532,7 @@ registerKernel('spectral-scatter', (params) => {
 
   return {
     out: () => buf,
+    liveParams: () => ({ rot: liveRot }),
     setParam: (id, v) => {
       p[id] = v;
       if (id === RIG_PARAM) {
@@ -1557,6 +1584,13 @@ registerKernel('spectral-scatter', (params) => {
       const spin = num(p.spin, 0);
       const rot = ins['rot']?.[0];
       const rotCv = rot ? rot[0] : 0; // control-rate: one sample per quantum
+      // Rotate is an ANGLE (turns) and Spin is a RATE (Hz) — two different
+      // quantities. The `rot` input had no knob of its own until this param
+      // existed, so a patched CV swung the whole scatter with nothing on the
+      // face to show it or to set a starting angle by hand.
+      const rotBase = num(p.rot, 0);
+      const rotTotal = rotBase + rotCv;
+      liveRot = rot ? Math.max(-1, Math.min(1, rotTotal)) : NaN;
       const width = num(p.width, 0.85);
       const elev = num(p.elev, 0);
       const blur = Math.max(0.05, num(p.spread, 0.2) * R);
@@ -1572,7 +1606,7 @@ registerKernel('spectral-scatter', (params) => {
         else if (mode === 'Alternate') turn = (b % 2 === 0 ? 0.25 : 0.75) + t * 0.5;
         else if (mode === 'Random') turn = randAngle(b, seed);
         else turn = t;
-        const a = (turn + phase + rotCv) * TWO_PI;
+        const a = (turn + phase + rotTotal) * TWO_PI;
         // Rig convention: +x right, +y front, azimuth positive CCW, so x uses
         // −sin (see `speakerVec` in rig.ts — this sign is the single most
         // flippable thing in the subsystem).
@@ -1780,6 +1814,9 @@ registerKernel('room', (params) => {
     }
   };
 
+  let liveSrcX = NaN;
+  let liveSrcY = NaN;
+
   const srcPos = (ins: Ins, n: number): void => {
     const Lx = Math.max(1, num(p.width, 7));
     const Ly = Math.max(1, num(p.depth, 9));
@@ -1791,6 +1828,11 @@ registerKernel('room', (params) => {
     const nx = Math.max(-1, Math.min(1, num(p.srcx, 0) + cvx));
     const ny = Math.max(-1, Math.min(1, num(p.srcy, -0.3) + cvy));
     const nz = Math.max(-1, Math.min(1, num(p.srcz, 0)));
+    // The XY pad shows where the source actually ended up. Wired axes only —
+    // an unwired one reports NaN and is dropped from the mods stream, so the
+    // pad's marker never claims a modulation that isn't there.
+    liveSrcX = ins['x'] ? nx : NaN;
+    liveSrcY = ins['y'] ? ny : NaN;
     const tx = nx * Lx * 0.45;
     const ty = ny * Ly * 0.45;
     const tz = nz * Lz * 0.45;
@@ -1808,6 +1850,7 @@ registerKernel('room', (params) => {
 
   return {
     out: () => buf,
+    liveParams: () => ({ srcx: liveSrcX, srcy: liveSrcY }),
     setParam: (id, v) => {
       p[id] = v;
       if (id === RIG_PARAM) {
@@ -5658,6 +5701,10 @@ registerKernel('vco', (params) => {
   let level = num(params.level, 0.6);
   let phase = 0;
   let syncL = 0;
+  // Post-CV values for the face markers. NaN = that input is unwired, which the
+  // mods stream drops — see `liveParams` in the Kernel interface.
+  let liveFreq = NaN;
+  let livePw = NaN;
   return {
     out: () => buf,
     setParam: (id, v) => {
@@ -5666,6 +5713,7 @@ registerKernel('vco', (params) => {
       else if (id === 'pw') pw0 = num(v, 0.5);
       else if (id === 'level') level = num(v, 0.6);
     },
+    liveParams: () => ({ freq: liveFreq, pw: livePw }),
     process: (ins, ctx) => {
       const A = ins.pitch;
       const B = ins.pwm;
@@ -5694,6 +5742,11 @@ registerKernel('vco', (params) => {
         phase += dt;
         if (phase >= 1) phase -= 1;
       }
+      // Sampled at the quantum's last frame, like the panner's `posOf` — the
+      // markers refresh at 30 Hz, so a per-sample latch would buy nothing and
+      // cost a write in the inner loop.
+      liveFreq = A ? Math.min(fmax, Math.max(0, freq * Math.pow(2, A[0][ctx.n - 1]))) : NaN;
+      livePw = B ? Math.min(0.98, Math.max(0.02, pw0 + B[0][ctx.n - 1])) : NaN;
     },
   };
 });
@@ -5706,6 +5759,7 @@ registerKernel('ladder', (params) => {
   // Four cascaded one-poles per channel, plus the half-sample feedback memory.
   const s = [new Float64Array(4), new Float64Array(4)];
   const s4p = [0, 0];
+  let liveCutoff = NaN;
   const reset = (): void => {
     s[0].fill(0);
     s[1].fill(0);
@@ -5718,6 +5772,7 @@ registerKernel('ladder', (params) => {
       else if (id === 'res') res = num(v, 0.15);
       else if (id === 'drive') drive = num(v, 1);
     },
+    liveParams: () => ({ cutoff: liveCutoff }),
     process: (ins, ctx) => {
       const A = ins.in;
       const B = ins.cut;
@@ -5749,6 +5804,7 @@ registerKernel('ladder', (params) => {
         }
         s4p[c] = p4;
       }
+      liveCutoff = B ? Math.min(fmax, Math.max(20, cutoff * Math.pow(2, B[0][ctx.n - 1]))) : NaN;
       // Recursive state: one bad sample is otherwise permanent silence.
       trapNonFinite(buf, ctx.n, reset);
     },
@@ -5760,6 +5816,7 @@ registerKernel('wavefold', (params) => {
   let amount = num(params.amount, 0);
   let sym = num(params.sym, 0);
   let level = num(params.level, 1);
+  let liveAmount = NaN;
   return {
     out: () => buf,
     setParam: (id, v) => {
@@ -5767,6 +5824,7 @@ registerKernel('wavefold', (params) => {
       else if (id === 'sym') sym = num(v, 0);
       else if (id === 'level') level = num(v, 1);
     },
+    liveParams: () => ({ amount: liveAmount }),
     process: (ins, ctx) => {
       const A = ins.in;
       const B = ins.fold;
@@ -5781,6 +5839,7 @@ registerKernel('wavefold', (params) => {
           dst[i] = fold1((src ? src[i] : 0) * (1 + a * 7) + sym * a) * level;
         }
       }
+      liveAmount = B ? Math.min(1, Math.max(0, amount + B[0][ctx.n - 1])) : NaN;
     },
   };
 });
@@ -5856,6 +5915,7 @@ registerKernel('lfo', (params) => {
   let uni = on(params.uni);
   let phase = 0;
   let resetL = 0;
+  let liveRate = NaN;
   return {
     out: () => buf,
     setParam: (id, v) => {
@@ -5864,6 +5924,7 @@ registerKernel('lfo', (params) => {
       else if (id === 'amp') amp = num(v, 1);
       else if (id === 'uni') uni = on(v);
     },
+    liveParams: () => ({ rate: liveRate }),
     process: (ins, ctx) => {
       const A = ins.rate;
       const B = ins.reset;
@@ -5888,6 +5949,7 @@ registerKernel('lfo', (params) => {
         phase += dt;
         if (phase >= 1) phase -= 1;
       }
+      liveRate = A ? Math.min(fmax, Math.max(0, rate * Math.pow(2, A[0][ctx.n - 1]))) : NaN;
     },
   };
 });
@@ -8531,3 +8593,124 @@ registerKernel('meter', tapKernel);
 registerKernel('scope', tapKernel);
 registerKernel('spectrum', tapKernel);
 registerKernel('spectrogram', tapKernel);
+
+// ---------------------------------------------------------------- keyboard --
+//
+// The two blocks that cross the boundary out of this app. Both are shaped so
+// the audio thread never touches the keyboard (golden rule 1):
+//
+//   • `key-in` reads a value that a message set. Registering a system-wide
+//     hotkey is the host's job; by the time the kernel sees it, it is a number.
+//   • `key-out` edge-detects and calls `sv.sendKey` — one function call that
+//     posts a message. The blocking OS call happens in the main process.
+//
+// Getting this backwards is not a style question: `SendInput` and
+// `globalShortcut` both enter the window manager and can block for tens of
+// milliseconds, which in an audio callback is a dropout every single time.
+
+/**
+ * Key In — a learned keystroke, as CV.
+ *
+ * The host delivers press/release through `deliverKey`. `Gate` follows the key
+ * down, `Toggle` flips on each press, `Trigger` emits a short pulse — the same
+ * three shapes the MIDI and button paths use, so a patch built around one
+ * behaves the same way here.
+ *
+ * `glide` is not decoration: a gate that steps 0→1 in one sample is a click
+ * when it is multiplied into audio, and this block exists to be wired into
+ * exactly that.
+ */
+registerKernel('key-in', (params) => {
+  const gate = stereo();
+  const trig = stereo();
+  const p: Record<string, ParamValue> = { ...params };
+  let target = 0; // set by deliverKey
+  let toggled = 0;
+  let level = 0; // smoothed gate
+  let pulse = 0; // remaining trigger samples
+  const PULSE_SEC = 0.005;
+
+  return {
+    out: (port) => (port === 'gate' ? gate : port === 'trig' ? trig : null),
+    setParam: (id, v) => {
+      p[id] = v;
+    },
+    // Called off the audio thread, between renders — assignment only.
+    deliverKey: (down: boolean) => {
+      const mode = str(p.mode, 'Gate');
+      if (mode === 'Toggle') {
+        if (down) toggled = toggled > 0.5 ? 0 : 1;
+        target = toggled;
+      } else if (mode === 'Trigger') {
+        target = 0;
+        if (down) pulse = -1; // -1 = "start on the next render", length needs sr
+      } else {
+        target = down ? 1 : 0;
+      }
+      if (down && mode !== 'Trigger') pulse = -1;
+    },
+    process: (_ins, ctx) => {
+      const n = ctx.n;
+      if (pulse === -1) pulse = Math.max(1, Math.round(PULSE_SEC * ctx.sr));
+      // One-pole toward the target. `glide` of 0 still smooths over a single
+      // sample rather than stepping, which is what keeps it click-free.
+      const g = num(p.glide, 0.005);
+      const a = g <= 0 ? 1 : Math.min(1, 1 - Math.exp(-1 / Math.max(1, g * ctx.sr)));
+      for (let i = 0; i < n; i++) {
+        level += (target - level) * a;
+        gate[0][i] = level;
+        gate[1][i] = level;
+        const t = pulse > 0 ? 1 : 0;
+        if (pulse > 0) pulse--;
+        trig[0][i] = t;
+        trig[1][i] = t;
+      }
+    },
+  };
+});
+
+/**
+ * Key Out — a gate that presses a key on this machine.
+ *
+ * Rising edge only, with a minimum gap. Both matter: a CV gate can chatter
+ * around its threshold, and without a floor on the rate this block would fire
+ * hundreds of keystrokes a second into whatever window has focus. That is not
+ * a glitch, it is the user losing control of their computer, so `minGap` is a
+ * safety limit rather than a preference.
+ */
+registerKernel('key-out', (params, sv) => {
+  const p: Record<string, ParamValue> = { ...params };
+  let armed = true; // low, ready for a rising edge
+  let waited = 1e9; // samples since the last send
+  const HI = 0.6;
+  const LO = 0.4; // hysteresis, so a noisy gate cannot re-trigger on ripple
+
+  return {
+    out: () => null,
+    setParam: (id, v) => {
+      p[id] = v;
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const src = ins.trig;
+      if (!src) return;
+      const gapSamples = Math.max(1, Math.round(num(p.minGap, 0.15) * ctx.sr));
+      const preset = str(p.preset, 'Media Play/Pause');
+      const accel = preset === 'Custom…' ? str(p.key, '') : preset;
+      for (let i = 0; i < n; i++) {
+        const v = src[0][i];
+        if (waited < 1e9) waited++;
+        if (armed && v >= HI) {
+          armed = false;
+          if (waited >= gapSamples && accel) {
+            waited = 0;
+            // One call, no allocation, no blocking — it posts a message.
+            sv.sendKey?.(accel);
+          }
+        } else if (!armed && v <= LO) {
+          armed = true;
+        }
+      }
+    },
+  };
+});

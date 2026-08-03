@@ -1,6 +1,6 @@
 # 09 — Persistence, Assets, and the Tape System
 
-_Last verified: 2026-08-01. Files: `src/core/persist.ts`, `src/core/session.ts`,
+_Last verified: 2026-08-02. Files: `src/core/persist.ts`, `src/core/session.ts`, `src/core/cassettes.ts`,
 `src/core/cassettes.ts`, `src/core/rolls.ts`, `src/core/sampler.ts`,
 `src/core/customblocks.ts`, `src/core/factory/*`,
 `src/core/prefs.ts`, `src/core/takehistory.ts`,
@@ -785,3 +785,55 @@ engine to start with, and whether audio comes up running. Top bar → **Options*
   (folder import). Bytes cross IPC one cassette at a time, on demand.
 - **`parseScene` must keep tolerating old/partial scenes** — add migrations, not
   hard requirements.
+
+---
+
+## The library on a remote surface
+
+`cassettes.ts` picks its backend **once, at module scope**, from
+`window.livepatchNative`. Electron → `%APPDATA%/cassettes`. No bridge → a
+per-device IndexedDB.
+
+A phone driving the Dock over the LAN falls in the second case, and its
+IndexedDB is empty. The Clip tab draws nothing, the Library is bare, and every
+tape widget resolves to no audio — with nothing on screen to say why. Same
+shape as the saved-rigs bug in `core/appstate.ts`: **installation state that
+does not travel.** `appstate` covers the localStorage half (rigs, custom
+blocks, prefs); the on-disk asset store is this half.
+
+The host serves it read-only over the LAN server:
+
+| route | what |
+|---|---|
+| `GET /library/list` | the cassette index (same records `cassettes:list` returns) |
+| `GET /library/<id>` | the bytes, **streamed** |
+
+Streamed because a take can be hundreds of megabytes and this is the process
+supervising the audio engine — reading one into a Buffer would spike it every
+time a phone opened the Clip tab. Served over HTTP rather than pushed down the
+link because the link is a control channel carrying value frames many times a
+second.
+
+### Two traps, both hit while building this
+
+**Do not install a partial `window.livepatchNative` shim.** The obvious fix is
+to fake the bridge on the remote so `cassettes.ts` takes the native path. It
+blanks the page: `persist.ts` and others read `!!window.livepatchNative` as
+"this is Electron", so a shim missing `listScenes` throws during boot. The
+backend choice belongs *inside* `cassettes.ts`, which is the module that
+actually knows what it needs.
+
+**Do not mount these under `/assets`.** Vite emits every bundle into
+`dist/assets/`, and dynamic routes are consulted *before* static files — so
+`/assets/list` also shadows `/assets/index-<hash>.js`, and the remote loads a
+white page. Hence `/library`.
+
+`remoteAssets` stays false until the probe actually succeeds, so a plain
+browser dev session — also http(s), but with no host serving `/library` —
+keeps its IndexedDB store instead of silently losing it.
+
+Writes are refused, not faked: a control surface that appeared to import a file
+and then lost it on reconnect is worse than one that plainly cannot.
+
+Last verified 2026-08-02: `dock.html` served with `/library` routes booted and
+fetched the index at startup (200).

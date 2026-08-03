@@ -5,6 +5,7 @@
 // properties panel, and both engines are all driven from these definitions.
 // ============================================================================
 import type { Block, BlockStyle, ParamValue, Port, PortDir, SignalKind } from './types';
+import type { CvLaw } from './cvlaw';
 
 export interface PortSpec {
   id: string;
@@ -20,6 +21,48 @@ export interface PortSpec {
    * `Port.chans` on the instance instead — the compiler reads the instance.
    */
   chans?: number;
+
+  // ---- Built-in CV inputs: what this port DOES ----------------------------
+  //
+  // A `role: 'cv'` input is read straight out of the kernel's input buffers;
+  // nothing ever calls `setParam` for it. The renderer therefore has no way to
+  // know which knob it is moving unless the def says so, and for years it
+  // guessed by comparing the port id to the param id. That works for
+  // `panner3d`'s x/y/z and nothing else: Room's `x` drives `srcx`, Distance's
+  // `dist` drives `distance`, Ladder's `cut` drives `cutoff`. Every one of
+  // those blocks shipped with a CV input that modulated audibly and showed
+  // nothing on the face.
+  //
+  // So a cv input must now declare itself as exactly one of three things — a
+  // modulator (`cvParam`), an edge (`cvTrigger`), or a plain signal inlet
+  // (`cvSignal`). `scripts/cv-indicator-test.mjs` fails the build on a cv
+  // input that declares none of them, which is what stops the next block from
+  // repeating this.
+
+  /**
+   * The param id this input modulates. Its widget shows the live post-CV
+   * marker while the port is wired (see `builtinCvPatched`, `ui/facepaint.ts`).
+   */
+  cvParam?: string;
+  /**
+   * How the CV combines with the knob — **must match what the kernel does**,
+   * because this is what the web engine uses to compute the displayed value
+   * (`src/core/cvlaw.ts`). Defaults to 'add'.
+   */
+  cvLaw?: CvLaw;
+  /** Multiplier for 'add' / 'replace' / 'replace-abs' (default 1). */
+  cvScale?: number;
+  /**
+   * An edge, not a modulator: clock / gate / trig / sync / reset. There is no
+   * knob to mark, so the indicator goes on the port itself (a decaying flash).
+   */
+  cvTrigger?: true;
+  /**
+   * A signal-path inlet that is merely *coloured* as a control line — Sample &
+   * Hold's `in`, the Logic blocks' `a`/`b`. It carries the signal being
+   * processed, not a modulation of a param, so there is nothing to indicate.
+   */
+  cvSignal?: true;
 }
 
 export type WidgetKind =
@@ -228,6 +271,49 @@ export function defaultPorts(def: BlockDef): Port[] {
 /** Param specs that get a face widget, in declaration order. */
 export function faceParams(def: BlockDef): ParamSpec[] {
   return def.params.filter((p) => p.face !== false && (p.widget !== 'select' || def.isControl));
+}
+
+// ---------------------------------------------------------------------------
+// Built-in CV inputs, indexed for the paint path.
+//
+// `builtinCvPatched` (ui/facepaint.ts) asks "is a cv input wired to this
+// param?" once per widget per frame, and the trigger flash asks "is this port
+// an edge?" once per port per frame. Both are pure functions of the block
+// TYPE, so they are computed once and cached — a `def.inputs.find(...)` in
+// `drawBlock` is exactly the per-frame scan `docs/10-performance.md` is about,
+// and it is the same reasoning as `hasTies` in the renderer.
+//
+// Keyed on the def's declarations rather than on the instantiated `Port`,
+// which matters: ports are materialised in two places (`defaultPorts` here and
+// the scene backfill in `core/persist.ts`) and every already-saved scene holds
+// ports written before these fields existed. Reading the def needs no
+// migration and cannot go stale.
+// ---------------------------------------------------------------------------
+const cvByParamCache = new Map<string, Map<string, PortSpec>>();
+const cvTriggerCache = new Map<string, Set<string>>();
+
+/** Built-in CV inputs of a block type, indexed by the param each modulates. */
+export function cvInputsByParam(type: string): ReadonlyMap<string, PortSpec> {
+  let m = cvByParamCache.get(type);
+  if (m) return m;
+  m = new Map();
+  const def = defs.get(type);
+  if (def)
+    for (const s of def.inputs)
+      if (s.role === 'cv' && s.dir === 'in' && s.cvParam) m.set(s.cvParam, s);
+  cvByParamCache.set(type, m);
+  return m;
+}
+
+/** Port ids of a block type's trigger-shaped CV inputs (clock/gate/trig/…). */
+export function cvTriggerPorts(type: string): ReadonlySet<string> {
+  let s = cvTriggerCache.get(type);
+  if (s) return s;
+  s = new Set();
+  const def = defs.get(type);
+  if (def) for (const p of def.inputs) if (p.role === 'cv' && p.dir === 'in' && p.cvTrigger) s.add(p.id);
+  cvTriggerCache.set(type, s);
+  return s;
 }
 
 // Synthesized specs for vst plugin params, cached per block so hot paint/hit

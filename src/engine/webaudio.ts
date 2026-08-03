@@ -6,6 +6,8 @@
 // terminate in AudioParams. MIDI nets are routed as JS events.
 // ============================================================================
 import { CompiledGraph, NetTapMod, NodeMidiMap, ParamValue } from '../core/types';
+import { CvLaw, cvValue } from '../core/cvlaw';
+import { ParamSpec, cvInputsByParam, getDef } from '../core/registry';
 import { EngineAdapter, LevelFrame, MidiEvent, TapeRef, TransportFrame, VisualFeed } from './engine';
 import { onMidi } from './midi';
 
@@ -75,6 +77,23 @@ export function registerUnit(type: string, f: UnitFactory): void {
   factories.set(type, f);
 }
 
+/**
+ * Whether this engine actually implements a block type, or will stub it.
+ *
+ * The library uses this to hide blocks that can only be silent where this is
+ * the only engine (Android — `src/ui/panels.ts`). DERIVED rather than a hand-
+ * written list on purpose: the list would be 20-odd entries that must be
+ * corrected every time a kernel is ported, and the failure mode of a stale one
+ * is a block that either lies about working or is missing for no reason.
+ *
+ * Note what this does NOT cover: types that never become audio nodes at all
+ * (`subgraph`, `comment`, portals) answer false here and are perfectly
+ * functional, so callers need their own structural allowlist.
+ */
+export function hasUnit(type: string): boolean {
+  return factories.has(type);
+}
+
 /** Identity unit: used for portals ('pass') and any stubbed native-only type.
  *  Forwards audio (a GainNode) AND MIDI, so a midi portal carries events across
  *  the subgraph boundary just like an audio portal carries signal. */
@@ -98,6 +117,8 @@ interface NetRec {
   wireIds: string[];
   /** CV sinks on this net: params modulated by the net's summed signal. */
   mods: ModRec[];
+  /** Built-in CV inlets fed by this net — see `BuiltinRec`. */
+  builtins: BuiltinRec[];
   /** Per-channel metering, built only when a sink declares `setChans` and the
    *  bus is actually wide. See `Unit.setChans`. */
   chanSplit?: ChannelSplitterNode;
@@ -122,6 +143,63 @@ interface ModRec {
   value: number;
   /** Gate mods only: current gate state, for edge detection. */
   gateHi?: boolean;
+}
+
+/**
+ * One **built-in** CV inlet on this net — a port the block def declares
+ * (`PortSpec.cvParam`), which the worklet reads straight out of its input
+ * buffer rather than through the `cv:<param>` modulation path.
+ *
+ * Because nothing calls `setParam` for these, the main thread never learned
+ * their value, and every built-in CV input on the web engine drew a dead
+ * widget: an LFO into a Ladder's `cut` moved the audio and left the Cutoff
+ * knob perfectly still. The native engine solves this in the kernel
+ * (`liveParams`); here there is no way in — a worklet can only report by
+ * `postMessage`, and calling that from `process()` allocates on the audio
+ * thread, which golden rule 1 forbids.
+ *
+ * So the value is *reconstructed* on the main thread: the net's analyser is
+ * already being read every poll for wire levels, and the same tail sample is
+ * the CV voltage. `applyCvLaw` turns (knob, voltage) into the number the
+ * worklet computed, which is why the law is declared on the port and shared
+ * (`src/core/cvlaw.ts`) rather than written out twice.
+ *
+ * **The law must match the kernel.** If a worklet's arithmetic changes, this
+ * number silently starts describing something that is not happening.
+ */
+interface BuiltinRec {
+  node: string;
+  param: string;
+  law: CvLaw | undefined;
+  scale: number | undefined;
+  spec: ParamSpec | undefined;
+  /** Knob value; refreshed from the node's params each rebuild. */
+  base: number;
+  /** Last computed post-CV value, read back by the UI indicator. */
+  value: number;
+}
+
+/**
+ * Is `portId` a built-in CV inlet of `type` that modulates a param? Returns
+ * the declaring `PortSpec`, or null for a trigger, a signal inlet, or an
+ * ordinary audio port. `cvInputsByParam` is memoized per block type and holds
+ * at most a handful of entries, so the scan is trivial — and this runs on graph
+ * rebuild, never per frame.
+ */
+function builtinCvInlet(type: string, portId: string): { cvParam?: string; cvLaw?: CvLaw; cvScale?: number } | null {
+  for (const spec of cvInputsByParam(type).values()) if (spec.id === portId) return spec;
+  return null;
+}
+
+/** The spec of a param, for range clamping. Null block types cannot happen
+ *  here (the unit was built from the def), but a custom/vst block may not
+ *  declare the param statically — an absent spec just means "don't clamp". */
+function paramSpecOf(type: string, paramId: string): ParamSpec | undefined {
+  try {
+    return getDef(type).params.find((s) => s.id === paramId);
+  } catch {
+    return undefined;
+  }
 }
 
 const modNorm = (m: NetTapMod, v: number): number =>
@@ -165,6 +243,8 @@ export class WebAudioEngine implements EngineAdapter {
   private wireLevels = new Map<string, LevelFrame>();
   /** node\0param → active modulation record. */
   private modIndex = new Map<string, ModRec>();
+  /** node\0param → live value of a built-in CV inlet (see `BuiltinRec`). */
+  private builtinIndex = new Map<string, BuiltinRec>();
   private assets = new Map<string, AudioBuffer>();
   private scratch = new Float32Array(256);
   private pendingGraph: CompiledGraph | null = null;
@@ -331,6 +411,7 @@ export class WebAudioEngine implements EngineAdapter {
     const nodeParams = new Map(g.nodes.map((n) => [n.id, n.params]));
     const oldMods = this.modIndex;
     this.modIndex = new Map();
+    this.builtinIndex = new Map();
     const tapeConnected = new Set<Unit>();
     for (const net of g.nets) {
       if (net.kind === 'midi') {
@@ -392,8 +473,10 @@ export class WebAudioEngine implements EngineAdapter {
         }
       }
       const mods: ModRec[] = [];
+      const builtins: BuiltinRec[] = [];
       for (const snk of net.sinks) {
-        const u = this.units.get(snk.node)?.unit;
+        const urec = this.units.get(snk.node);
+        const u = urec?.unit;
         if (!u) continue;
         if (snk.mod) {
           // CV input: modulate the param at control rate instead of patching
@@ -415,6 +498,28 @@ export class WebAudioEngine implements EngineAdapter {
           hub.connect(inl); // AudioParam
           this.netConns.push({ from: hub, to: inl });
         }
+        // A built-in CV inlet also gets a live-value record, so the widget it
+        // drives can show a marker (see `BuiltinRec`). This is bookkeeping on
+        // top of the connection above, never instead of it — the audio still
+        // goes through the inlet; the record only reconstructs the number for
+        // the UI. Resolved once per graph rebuild, not per frame.
+        const spec = urec ? builtinCvInlet(urec.type, snk.port) : null;
+        if (spec?.cvParam) {
+          const key = snk.node + ' ' + spec.cvParam;
+          const raw = nodeParams.get(snk.node)?.[spec.cvParam];
+          const base = typeof raw === 'number' ? raw : 0;
+          const rec: BuiltinRec = {
+            node: snk.node,
+            param: spec.cvParam,
+            law: spec.cvLaw,
+            scale: spec.cvScale,
+            spec: paramSpecOf(urec!.type, spec.cvParam),
+            base,
+            value: base,
+          };
+          builtins.push(rec);
+          this.builtinIndex.set(key, rec);
+        }
       }
       const analyser = ctx.createAnalyser();
       // Small window: these taps only feed wire meters + control-rate CV, and
@@ -423,7 +528,7 @@ export class WebAudioEngine implements EngineAdapter {
       analyser.smoothingTimeConstant = 0;
       hub.connect(analyser);
       this.netConns.push({ from: hub, to: analyser });
-      const rec: NetRec = { hub, analyser, level: { rms: 0, peak: 0 }, wireIds: net.wireIds, mods };
+      const rec: NetRec = { hub, analyser, level: { rms: 0, peak: 0 }, wireIds: net.wireIds, mods, builtins };
       // ---- per-channel metering ----
       // Every wide block is stubbed on this engine, so before this the Spatial
       // Scope drew the layout and then sat dead however loud the patch was —
@@ -502,6 +607,12 @@ export class WebAudioEngine implements EngineAdapter {
       rec.base = v;
       return;
     }
+    // A built-in CV inlet does NOT intercept the write — the worklet owns the
+    // knob and adds the voltage itself, so the value must reach it. We only
+    // track the new base, or the displayed marker would keep reporting the old
+    // knob position for as long as the cable stayed plugged in.
+    const b = typeof v === 'number' ? this.builtinIndex.get(nodeId + ' ' + paramId) : undefined;
+    if (b) b.base = v as number;
     // Gate-modulated buttons pass through: manual presses still work while a
     // CV line is plugged (last writer wins).
     this.units.get(nodeId)?.unit.setParam(paramId, v);
@@ -520,7 +631,10 @@ export class WebAudioEngine implements EngineAdapter {
     const frame = ++this._pollFrame;
     for (let ni = 0; ni < this.nets.length; ni++) {
       const net = this.nets[ni];
-      if (!net.mods.length && (ni + frame) % 3 !== 0) {
+      // A net feeding a built-in CV inlet is a control path too: at ⅓ rate its
+      // marker steps at 20 Hz and reads as stuttering rather than as motion,
+      // which is the whole thing the indicator is for.
+      if (!net.mods.length && !net.builtins.length && (ni + frame) % 3 !== 0) {
         net.level.rms *= 0.95;
         net.level.peak *= 0.96;
         continue;
@@ -552,6 +666,14 @@ export class WebAudioEngine implements EngineAdapter {
       // Fast attack, gentle release so wires glow musically instead of strobing.
       net.level.rms = rms > net.level.rms ? rms : net.level.rms * 0.86;
       net.level.peak = peak > net.level.peak ? peak : net.level.peak * 0.9;
+      if (net.builtins.length) {
+        // Same tail sample as below: the summed net's current CV voltage. The
+        // worklet applied this to its own copy of the knob a few ms ago; here
+        // we reproduce the arithmetic so the face can draw it. No extra read —
+        // `scratch` was filled for the wire level above.
+        const cv = this.scratch[this.scratch.length - 1];
+        for (const rec of net.builtins) rec.value = cvValue(rec.spec, rec.law, rec.base, cv, rec.scale ?? 1);
+      }
       if (net.mods.length) {
         // Latest sample of the summed net = current CV voltage (DC included).
         const cv = this.scratch[this.scratch.length - 1];
@@ -575,14 +697,21 @@ export class WebAudioEngine implements EngineAdapter {
 
   modValue(nodeId: string, paramId: string): number | null {
     if (!this.running) return null;
-    const rec = this.modIndex.get(nodeId + ' ' + paramId);
+    const key = nodeId + ' ' + paramId;
+    const rec = this.modIndex.get(key);
     if (rec) return rec.value;
-    return this.midiLive.get(nodeId + ' ' + paramId) ?? null;
+    // A `cv:<param>` port wins over a built-in inlet driving the same param:
+    // it is the one that actually reaches `setParam`, so it is the value the
+    // block is really running on. Same precedence as the native engine's
+    // `modIndex` check in engine/src/graph.ts.
+    const b = this.builtinIndex.get(key);
+    if (b) return b.value;
+    return this.midiLive.get(key) ?? null;
   }
 
   modSrc(nodeId: string, paramId: string): 'cv' | 'midi' | null {
     const key = nodeId + ' ' + paramId;
-    if (this.modIndex.has(key)) return 'cv';
+    if (this.modIndex.has(key) || this.builtinIndex.has(key)) return 'cv';
     return this.midiLive.has(key) ? 'midi' : null;
   }
 

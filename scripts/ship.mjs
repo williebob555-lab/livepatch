@@ -25,8 +25,9 @@
 //   npm run ship -- -m "Room block"   commit + release message
 //   npm run ship -- --dry-run         run every check, touch nothing
 //   npm run ship -- --no-typecheck    skip the typecheck gate (don't)
+//   npm run ship -- --no-android      desktop-only; phones will not see it
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,7 +38,25 @@ const pkgPath = path.join(root, 'package.json');
 const argv = process.argv.slice(2);
 const dryRun = argv.includes('--dry-run');
 const skipTypecheck = argv.includes('--no-typecheck');
-const skipVerify = argv.includes('--no-verify');
+const repair = argv.includes('--repair');
+/**
+ * Build the Android APK as part of the ship, after the version bump.
+ *
+ * On by default when this machine can actually do it, because the alternative
+ * was a trap with no error: `ensureAssets` looks for `LivePatch-<NEW
+ * version>.apk`, and the documented order was "build the APK, then ship" —
+ * which stamps the OLD version into the filename. Ship then bumps, finds no
+ * matching APK, prints one warning among many, and publishes a desktop-only
+ * release. Every phone reports "no .apk in this release" and nobody finds out
+ * until someone checks for updates on a handset.
+ *
+ * Ordering is the whole fix: the APK must be built AFTER `npm version`, so
+ * `patchVersion` in `android-apk.mjs` stamps the version being shipped.
+ */
+const noAndroid = argv.includes('--no-android');
+const canAndroid =
+  existsSync(path.join(root, 'android')) &&
+  existsSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.livepatch', 'livepatch.jks'));
 const mIdx = argv.findIndex((a) => a === '-m' || a === '--message');
 const message = mIdx >= 0 ? argv[mIdx + 1] : null;
 const bump = argv.find((a) => ['patch', 'minor', 'major'].includes(a)) ?? 'patch';
@@ -108,6 +127,166 @@ async function gh(pathname, token) {
   return { data: await res.json() };
 }
 
+/** Upload one built artifact to an existing release, with retries.
+ *
+ *  Why this exists rather than leaving it to electron-builder: on 2026-08-01 a
+ *  release published with ONLY the 119 KB blockmap. The 113 MB installer upload
+ *  failed and electron-builder still exited 0 — so `npm run release` succeeding
+ *  is not evidence the assets are there. Big uploads over a flaky link are the
+ *  normal case, not the exception, so ship repairs them itself. */
+async function uploadAsset(file, { owner, repo, releaseId, token }) {
+  const body = readFileSync(file);
+  const name = path.basename(file);
+  const mb = (body.length / 1048576).toFixed(1);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    info(`uploading ${name} (${mb} MB), attempt ${attempt}/3 …`);
+    try {
+      const res = await fetch(
+        `https://uploads.github.com/repos/${owner}/${repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(body.length),
+            'User-Agent': 'livepatch-ship',
+          },
+          body,
+          signal: AbortSignal.timeout(20 * 60 * 1000),
+        },
+      );
+      if (res.ok) return ok(`uploaded ${name}`);
+      // A half-finished asset from a previous attempt blocks the name; clear it.
+      if (res.status === 422) {
+        warn(`${name} already exists in some state — replacing`);
+        const { data: rel } = await gh(`/repos/${owner}/${repo}/releases/${releaseId}`, token);
+        const stale = (rel?.assets ?? []).find((a) => a.name === name);
+        if (stale) {
+          await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/assets/${stale.id}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'livepatch-ship' },
+          });
+        }
+        continue;
+      }
+      warn(`upload failed: ${res.status} ${res.statusText}`);
+    } catch (e) {
+      warn(`upload error: ${e.message}`);
+    }
+  }
+  return die(`could not upload ${name} after 3 attempts`, `The built file is fine — it is at release/${name}.\nRe-run just the upload with:\n  npm run ship:resume`);
+}
+
+/** REST helper for anything that mutates a release. */
+async function ghWrite(method, pathname, token, body) {
+  const res = await fetch(`https://api.github.com${pathname}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'livepatch-ship',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (!res.ok) return { error: `${res.status} ${res.statusText}` };
+  return { data: res.status === 204 ? {} : await res.json() };
+}
+
+/** Every release carrying this tag. GitHub permits several — that is the bug. */
+async function releasesForTag({ owner, repo, tag, token }) {
+  const { data, error } = await gh(`/repos/${owner}/${repo}/releases?per_page=100`, token);
+  if (error) return { error };
+  return { data: (data ?? []).filter((r) => r.tag_name === tag) };
+}
+
+/** Pre-create the release as a DRAFT so electron-builder finds it instead of
+ *  racing to make its own.
+ *
+ *  This is the root-cause fix for the duplicate-release bug that split v0.1.3
+ *  and v0.1.4 across two releases each (installer + latest.yml on one, blockmap
+ *  on the other — which silently downgrades every delta update to a full
+ *  ~108 MB download). electron-builder's publisher creates the release lazily,
+ *  once per artifact; two artifacts starting together both see "no release" and
+ *  both POST one. If it already exists, there is nothing to race for.
+ *
+ *  Draft specifically, because electron-publish does `if (release.draft) return
+ *  release` on a tag match — it uploads into the draft and never second-guesses
+ *  it. Publishing is then OUR last step, after the assets are verified, which
+ *  also gets back the safety net that `releaseType: release` gave up. */
+async function createDraftRelease({ owner, repo, tag, token }) {
+  const { data: existing } = await releasesForTag({ owner, repo, tag, token });
+  if (existing?.length) {
+    ok(`reusing existing release for ${tag}`);
+    return existing[0];
+  }
+  const { data, error } = await ghWrite('POST', `/repos/${owner}/${repo}/releases`, token, {
+    tag_name: tag,
+    name: tag.replace(/^v/, ''),
+    draft: true,
+  });
+  if (error) die(`could not pre-create the release for ${tag} (${error})`);
+  ok(`pre-created draft release ${tag} — electron-builder will upload into it`);
+  return data;
+}
+
+/** Fold stray duplicate releases for this tag back into the primary one.
+ *  Belt and braces: the pre-created draft should prevent duplicates, but if one
+ *  appears anyway, its assets are re-uploaded from disk and the empty shell is
+ *  removed. Deleting a release does NOT delete its git tag. */
+async function consolidateDuplicates({ owner, repo, tag, token, keepId }) {
+  const { data: all, error } = await releasesForTag({ owner, repo, tag, token });
+  if (error || !all) return;
+  const dupes = all.filter((r) => r.id !== keepId);
+  if (!dupes.length) return ok('exactly one release for this tag');
+  warn(`${dupes.length} duplicate release(s) for ${tag} — consolidating`);
+  for (const d of dupes) {
+    for (const a of d.assets ?? []) info(`  duplicate ${d.id} holds ${a.name}`);
+    const { error: delErr } = await ghWrite('DELETE', `/repos/${owner}/${repo}/releases/${d.id}`, token);
+    if (delErr) warn(`could not delete duplicate ${d.id}: ${delErr}`);
+    else ok(`removed duplicate release ${d.id} (git tag untouched)`);
+  }
+}
+
+/** Make the release on GitHub match what was actually built. Ordering matters:
+ *  latest.yml goes LAST, because it is the update feed — publishing it while
+ *  the installer is still missing points every client at a 404. */
+async function ensureAssets({ owner, repo, releaseId, token, version }) {
+  // Look the release up by ID, never by tag: with duplicates present,
+  // /releases/tags/<tag> returns an arbitrary one of them.
+  const { data: rel, error } = await gh(`/repos/${owner}/${repo}/releases/${releaseId}`, token);
+  if (error) return die(`release ${releaseId} is not readable (${error})`);
+  const have = new Set((rel.assets ?? []).filter((a) => a.state === 'uploaded').map((a) => a.name));
+  // The Android APK is the update feed for the phone build: `androidupdate.ts`
+  // looks for the newest release's `.apk` asset. Included only when one has
+  // actually been built (`npm run android:apk` copies it into release/), so a
+  // Windows-only ship still works — but say so, because a release without it
+  // leaves every phone reporting "no .apk in this release".
+  const apk = `LivePatch-${version}.apk`;
+  const haveApk = existsSync(path.join(root, 'release', apk));
+  const wanted = [
+    `LivePatch-${version}-setup.exe`,
+    `LivePatch-${version}-setup.exe.blockmap`,
+    ...(haveApk || (rel.assets ?? []).some((a) => a.name === apk) ? [apk] : []),
+    'latest.yml', // must stay last
+  ];
+  if (!haveApk && !(rel.assets ?? []).some((a) => a.name === apk))
+    warn(`no ${apk} in release/ — phones will not see this release. Build one with "npm run android:apk:release".`);
+  for (const name of wanted) {
+    if (have.has(name)) {
+      ok(`${name} already present`);
+      continue;
+    }
+    const file = path.join(root, 'release', name);
+    if (!existsSync(file)) {
+      die(`${name} is missing from GitHub AND from release/`, `Rebuild it:\n  npm run release`);
+    }
+    await uploadAsset(file, { owner, repo, releaseId: rel.id, token });
+  }
+  if (rel.draft) warn('release is still a DRAFT — electron-updater ignores drafts');
+  return rel;
+}
+
 // ============================================================== 1. preflight
 // Everything cheap and everything that can fail SILENTLY later, checked before
 // the multi-minute build burns your time.
@@ -117,7 +296,11 @@ const to = nextVersion(from, bump);
 const tag = `v${to}`;
 const { owner, repo } = repoSlug(pkg);
 
-console.log(`${C.bld}LivePatch ship${C.off}  ${from} → ${to}  (${owner}/${repo})${dryRun ? `  ${C.yel}DRY RUN${C.off}` : ''}`);
+console.log(
+  repair
+    ? `${C.bld}LivePatch ship --repair${C.off}  v${from}  (${owner}/${repo})`
+    : `${C.bld}LivePatch ship${C.off}  ${from} → ${to}  (${owner}/${repo})${dryRun ? `  ${C.yel}DRY RUN${C.off}` : ''}`,
+);
 
 step('Preflight');
 
@@ -132,6 +315,36 @@ if (!token) {
   );
 }
 ok('GH_TOKEN present');
+
+// ---------------------------------------------------------------- repair mode
+// `npm run ship:repair` — no git, no rebuild. Takes the CURRENT package.json
+// version, folds any duplicate releases for its tag into one, re-uploads
+// whatever is missing from release/, and publishes. This is the cleanup path
+// for a release that electron-builder split in two.
+if (repair) {
+  const rTag = `v${from}`;
+  step(`Repair ${rTag}`);
+  const { data: found, error: findErr } = await releasesForTag({ owner, repo, tag: rTag, token });
+  if (findErr) die(`could not list releases (${findErr})`);
+  if (!found.length) die(`no release exists for ${rTag}`, `Nothing to repair. Ship it with:\n  npm run ship`);
+
+  // Keep whichever release already holds the 108 MB installer — re-uploading
+  // the small assets onto it costs kilobytes instead of re-sending the exe.
+  const exe = `LivePatch-${from}-setup.exe`;
+  const primary = found.find((r) => (r.assets ?? []).some((a) => a.name === exe)) ?? found[0];
+  info(`${found.length} release(s) for ${rTag}; keeping id ${primary.id}`);
+
+  await consolidateDuplicates({ owner, repo, tag: rTag, token, keepId: primary.id });
+  await ensureAssets({ owner, repo, releaseId: primary.id, token, version: from });
+
+  if (primary.draft) {
+    const { error: e } = await ghWrite('PATCH', `/repos/${owner}/${repo}/releases/${primary.id}`, token, { draft: false });
+    if (e) die(`could not publish ${rTag} (${e})`);
+    ok('published');
+  }
+  console.log(`\n${C.grn}${C.bld}${rTag} repaired${C.off}  ${primary.html_url}\n`);
+  process.exit(0);
+}
 
 if (!git('rev-parse', '--git-dir')) die('not a git repository');
 
@@ -154,14 +367,13 @@ const { data: releases, error: relErr } = await gh(`/repos/${owner}/${repo}/rele
 if (relErr) {
   warn(`could not list releases (${relErr}) — skipping the stale-draft check`);
 } else {
-  const clash = releases.find((r) => r.tag_name === tag);
-  if (clash) {
+  const clash = releases.filter((r) => r.tag_name === tag);
+  if (clash.length) {
     die(
-      `a release for ${tag} already exists on GitHub (draft=${clash.draft})`,
-      clash.draft
-        ? `A leftover draft SWALLOWS this upload silently — the build will report success and\n` +
-            `the app will keep saying "up to date". Delete it first:\n  ${clash.html_url}`
-        : `Bump to a different version, or delete the release at:\n  ${clash.html_url}`,
+      `${clash.length} release(s) for ${tag} already exist on GitHub`,
+      `If a previous run got partway, finish it without rebuilding:\n` +
+        `  npm run ship:repair\n\n` +
+        `Otherwise bump to a different version, or delete:\n  ${clash.map((r) => r.html_url).join('\n  ')}`,
     );
   }
   ok(`no existing release or draft for ${tag}`);
@@ -265,54 +477,52 @@ if (branch !== 'main') {
 // vsthost.node rather than shipping a build with VST3 hosting silently off.
 step('Build and publish');
 if (dryRun) {
-  info('dry-run: npm run release');
+  info('dry-run: create draft release, npm run release');
+  // Named explicitly rather than folded into "…, verify, publish": whether the
+  // APK is part of this release is the one thing a dry run is asked to confirm
+  // that cannot be seen afterwards without a phone.
+  info(
+    noAndroid
+      ? 'dry-run: SKIPPING the Android APK (--no-android) — phones would not see this release'
+      : canAndroid
+        ? `dry-run: npm run android:app && android:apk:release → release/LivePatch-${to}.apk`
+        : 'dry-run: no android/ dir or no keystore — would ship desktop-only',
+  );
+  info('dry-run: verify assets, publish');
   console.log(`\n${C.yel}Dry run complete — nothing was committed, tagged, pushed or uploaded.${C.off}\n`);
   process.exit(0);
 }
+const draft = await createDraftRelease({ owner, repo, tag, token });
 npmRun('release', 'build/publish');
-ok('electron-builder finished');
+ok('electron-builder finished (exit code alone proves nothing — verifying)');
+
+// The APK, now that package.json says `to` — this is the only point in the run
+// where building it produces the filename `ensureAssets` is about to demand.
+if (noAndroid) {
+  info('skipping the Android APK (--no-android): phones will not see this release');
+} else if (!canAndroid) {
+  warn('no android/ dir or no signing keystore — shipping desktop-only, phones will not see this release');
+} else {
+  step(`Android APK ${to}`);
+  npmRun('android:app', 'Android web payload');
+  npmRun('android:apk:release', 'Android APK');
+  ok(`release/LivePatch-${to}.apk`);
+}
 
 // ============================================================== 7. verify
 // electron-builder exiting 0 is not evidence the release is live and complete.
-step('Verify the release is live');
-if (skipVerify) {
-  warn('skipped (--no-verify)');
-} else {
-  let seen = null;
-  for (let attempt = 1; attempt <= 6; attempt++) {
-    const { data, error } = await gh(`/repos/${owner}/${repo}/releases/tags/${tag}`, token);
-    if (data && !error) {
-      seen = data;
-      break;
-    }
-    info(`not visible yet (${error}) — retry ${attempt}/6`);
-    await new Promise((r) => setTimeout(r, 5000));
-  }
-  if (!seen) {
-    die(
-      `${tag} is not on GitHub, even though the build reported success`,
-      `Check for a draft that swallowed it:\n  https://github.com/${owner}/${repo}/releases`,
-    );
-  }
+step('Consolidate and verify');
+await consolidateDuplicates({ owner, repo, tag, token, keepId: draft.id });
+await ensureAssets({ owner, repo, releaseId: draft.id, token, version: to });
 
-  const names = (seen.assets ?? []).map((a) => a.name);
-  const need = [
-    [`LivePatch-${to}-setup.exe`, 'the installer'],
-    ['latest.yml', 'the update feed — without it the app 404s on every update check'],
-    [`LivePatch-${to}-setup.exe.blockmap`, 'the delta map — without it updates download the full ~95 MB'],
-  ];
-  let missing = 0;
-  for (const [name, why] of need) {
-    if (names.includes(name)) ok(name);
-    else {
-      warn(`MISSING ${name} — ${why}`);
-      missing++;
-    }
-  }
-  if (seen.draft) warn('release is a DRAFT — electron-updater ignores drafts, so no user will see it');
-  if (missing || seen.draft) {
-    console.log(`\n${C.yel}Published with problems: ${seen.html_url}${C.off}\n`);
-    process.exit(1);
-  }
-  console.log(`\n${C.grn}${C.bld}${tag} is live${C.off}  ${seen.html_url}\n`);
+// ================================================================= 8. go live
+// Deliberately last: nothing is visible to users until the assets above are
+// confirmed complete and on ONE release.
+step('Publish');
+const { data: live, error: pubErr } = await ghWrite('PATCH', `/repos/${owner}/${repo}/releases/${draft.id}`, token, {
+  draft: false,
+});
+if (pubErr) {
+  die(`assets are uploaded but publishing failed (${pubErr})`, `Flip it live by hand:\n  https://github.com/${owner}/${repo}/releases`);
 }
+console.log(`\n${C.grn}${C.bld}${tag} is live${C.off}  ${live.html_url}\n`);

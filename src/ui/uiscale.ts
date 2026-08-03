@@ -12,7 +12,13 @@
 // px, so any code turning a pointer coordinate into a style value must send
 // it through `toUiPx` (see dock.ts, menus.ts).
 // ============================================================================
-const KEY = 'livepatch.uiscale';
+// Per-WINDOW, not per-app. The detached Dock window is usually a different
+// panel at a different viewing distance (a touchscreen at arm's length vs a
+// desk monitor), so it keeps its own scale — and because it shares an origin
+// with the main window, that requires a separate key rather than a separate
+// variable. Sharing one key would also mean each window's scale change
+// silently rewrote the other's on next launch.
+const KEY = document.body.classList.contains('dock-window') ? 'livepatch.uiscale.dock' : 'livepatch.uiscale';
 
 export const UI_SCALE_MIN = 0.6;
 // 4× because the old 2.5 ceiling was a real limit in daily use, not a safety

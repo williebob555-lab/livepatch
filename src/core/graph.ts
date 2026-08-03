@@ -295,6 +295,48 @@ export class GraphDoc {
     this.touch('meta');
   }
 
+  /**
+   * Install a scene received from a PEER surface — the detached Dock window or
+   * a remote control surface on the LAN.
+   *
+   * Deliberately **not** `loadScene`. That is a document *load* and carries
+   * load semantics which are actively wrong for a replica sync, in three ways
+   * that each produced a bug:
+   *
+   * 1. **"The room wins."** `loadScene` replaces the incoming `scene.rig` with
+   *    this installation's saved rig, so a patch never moves your speakers.
+   *    Correct for opening a file; catastrophic for a sync, because both
+   *    windows are the *same* installation — every rig edit was overwritten the
+   *    instant it arrived. Reported as "the rig doesn't sync".
+   * 2. **It clears the undo stack** and calls `resetSides()`, dropping the take
+   *    store with it. Using it per sync meant any structural edit in either
+   *    window silently destroyed the other's history, megabytes of recorded
+   *    audio included.
+   * 3. It resets `path`, `savedAs` and `dirty` — state the peer is not
+   *    authoritative about.
+   *
+   * What a sync actually needs is to adopt the *content* and leave the local
+   * session alone. Note the rig is taken verbatim: the peer is this same
+   * installation, so its layout is already ours.
+   */
+  adoptScene(scene: Scene): void {
+    scene.theme = { ...defaultTheme(), ...scene.theme };
+    this.scene = scene;
+    this.pruneDock();
+    // Still guard the degenerate case — a hand-edited or truncated payload
+    // with no speakers would compile every spatial block to nothing.
+    if (!scene.rig?.speakers?.length) scene.rig = defaultRig();
+    this.syncRigPorts();
+    this.touch('structure');
+    this.touch('theme');
+    // 'rig' is its own change kind and the runtime listens for exactly it
+    // (`pushRig`). Touching only 'structure' would update both screens and
+    // never tell the engine, so the speakers on the drawing would stop
+    // matching the speakers in the room.
+    this.touch('rig');
+    this.touch('meta');
+  }
+
   // ---- rig (the scene's speaker layout) ----
   /**
    * Commit a speaker-layout edit. `live` is for drags: it skips the history
@@ -1274,22 +1316,34 @@ export class GraphDoc {
     return this.wiredPorts().has(blockId + '\0' + portId);
   }
 
-  private wiredCache: { rev: number; set: Set<string> } | null = null;
-  private wiredPorts(): Set<string> {
-    if (this.wiredCache && this.wiredCache.rev === this.netRev) return this.wiredCache.set;
-    const set = new Set<string>();
+  /**
+   * The id of a wire plugged into a port, or null. Same memoized walk as
+   * `isPortWired` — the trigger flash needs to ask `runtime.levelFor` about the
+   * line feeding a clock/gate input, once per port per frame, and `wireAtPort`
+   * above is a linear scan of every wire in the graph (fine for a click, not
+   * for a paint). When several wires end on one port the last one wins, which
+   * is the same answer `isPortWired` gives.
+   */
+  wireIdAtPort(blockId: string, portId: string): string | null {
+    return this.wiredPorts().get(blockId + '\0' + portId) ?? null;
+  }
+
+  private wiredCache: { rev: number; map: Map<string, string> } | null = null;
+  private wiredPorts(): Map<string, string> {
+    if (this.wiredCache && this.wiredCache.rev === this.netRev) return this.wiredCache.map;
+    const map = new Map<string, string>();
     const visit = (g: Graph): void => {
       for (const w of g.wires) {
         // A wire end being dragged has `float` instead of `port` — it is
         // genuinely unplugged, so it correctly contributes nothing.
-        if (w.a.port) set.add(w.a.port.blockId + '\0' + w.a.port.portId);
-        if (w.b.port) set.add(w.b.port.blockId + '\0' + w.b.port.portId);
+        if (w.a.port) map.set(w.a.port.blockId + '\0' + w.a.port.portId, w.id);
+        if (w.b.port) map.set(w.b.port.blockId + '\0' + w.b.port.portId, w.id);
       }
       for (const b of g.blocks) if (b.graph) visit(b.graph);
     };
     visit(this.scene.root);
-    this.wiredCache = { rev: this.netRev, set };
-    return set;
+    this.wiredCache = { rev: this.netRev, map };
+    return map;
   }
 
   /**

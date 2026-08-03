@@ -347,6 +347,22 @@ export class GraphExec {
     slot.tMs = now;
   }
 
+  /**
+   * A learned keystroke changed state.
+   *
+   * Broadcast to every `key-in` whose `key` param matches, rather than
+   * addressed to one node: the same shortcut can legitimately drive several
+   * blocks, and the host that registered the hotkey knows the accelerator, not
+   * which nodes asked for it.
+   */
+  deliverKey(accel: string, down: boolean): void {
+    for (const rec of this.nodes.values()) {
+      if (!rec.kernel.deliverKey) continue;
+      if (String(rec.params?.key ?? '') !== accel) continue;
+      rec.kernel.deliverKey(down);
+    }
+  }
+
   assetReady(id: string): void {
     this.sv.assets.retry(id);
     // Dropping the store's decoded copy is only half of it. A kernel hydrates

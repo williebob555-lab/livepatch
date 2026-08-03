@@ -1,0 +1,12 @@
+{
+  "appId": "com.livepatch.player",
+  "appName": "LivePatch",
+  "webDir": "build/android-www",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#14161a"
+  },
+  "server": {
+    "androidScheme": "http"
+  }
+}

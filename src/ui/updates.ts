@@ -14,6 +14,7 @@
  * dev flow the bridge reports `unsupported` and the menu item says so.
  */
 import { buildModal, confirmModal, showBanner } from './menus';
+import { isAndroidApp } from './androidupdate';
 
 interface UpdateCheck {
   state: 'available' | 'none' | 'downloaded' | 'error' | 'unsupported';
@@ -127,6 +128,20 @@ async function offerRestart(version: string): Promise<void> {
   // The version can be blank when the download resolved before the
   // 'update-downloaded' event named it — don't render "LivePatch  ".
   const what = version ? `LivePatch ${version}` : 'The update';
+  // Android's ending is a different one: the browser has the download, and it
+  // installs it. LivePatch deliberately cannot — see androidupdate.ts — so
+  // there is nothing to confirm here, only something to explain. The NSIS copy
+  // below ("gone for about a minute with nothing on screen") would be actively
+  // misleading.
+  if (isAndroidApp()) {
+    await confirmModal(
+      'Downloading in your browser',
+      `${what} is downloading. When it finishes, tap the download notification to install it — ` +
+        `Android will ask you to confirm. Audio stops while it installs.`,
+      'OK',
+    );
+    return;
+  }
   // Be specific about the gap. The installer replaces ~2,500 files one at a
   // time (asar is off), so LivePatch is gone for around a minute with nothing
   // on screen — and a user who assumes it crashed will relaunch the old copy

@@ -134,7 +134,11 @@ registerBlock({
   desc: 'Distance cues for a source: gain rolloff, air-absorption low-pass, and Doppler',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'dist', name: 'dist', kind: 'audio', role: 'cv', dir: 'in' },
+    // The CV *replaces* the knob (metres = |cv| × 50), it does not offset it —
+    // see the kernel's `dTarget`. Magnitude, so a bipolar LFO sweeps toward the
+    // listener and back rather than passing through the wall behind them.
+    { id: 'dist', name: 'dist', kind: 'audio', role: 'cv', dir: 'in',
+      cvParam: 'distance', cvLaw: 'replace-abs', cvScale: 50 },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
@@ -211,7 +215,7 @@ registerBlock({
   category: 'Surround',
   group: 'Spatial',
   desc: 'Play a hand-drawn 3D path as X/Y/Z control voltages — draw it in the Advanced tab',
-  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'in' }],
+  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'in', cvTrigger: true }],
   outputs: [
     { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'out' },
     { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'out' },
@@ -247,7 +251,7 @@ registerBlock({
   category: 'Surround',
   group: 'Spatial',
   desc: 'Moves X/Y/Z control voltages along a circular, Lissajous or spiral path',
-  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'in' }],
+  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', role: 'cv', dir: 'in', cvTrigger: true }],
   outputs: [
     { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'out' },
     { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'out' },
@@ -323,9 +327,12 @@ registerBlock({
   desc: 'Position a source in the speaker layout (DBAP / VBAP), moved by CV or the XY pad',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in' },
-    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in' },
-    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'in' },
+    // A wired axis takes over from its knob outright (`posOf` in the kernel):
+    // the knob is the base position you patch *away* from, not something the
+    // CV is added to.
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'x', cvLaw: 'replace' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'y', cvLaw: 'replace' },
+    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'z', cvLaw: 'replace' },
   ],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
@@ -365,8 +372,10 @@ registerBlock({
   desc: 'Geometric early reflections (image-source), each panned onto the rig — pair with Reverb for the tail',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in' },
-    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in' },
+    // Offsets the source position set by the XY pad, unlike the Panner's
+    // take-over inputs — the room's geometry means the knob is a real place.
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'srcx', cvLaw: 'add' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'srcy', cvLaw: 'add' },
   ],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
@@ -411,7 +420,7 @@ registerBlock({
   desc: 'Splits a source into frequency bands and places each one somewhere different in the rig',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'rot', name: 'rot', kind: 'audio', role: 'cv', dir: 'in' },
+    { id: 'rot', name: 'rot', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'rot', cvLaw: 'add' },
   ],
   outputs: [{ id: 'out', name: 'speakers', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
@@ -419,6 +428,12 @@ registerBlock({
     { id: 'mode', name: 'Pattern', type: 'enum', def: 'Rising', widget: 'select', affects: ['spin'],
       options: ['Rising', 'Falling', 'Alternate', 'Random'] },
     knob('spin', 'Spin', -2, 2, 0, { mark: 'spin', unit: 'Hz' }),
+    // Where the pattern is pointing *now*, in turns — the thing the `rot` input
+    // moves. Spin is a rate (Hz) and Rotate is an angle: they are different
+    // quantities, and the CV input had no knob of its own until this existed,
+    // so a patched `rot` swung the whole scatter with nothing on the face to
+    // show it. Default 0 leaves every existing patch sounding identical.
+    knob('rot', 'Rotate', -1, 1, 0, { mark: 'spin', unit: 'turn' }),
     knob('width', 'Width', 0, 1, 0.85, { mark: 'width' }),
     knob('elev', 'Elevation', -1, 1, 0),
     knob('low', 'Low', 40, 800, 120, { curve: 'log', unit: 'Hz', face: false }),
@@ -485,9 +500,9 @@ registerBlock({
   desc: 'Put a source INTO an ambisonic field. Start of every ambisonic chain — feed its output to Rotate/Transform, then Decode. On the pad, the ANGLE is the direction and the DISTANCE FROM CENTRE is how focused it is: at the rim it points somewhere, at the centre it comes from everywhere. Not distance — use Distance for that.',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in' },
-    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in' },
-    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'in' },
+    { id: 'x', name: 'x', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'x', cvLaw: 'replace' },
+    { id: 'y', name: 'y', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'y', cvLaw: 'replace' },
+    { id: 'z', name: 'z', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'z', cvLaw: 'replace' },
   ],
   outputs: [{ id: 'out', name: 'B-format', kind: 'audio', dir: 'out', chans: 4 }],
   params: [
@@ -508,7 +523,8 @@ registerBlock({
   desc: 'Turn the whole scene at once — every source and the space with them. Yaw spins it left/right, Pitch tips it, Roll banks it; Spin free-runs in Hz. The move ambisonics exists for.',
   inputs: [
     { id: 'in', name: 'B-format', kind: 'audio', dir: 'in', chans: 4 },
-    { id: 'yaw', name: 'yaw', kind: 'audio', role: 'cv', dir: 'in' },
+    // Degrees, added to the knob (and to the free-running Spin) — see `yawDeg`.
+    { id: 'yaw', name: 'yaw', kind: 'audio', role: 'cv', dir: 'in', cvParam: 'yaw', cvLaw: 'add' },
   ],
   outputs: [{ id: 'out', name: 'B-format', kind: 'audio', dir: 'out', chans: 4 }],
   params: [
@@ -955,9 +971,10 @@ registerBlock({
   alsoIn: [{ category: 'Control & CV', group: 'Modular' }],
   desc: 'Analog-style oscillator: saw↔pulse blend, pulse width, 1V/oct pitch CV, PWM and hard sync. Anti-aliased (polyBLEP).',
   inputs: [
-    { id: 'pitch', name: '1v/oct', kind: 'audio', dir: 'in', role: 'cv' },
-    { id: 'pwm', name: 'pwm', kind: 'audio', dir: 'in', role: 'cv' },
-    { id: 'sync', name: 'sync', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'pitch', name: '1v/oct', kind: 'audio', dir: 'in', role: 'cv',
+      cvParam: 'freq', cvLaw: '1v/oct' },
+    { id: 'pwm', name: 'pwm', kind: 'audio', dir: 'in', role: 'cv', cvParam: 'pw', cvLaw: 'add' },
+    { id: 'sync', name: 'sync', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
@@ -981,7 +998,8 @@ registerBlock({
   desc: 'Four-pole (−24 dB/oct) transistor-ladder low pass with resonance to self-oscillation, drive, and a 1V/oct cutoff CV',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'cut', name: 'cutoff', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'cut', name: 'cutoff', kind: 'audio', dir: 'in', role: 'cv',
+      cvParam: 'cutoff', cvLaw: '1v/oct' },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
@@ -1003,7 +1021,8 @@ registerBlock({
   desc: 'Folds a signal back on itself instead of clipping it — adds harmonics that track the level, not the pitch',
   inputs: [
     { id: 'in', name: 'in', kind: 'audio', dir: 'in' },
-    { id: 'fold', name: 'fold', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'fold', name: 'fold', kind: 'audio', dir: 'in', role: 'cv',
+      cvParam: 'amount', cvLaw: 'add' },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
@@ -1024,7 +1043,7 @@ registerBlock({
   group: 'Generators',
   alsoIn: [{ category: 'Sources', group: 'Modular' }],
   desc: 'ADSR envelope fired by a gate CV — the articulation source for a patched voice. Exponential segments, like an RC envelope.',
-  inputs: [{ id: 'gate', name: 'gate', kind: 'audio', dir: 'in', role: 'cv' }],
+  inputs: [{ id: 'gate', name: 'gate', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true }],
   outputs: [
     { id: 'out', name: 'env', kind: 'audio', dir: 'out', role: 'cv' },
     // The complement (1 − env), free: patch it to a cutoff for a filter that
@@ -1054,8 +1073,9 @@ registerBlock({
   alsoIn: [{ category: 'Sources', group: 'Modular' }],
   desc: 'Triangle↔square blend, 0.05–550 Hz, 1V/oct rate CV and a reset input. Runs into the audio range on purpose.',
   inputs: [
-    { id: 'rate', name: 'rate', kind: 'audio', dir: 'in', role: 'cv' },
-    { id: 'reset', name: 'reset', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'rate', name: 'rate', kind: 'audio', dir: 'in', role: 'cv',
+      cvParam: 'rate', cvLaw: '1v/oct' },
+    { id: 'reset', name: 'reset', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
   params: [
@@ -1079,8 +1099,8 @@ registerBlock({
   alsoIn: [{ category: 'Sources', group: 'Modular' }, { category: 'Logic', group: 'Sample & Hold' }],
   desc: 'Grabs its source on each rising edge of the trigger and holds it. Source defaults to internal noise, so it is a random voltage generator with one wire.',
   inputs: [
-    { id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv' },
-    { id: 'trig', name: 'trig', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv', cvSignal: true },
+    { id: 'trig', name: 'trig', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
   params: [
@@ -1103,7 +1123,7 @@ registerBlock({
   group: 'Math',
   alsoIn: [{ category: 'Sources', group: 'Modular' }],
   desc: 'Limits how fast a signal may move — portamento on a pitch CV, a lag on a gate, a smoother on anything steppy',
-  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv' }],
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in', role: 'cv', cvSignal: true }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out', role: 'cv' }],
   params: [
     knob('rise', 'Rise', 0, 9, 0, { mark: 'glide-up', curve: 'lin', unit: 's', cv: true }),
@@ -1519,8 +1539,12 @@ registerBlock({
 });
 
 // ---------- CV math (audio-rate — works on any signal, colored as CV) ----------
+// Every inlet built by this helper carries the signal being *operated on*, not
+// a modulation of some knob — so it declares `cvSignal` once here rather than
+// on each of the dozen blocks that use it. (See PortSpec: a cv input must
+// declare itself a modulator, a trigger, or a signal inlet.)
 const cvIn = (id: string, name = id) =>
-  ({ id, name, kind: 'audio' as const, role: 'cv' as const, dir: 'in' as const });
+  ({ id, name, kind: 'audio' as const, role: 'cv' as const, dir: 'in' as const, cvSignal: true as const });
 const cvOut = { id: 'out', name: 'out', kind: 'audio' as const, role: 'cv' as const, dir: 'out' as const };
 registerBlock({
   type: 'cv-scale',
@@ -1612,7 +1636,7 @@ registerBlock({
   desc: 'Held notes played as a pattern. Clock in (rising edge) or internal rate; up/down/updown/random/order, octave span, gate length, probability.',
   inputs: [
     { id: 'midi', name: 'midi', kind: 'midi', dir: 'in' },
-    { id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
@@ -1661,7 +1685,7 @@ registerBlock({
   group: 'Tools',
   alsoIn: [{ category: 'Control & CV', group: 'Generators' }],
   desc: 'Monophonic step sequencer. Clock in or internal rate; drag steps to set pitch, click to rest. Length 1–32.',
-  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' }],
+  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true }],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
     { id: 'steps', name: 'Steps', type: 'string', def: '', widget: 'seqgrid' },
@@ -1692,7 +1716,7 @@ registerBlock({
   desc: 'Repeats notes with decaying velocity. Clock in (per-edge delay) or internal time; feedback sets repeat count.',
   inputs: [
     { id: 'midi', name: 'midi', kind: 'midi', dir: 'in' },
-    { id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' },
+    { id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [
@@ -1805,8 +1829,10 @@ registerBlock({
   alsoIn: [{ category: 'Control & CV', group: 'Convert' }],
   desc: 'Gate rising edge triggers a note; pitch CV picks it (C4 + pitch·octave). Pitch moves retrigger while gated — sample-accurate edges.',
   inputs: [
-    { id: 'pitch', name: 'pitch', kind: 'audio', dir: 'in', role: 'cv' },
-    { id: 'gate', name: 'gate', kind: 'audio', dir: 'in', role: 'cv' },
+    // `pitch` selects the note rather than modulating a knob — a signal inlet.
+    // `gate` is the edge that fires it.
+    { id: 'pitch', name: 'pitch', kind: 'audio', dir: 'in', role: 'cv', cvSignal: true },
+    { id: 'gate', name: 'gate', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true },
   ],
   outputs: [{ id: 'out', name: 'midi', kind: 'midi', dir: 'out' }],
   params: [knob('velocity', 'Vel', 0.1, 1, 0.9)],
@@ -1818,7 +1844,7 @@ registerBlock({
   group: 'Convert',
   alsoIn: [{ category: 'Control & CV', group: 'Convert' }],
   desc: 'Measures tempo from the rising edges of a CV clock (square LFO): bpm out = BPM/240. Feed any square wave in, use the tempo anywhere.',
-  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv' }],
+  inputs: [{ id: 'clock', name: 'clock', kind: 'audio', dir: 'in', role: 'cv', cvTrigger: true }],
   outputs: [{ id: 'bpm', name: 'bpm', kind: 'audio', dir: 'out', role: 'cv' }],
   params: [],
 });
@@ -2339,4 +2365,99 @@ registerBlock({
   params: [
     { id: 'kind', name: 'Kind', type: 'enum', def: 'audio', widget: 'select', options: ['audio', 'cv', 'midi'] },
   ],
+});
+
+// ---------------------------------------------------------------- keyboard --
+//
+// Two blocks that reach OUTSIDE the app: one listens for a keystroke anywhere
+// on the machine, one presses a key anywhere on the machine. They are how a
+// patch drives — and is driven by — everything that is not LivePatch: a DAW
+// transport, OBS scenes, a media player, a lighting desk's hotkeys.
+//
+// Both are deliberately shaped so the audio thread never touches the keyboard.
+// The kernels only read a param (`key-in`) or edge-detect a gate and emit one
+// message (`key-out`); registration and injection happen in the main process.
+// See `docs/14-input.md` and golden rule 1.
+
+/** Curated shortcuts, so the common cases need no accelerator typing at all.
+ *  Media keys are the reason this list exists — they are the ones people want
+ *  and the ones nobody can guess the accelerator name for. */
+export const KEY_PRESETS = [
+  'Custom…',
+  'Media Play/Pause',
+  'Media Next Track',
+  'Media Previous Track',
+  'Media Stop',
+  'Volume Up',
+  'Volume Down',
+  'Volume Mute',
+  'Space',
+  'Escape',
+  'Enter',
+  'Left',
+  'Right',
+  'Up',
+  'Down',
+  'PageUp',
+  'PageDown',
+  'F1',
+  'F2',
+  'F5',
+  'F11',
+  'Ctrl+C',
+  'Ctrl+V',
+  'Ctrl+Z',
+  'Ctrl+S',
+  'Alt+Tab',
+];
+
+registerBlock({
+  type: 'key-in',
+  title: 'Key In',
+  category: 'I/O & Hardware',
+  desc: 'Listens for a keystroke anywhere on this machine and outputs a gate + trigger',
+  inputs: [],
+  outputs: [
+    { id: 'gate', name: 'gate', kind: 'audio', role: 'cv', dir: 'out' },
+    { id: 'trig', name: 'trig', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    // Held as an Electron accelerator string ('Ctrl+Alt+K', 'MediaPlayPause').
+    // Set by the Learn button rather than typed, which is why it is not a face
+    // param — a text field showing "Ctrl+Alt+K" invites editing it by hand into
+    // something that will not register.
+    { id: 'key', name: 'Key', type: 'string', def: '', widget: 'select', face: false },
+    {
+      id: 'mode',
+      name: 'Mode',
+      type: 'enum',
+      def: 'Gate',
+      widget: 'select',
+      options: ['Gate', 'Toggle', 'Trigger'],
+    },
+    knob('glide', 'Glide', 0, 0.5, 0.005, { mark: 'time' }),
+  ],
+  stubbed: true,
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#33323f', stroke: '#9d8cff' },
+});
+
+registerBlock({
+  type: 'key-out',
+  title: 'Key Out',
+  category: 'I/O & Hardware',
+  desc: 'Presses a key on this machine when its gate rises — media controls and app shortcuts',
+  inputs: [{ id: 'trig', name: 'trig', kind: 'audio', role: 'cv', dir: 'in', cvTrigger: true }],
+  outputs: [],
+  params: [
+    { id: 'preset', name: 'Shortcut', type: 'enum', def: 'Media Play/Pause', widget: 'select', options: KEY_PRESETS },
+    { id: 'key', name: 'Custom key', type: 'string', def: '', widget: 'select', face: false },
+    // A gate that chatters would fire hundreds of keystrokes a second into
+    // whatever has focus. This is a floor on how often one can be sent, and it
+    // is a safety limit rather than a taste one.
+    knob('minGap', 'Min gap', 0.02, 2, 0.15, { mark: 'time' }),
+  ],
+  stubbed: true,
+  minW: 110,
+  style: { shape: 'chamfer', fill: '#3a3330', stroke: '#ffb86c' },
 });

@@ -54,6 +54,7 @@ interface Bridge {
   cassettesSavePcm(id: string, data: Uint8Array): Promise<boolean>;
 }
 const bridge = (): Bridge | undefined => (window as any).livepatchNative;
+export type EngineTransport = Bridge;
 
 const SETTINGS_KEY = 'livepatch.nativeengine';
 /**
@@ -139,8 +140,28 @@ export interface MeasureSpeakersOpts {
 }
 
 export class NativeEngineClient implements EngineAdapter {
-  readonly name = 'native';
+  readonly name: string = 'native';
   running = false;
+
+  /**
+   * Where protocol messages go.
+   *
+   * Defaults to the Electron preload bridge. The AudioWorklet engine
+   * (`worklet.ts`) injects its own, because it speaks the SAME protocol — the
+   * worklet hosts the same `dsp.ts`, so it emits the same `levels`/`mods`/
+   * `visuals`/`need-asset` messages. Injecting the transport means one client
+   * implementation serves both engines; a separate `WorkletEngine` adapter
+   * would be a second copy of all the level, mod, visual and asset bookkeeping
+   * below, which is exactly the duplication golden rule 8 exists to prevent.
+   */
+  protected tx: EngineTransport | undefined;
+  constructor(tx?: EngineTransport) {
+    this.tx = tx;
+  }
+  /** The transport in use — injected, or the global preload bridge. */
+  protected b(): EngineTransport | undefined {
+    return this.tx ?? bridge();
+  }
   /** Set by the runtime: a node committed a recorded take (see EngineAdapter). */
   onAsset: ((nodeId: string, assetId: string) => void) | null = null;
   devices: NativeDeviceInfo[] = [];
@@ -157,7 +178,7 @@ export class NativeEngineClient implements EngineAdapter {
 
   /** Arm/disarm engine-side MIDI-learn event echoing. */
   armMidiLearn(on: boolean): void {
-    bridge()?.engineSend({ op: 'midi-learn', on });
+    this.b()?.engineSend({ op: 'midi-learn', on });
   }
 
   private unsub: (() => void) | null = null;
@@ -228,7 +249,7 @@ export class NativeEngineClient implements EngineAdapter {
   private everReady = false;
 
   async start(): Promise<void> {
-    const b = bridge();
+    const b = this.b();
     if (!b?.engineStart) {
       this.status = { error: 'native engine requires the desktop app' };
       this.onStatus?.(this.status);
@@ -250,7 +271,7 @@ export class NativeEngineClient implements EngineAdapter {
 
   stop(): void {
     this.running = false;
-    bridge()?.engineStop();
+    this.b()?.engineStop();
     this.unMidi?.();
     this.unMidi = null;
     this.levels.clear();
@@ -260,11 +281,11 @@ export class NativeEngineClient implements EngineAdapter {
   applyGraph(g: CompiledGraph): void {
     this.netWires.clear();
     for (const net of g.nets) this.netWires.set(net.id, net.wireIds);
-    bridge()?.engineSend({ op: 'set-graph', graph: g });
+    this.b()?.engineSend({ op: 'set-graph', graph: g });
   }
 
   setParam(nodeId: string, paramId: string, v: ParamValue): void {
-    bridge()?.engineSend({ op: 'set-param', node: nodeId, param: paramId, value: v });
+    this.b()?.engineSend({ op: 'set-param', node: nodeId, param: paramId, value: v });
   }
 
   poll(): void {
@@ -280,7 +301,7 @@ export class NativeEngineClient implements EngineAdapter {
     const key = active.sort().join(',');
     if (key !== this.lastWatchSent) {
       this.lastWatchSent = key;
-      bridge()?.engineSend({ op: 'watch-visuals', nodes: active });
+      this.b()?.engineSend({ op: 'watch-visuals', nodes: active });
     }
   }
 
@@ -451,7 +472,7 @@ export class NativeEngineClient implements EngineAdapter {
             // those live in renderer storage. Without this the engine silently
             // comes back at the default rate and buffer size.
             const s = loadNativeSettings();
-            bridge()?.engineSend({ op: 'config', frames: s.frames, sampleRate: s.sampleRate });
+            this.b()?.engineSend({ op: 'config', frames: s.frames, sampleRate: s.sampleRate });
             this.onEngineRestart?.();
           }
           this.everReady = true;
@@ -495,8 +516,8 @@ export class NativeEngineClient implements EngineAdapter {
         const d = buf.getChannelData(c);
         for (let i = 0; i < buf.length; i++) inter[i * nCh + c] = d[i];
       }
-      await bridge()?.cassettesSavePcm(id, out);
-      bridge()?.engineSend({ op: 'asset-ready', id });
+      await this.b()?.cassettesSavePcm(id, out);
+      this.b()?.engineSend({ op: 'asset-ready', id });
     } finally {
       this.decodingAssets.delete(id);
     }
@@ -505,7 +526,7 @@ export class NativeEngineClient implements EngineAdapter {
   /** Device names for a hardware block's `device` param dropdown. */
   /** Start a loopback round-trip latency measurement (result → onLatencyResult). */
   measureLatency(opts: { device?: string; channel?: number; runs?: number } = {}): void {
-    bridge()?.engineSend({ op: 'measure-latency', ...opts });
+    this.b()?.engineSend({ op: 'measure-latency', ...opts });
   }
 
   // ---- speaker calibration ----
@@ -566,7 +587,7 @@ export class NativeEngineClient implements EngineAdapter {
    *  progress on `onCalProgress`. */
   measureSpeakers(opts: MeasureSpeakersOpts): void {
     this.sweepPart = null;
-    bridge()?.engineSend({
+    this.b()?.engineSend({
       op: 'measure-speakers',
       device: opts.device ?? '',
       channel: opts.channel ?? 1,
@@ -582,7 +603,7 @@ export class NativeEngineClient implements EngineAdapter {
    *  message, so the caller's teardown runs through the same path either way. */
   cancelSpeakerMeasure(): void {
     this.sweepPart = null;
-    bridge()?.engineSend({ op: 'measure-speakers', cancel: true, speakers: [], sweep: '' });
+    this.b()?.engineSend({ op: 'measure-speakers', cancel: true, speakers: [], sweep: '' });
   }
 
   /** `api` is the block's Driver param where it has one (Speaker Rig), so the

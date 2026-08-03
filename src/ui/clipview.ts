@@ -16,6 +16,7 @@
 // (`pianoroll.ts`) — notes are the one thing here that really is edited.
 // ============================================================================
 import { doc } from '../core/graph';
+import { buildTargetPicker } from './targetpicker';
 import { Block, Theme } from '../core/types';
 import { paramSpec } from '../core/registry';
 import { runtime } from '../engine/runtime';

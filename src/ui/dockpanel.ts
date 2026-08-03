@@ -65,7 +65,12 @@ export function registerDockTab(def: DockTabDef): void {
   tabDefs.sort((a, b) => a.order - b.order);
 }
 
-const LS_TAB = 'livepatch.dock.tab';
+// Per-WINDOW, like the panel layout and the UI scale (see dock.ts, uiscale.ts).
+// The detached Dock window shares an origin with the main one, and in mirrored
+// mode both are showing a tab at the same time — one key would mean whichever
+// window was touched last silently decided what the other opened on next
+// launch.
+const LS_TAB = document.body.classList.contains('dock-window') ? 'livepatch.dock.tab.detached' : 'livepatch.dock.tab';
 let activeId = '';
 let railEl: HTMLElement | null = null;
 let paneEl: HTMLElement | null = null;
