@@ -31,7 +31,24 @@ export function showContextMenu(x: number, y: number, items: MenuItem[]): void {
     }
     const el = document.createElement('div');
     el.className = 'ctx-item' + (it.disabled ? ' disabled' : '');
-    el.innerHTML = `<span>${it.label}</span>` + (it.key ? `<span class="key">${it.key}</span>` : '');
+    // `textContent`, never `innerHTML` — see docs/07-ui.md rule on menu labels.
+    // Labels are not all literals: they interpolate block names
+    // (`widgetdock.ts`), speaker names (`rigview.ts`) and custom-block titles
+    // (`panels.ts`), and a block name travels *inside a shared `.lps` scene*.
+    // So an imported scene could put `<img src=x onerror=…>` into a menu item
+    // and fire it on an ordinary right-click — and page script reaches the
+    // preload bridge, which offers `keysSend`, `lanStart` and `updatesInstall`.
+    // No label anywhere relies on HTML (the ●/▸/○/✓ markers are plain text),
+    // so this costs nothing. (CodeQL js/xss-through-dom, 2026-08-05.)
+    const label = document.createElement('span');
+    label.textContent = it.label ?? '';
+    el.appendChild(label);
+    if (it.key) {
+      const key = document.createElement('span');
+      key.className = 'key';
+      key.textContent = it.key;
+      el.appendChild(key);
+    }
     if (!it.disabled && it.action) {
       el.addEventListener('click', () => {
         closeMenus();

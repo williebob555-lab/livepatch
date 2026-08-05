@@ -84,7 +84,21 @@ function decode(v: unknown): unknown {
       return new Float32Array(u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
     }
     const o: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) o[k] = decode(x);
+    for (const [k, x] of Object.entries(v)) {
+      // `__proto__` is the one key name where `o[k] = …` does not define a
+      // property but invokes the prototype SETTER, re-parenting this object.
+      // `JSON.parse` happily produces it as an own key, so a crafted Dock
+      // message could reach it. Skipped rather than remapped: no message in
+      // this protocol carries a field by that name, so there is nothing to
+      // lose. (CodeQL js/remote-property-injection, 2026-08-05.)
+      //
+      // Only this key needs the guard — `constructor` and `prototype` assigned
+      // onto a fresh `{}` are ordinary own properties that shadow nothing
+      // outside it. Plain assignment is kept for the rest because this runs on
+      // every value frame, which is a per-frame path (docs/07-ui.md).
+      if (k === '__proto__') continue;
+      o[k] = decode(x);
+    }
     return o;
   }
   return v;

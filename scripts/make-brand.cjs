@@ -54,7 +54,16 @@ const ICON_SIZES = [
 // offscreen window per SVG aborts the *next* load with ERR_FAILED, and loading
 // from a data: URL is fragile besides — a temp file on disk is not.
 let win = null;
-const TMP_HTML = path.join(require('os').tmpdir(), 'livepatch-brand-render.html');
+// A per-run directory with an unpredictable name, not a fixed name in the shared
+// temp dir. (The property doing the work here is the unguessable name, not
+// permission bits — this script is Windows-only and POSIX modes mean nothing.)
+// The old fixed path was pre-creatable and symlink-able by any local account,
+// and whatever it pointed at got loaded into a BrowserWindow below — so someone
+// else's HTML could execute in an Electron renderer of ours. `mkdtempSync`
+// creates a directory that cannot already exist.
+// (CodeQL js/insecure-temporary-file, 2026-08-05.)
+const TMP_DIR = fs.mkdtempSync(path.join(require('os').tmpdir(), 'livepatch-brand-'));
+const TMP_HTML = path.join(TMP_DIR, 'render.html');
 
 function ensureWindow() {
   if (win) return win;
@@ -149,7 +158,8 @@ async function main() {
   const ico = path.join(BUILD, 'icon.ico');
   fs.writeFileSync(ico, buildIco(entries));
   try {
-    fs.unlinkSync(TMP_HTML);
+    // The whole per-run directory, not just the file inside it.
+    fs.rmSync(TMP_DIR, { recursive: true, force: true });
   } catch {}
   console.log(`  icon.ico                       ${ICON_SIZES.map((i) => i.size).join(', ')} px`);
   console.log(`\nwrote ${EXPORTS.length} PNGs to brand/png/ and ${ico}`);
