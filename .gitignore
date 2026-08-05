@@ -30,3 +30,7 @@ pkg-out.txt
 
 # Generated Android icon/splash intermediates
 build/android-assets/
+
+# Claude Code local overrides: machine-specific paths, session ids and
+# per-machine permission grants. Nothing here belongs in a public repo.
+.claude/settings.local.json

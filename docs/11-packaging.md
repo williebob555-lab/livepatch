@@ -1,6 +1,6 @@
 # 11 — Build, Packaging & Updates
 
-_Last verified: 2026-08-03. Files: `package.json`, `electron-builder.yml`, `player/*`, `scripts/android-*`,
+_Last verified: 2026-08-05. Files: `package.json`, `electron-builder.yml`, `player/*`, `scripts/android-*`,
 `scripts/ship.mjs`, `scripts/bundle-node.mjs`, `engine/postbuild.mjs`,
 `vite.config.ts`, `electron/main.cjs`, `src/ui/updates.ts`._
 
@@ -241,6 +241,59 @@ against `package.json`'s version. Bump the version down locally to see the
 
 Last verified package: reported the bundled `resources\node.exe`, enumerated
 27 WASAPI + 9 ASIO drivers, MIDI-direct found the MOTU.
+
+## Dependency security — `npm audit`, overrides, and Electron majors
+
+_Last full sweep: 2026-08-05, from 41 open GitHub Dependabot alerts (1 critical,
+15 high) to `found 0 vulnerabilities`._
+
+The repo is **public**, so Dependabot files an alert against the manifest on the
+**default branch** and the count only drops once the fix reaches `main`. Fixing
+on a feature branch changes nothing on the security tab until it merges.
+
+Three tiers, in the order to try them:
+
+1. **`npm audit fix`** — anything a same-major bump resolves. Free, took 18
+   findings to 14.
+2. **`overrides` in `package.json`** for a *transitive* package whose parent
+   still range-pins a vulnerable version. This is the tier that matters here:
+   `tar`, `uuid`, `sharp` and an ancient `minimatch@3` all arrive under
+   Capacitor's CLI / asset generator or `cmake-js`, and `npm audit fix --force`
+   wanted to **downgrade `@capacitor/cli` 8.5 → 8.4.2** to satisfy them, which
+   is not a fix. Pinning forward instead (`tar: ^7.5.22`, `uuid: ^11.1.1`,
+   `@capacitor/assets` → `sharp: ^0.35.3`, `replace` → `minimatch: ^3.1.5`)
+   took 14 → 3. Scope an override to its parent whenever only that parent is
+   the problem. **Every override is a package held back by hand** — re-check
+   after any bump and delete entries whose parent has moved on.
+3. **Deliberate major bumps** for the packages that are ours: `vite` 5 → 8
+   (also clears the `esbuild` dev-server advisory) and `electron` 33 → 43.
+
+### Why the Electron major bump is safer here than it looks
+
+Ten majors at once sounds alarming; the exposure is small, and for reasons this
+project chose on purpose:
+
+- `electron/main.cjs` imports **only** `app`, `BrowserWindow`, `ipcMain`,
+  `dialog`, `shell` and `screen`. None of the removed/renamed API surface
+  (`registerFileProtocol`, `getPrinters`, `desktopCapturer`, `nativeWindowOpen`,
+  offscreen paint callbacks) is touched.
+- `npmRebuild: false` and the engine-on-`node.exe` split mean **no native module
+  is built against Electron's ABI** — `audify`, `@julusian/midi` and
+  `vsthost.node` all keep their Node-ABI builds regardless of Electron's
+  version. An Electron bump here cannot break the audio path, which is the
+  usual reason to fear one.
+
+So the risk lives in Chromium's renderer behaviour, not in the host wiring —
+which is exactly what the boot-and-click check below is for.
+
+### The one check that needs a human, and why
+
+`app.requestSingleInstanceLock()` (`electron/main.cjs`) runs **before** every
+`LIVEPATCH_*_SMOKE` branch. So while an installed LivePatch is running, a
+`npm run electron` dev instance exits instantly and every smoke test silently
+proves nothing. Verifying a new Electron on the renderer means **closing the
+running app first** — and the app holds the ASIO device, so this is never
+something to do behind the user's back mid-session.
 
 ## Known follow-ups (not done)
 

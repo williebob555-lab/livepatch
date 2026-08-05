@@ -1,0 +1,52 @@
+# CodeQL static analysis.
+#
+# WHY THIS EXISTS: before 2026-08-05 this repo had no code analysis at all —
+# `GET /repos/.../code-scanning/alerts` answered "no analysis found", so
+# Dependabot's dependency alerts were the only security signal and nothing ever
+# looked at our own source.
+#
+# SCOPE IS javascript-typescript ONLY, on purpose. It covers the renderer
+# (`src/`), the engine (`engine/`), the Electron host (`electron/`) and the build
+# scripts — everything that handles untrusted input: the LAN control surface
+# (`electron/lanserver.cjs`), scene/cassette file parsing, and the update feed.
+#
+# `native/vsthost` (C++) is NOT analysed. CodeQL's c-cpp extractor has to watch a
+# real compile, and that build needs MSVC, the VS-bundled CMake and the VST3 SDK
+# (see scripts/build-vsthost.mjs) — none of which exist on a GitHub runner. Adding
+# c-cpp here would produce a permanently red workflow, not coverage. If that code
+# ever needs scanning it has to be a self-hosted Windows runner.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so a newly published query finds old code without waiting for a
+    # push. Monday 07:00 UTC.
+    - cron: '0 7 * * 1'
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload results to the Security tab.
+      security-events: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+
+      # No build step: the JS/TS extractor reads sources directly. Do not add
+      # `npm ci` here — it would pull the native toolchain paths for audify and
+      # @julusian/midi and fail on a Linux runner for no analytical gain.
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:javascript-typescript
