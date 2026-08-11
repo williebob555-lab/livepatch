@@ -63,11 +63,14 @@ export function controlOf(
   spec: ParamSpec,
 ): { kind: WidgetKind; variant?: string } {
   const c = block.controls?.[ref];
+  // The instance's own variant wins; the spec's is the block's default look
+  // (see `ParamSpec.variant`).
+  const variant = c?.variant ?? spec.variant;
   // Only the swappable kinds may change widget; variants apply to any widget
   // that has them (knob/fader styles, toggle/button looks).
-  if (!SWAPPABLE_WIDGETS.has(spec.widget)) return { kind: spec.widget, variant: c?.variant };
+  if (!SWAPPABLE_WIDGETS.has(spec.widget)) return { kind: spec.widget, variant };
   const kind = c?.kind && SWAPPABLE_WIDGETS.has(c.kind) ? c.kind : spec.widget;
-  return { kind, variant: c?.variant };
+  return { kind, variant };
 }
 
 /** Approximate title width so long names don't spill past the block edge. */
@@ -99,16 +102,26 @@ function itemSize(block: Block, ref: string): { w: number; h: number } {
   }
   // A widget that prints a panel mark is that much taller, so the strip is
   // real space in the flow rather than something drawn over the neighbour below.
-  const withMark = (sz: { w: number; h: number }, spec: ParamSpec | undefined): { w: number; h: number } =>
-    spec?.mark ? { w: sz.w, h: sz.h + MARK_H } : sz;
+  // A widget that ENGRAVES its own mark (the machined 'panel' button) needs no
+  // strip: the symbol is on the key, not printed under it.
+  const withMark = (
+    sz: { w: number; h: number },
+    spec: ParamSpec | undefined,
+    variant?: string,
+  ): { w: number; h: number } =>
+    spec?.mark && variant !== 'panel' ? { w: sz.w, h: sz.h + MARK_H } : sz;
   if (ref.startsWith('param:')) {
     // paramSpec (not def.params) so pinned vst plugin params size correctly.
     const spec = paramSpec(block, ref.slice(6));
-    return spec ? withMark(widgetSize[controlOf(block, ref, spec).kind], spec) : { w: 60, h: 24 };
+    if (!spec) return { w: 60, h: 24 };
+    const c = controlOf(block, ref, spec);
+    return withMark(widgetSize[c.kind], spec, c.variant);
   }
   if (ref.startsWith('link:')) {
     const t = linkTarget(block, ref);
-    return t ? withMark(widgetSize[controlOf(block, ref, t.spec).kind], t.spec) : { w: 48, h: 60 };
+    if (!t) return { w: 48, h: 60 };
+    const c = controlOf(block, ref, t.spec);
+    return withMark(widgetSize[c.kind], t.spec, c.variant);
   }
   if (ref.startsWith('expose:')) {
     const child = block.graph?.blocks.find((b) => b.id === ref.slice(7));

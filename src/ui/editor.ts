@@ -8,7 +8,16 @@
 // ============================================================================
 import { BlockClip, doc } from '../core/graph';
 import { ParamSpec, WidgetKind, getDef, paramSpec } from '../core/registry';
-import { Block, ControlStyle, FaceItem, Port, Theme, Vec2, Wire } from '../core/types';
+import { Block, ControlStyle, FaceItem, Port, PortDir, SignalKind, Theme, Vec2, Wire } from '../core/types';
+import { ENT_MAX, isTerminal, replanEntangle, stepEntangle } from '../core/entangle';
+import { fieldFractionAt, inEntangleField } from './entangleface';
+import { buoyAt, poolFractionAt } from '../core/ripplepool';
+
+import { type ArtCtx, type ArtDrag, artworkDown, artworkMove, artworkUp } from './artworkdrag';
+import { syncDynamic } from '../core/dynamic';
+// MINIONS (src/ui/minions) — user-write hook that shatters a work mark. One
+// call in setParamLive; deletable with the folder.
+import { noteUserParam } from './minions/marks';
 import { runtime } from '../engine/runtime';
 import { CassetteMeta, getCassette, getCassetteBuffer, importAudioFiles, importAudioFolder, saveAudioFileAs } from '../core/cassettes';
 import { pickImage } from './imagepicker';
@@ -77,14 +86,48 @@ import {
 } from './widgets';
 import { toggleSpeakerMute } from '../core/rig';
 import { crossIndex, matrixPorts, parseMatrix, setCrosspoint, toggledCrosspoint } from '../core/matrix';
-import { LONGPRESS_NUDGE, LONGPRESS_SLOP, TwoPointerGesture, capture, grabSlop, wheelIntent } from './input';
+import { LONGPRESS_NUDGE, LONGPRESS_SLOP, TwoPointerGesture, capture, dragThreshold, grabSlop, wheelIntent } from './input';
+// MINIONS (src/ui/minions) — the carry seam, and the only reach this file has
+// into that folder. Deleting the feature is: delete the folder, delete this
+// import and the four blocks below marked `MINIONS`. See `minions/layer.ts`.
+import { giveToMinion, minionBodyAt, minionCarrying, minionGripAt, minionPutBack, takeFromMinion } from './minions/layer';
+import type { Origin, Payload } from './minions/payload';
 
 const BRANCH_DEADZONE = 28; // px of trunk arc kept clear near endpoints
 const BRANCH_DRAG_MIN = 8;
 const BUNDLE_SNAP = 14;
+/**
+ * How far, in world units, the end you are holding has to get from **every**
+ * one of its bundle-mates before the cable leaves the ribbon — while you are
+ * still dragging, not at the drop.
+ *
+ * Waiting for the drop is what made pulling a cable out feel stuck: the end
+ * follows your pointer but the rest of the cable stays dressed into the lane,
+ * so the thing you are dragging is still visibly *in* the bundle and you have
+ * no way to tell whether letting go will free it. Breaking live means the
+ * gesture shows its own outcome.
+ *
+ * Much larger than `BUNDLE_SNAP` on purpose. The two thresholds are the same
+ * boundary crossed in opposite directions, and equal ones would make a cable
+ * held near the edge of the ribbon leave and rejoin every frame; the gap
+ * between 14 and this is the hysteresis. World units, like `BUNDLE_SNAP`,
+ * because this is a question about cable geometry, not about pointer accuracy.
+ */
+const BUNDLE_BREAK = 48;
 const WIRE_HIT_TOL = 6;
-/** Mouse-sized radius for grabbing a wire end; scaled up for touch/pen at the
- *  call site, where the pointer type is known. */
+/**
+ * Mouse-sized radius for grabbing a wire end, **in screen pixels**; scaled up
+ * for touch/pen at the call site, where the pointer type is known.
+ *
+ * **It is divided by the zoom, exactly like `WIRE_HIT_TOL`, and used not to
+ * be.** It was a flat number of *world* units while the body tolerance was
+ * `WIRE_HIT_TOL / scale + wireWidth`, so the two crossed over as you zoomed
+ * out: below about 1× the band that counts as "the middle of the wire" grew
+ * past the band that counts as "the end", and a press aimed at a cable end
+ * landed in branch-spawn territory instead. That is the "it really wants to
+ * branch a new one" report, and it got worse the further out you were zoomed —
+ * which is exactly when cables look bunched.
+ */
 const BASE_END_GRAB = 11;
 
 /**
@@ -111,6 +154,10 @@ type DragState =
   | { kind: 'pan'; last: Vec2 }
   | { kind: 'marquee'; start: Vec2 }
   | { kind: 'blocks'; start: Vec2; orig: Map<string, Vec2>; moved: boolean }
+  /** Dragging one of the Ripple Pool's buoys — a 'param' edit, not 'structure'. */
+  | { kind: 'buoy'; block: Block; i: number }
+  /** A gesture on a dynamic block's artwork (`ui/artworkdrag.ts`). */
+  | { kind: 'artwork'; art: ArtDrag }
   | {
       kind: 'resize';
       block: Block;
@@ -215,7 +262,7 @@ const VARIANTS: Record<string, string[]> = {
   fader: ['track', 'slim', 'led'],
   hfader: ['track', 'slim', 'led'],
   toggle: ['switch', 'check', 'led', 'rocker', 'power'],
-  button: ['rect', 'pill', 'round', 'flat'],
+  button: ['rect', 'pill', 'round', 'flat', 'panel'],
   // The keyboard has had two layouts since the Mavis shipped (`keyLayout` in
   // widgets.ts) and no way to pick between them: it is not a swappable kind, so
   // `Control ▸` never offered it, and it had no entry here so `Style ▸` was
@@ -241,8 +288,91 @@ const dockable = (ref: string): boolean =>
 
 export class Editor {
   renderer: Renderer;
-  overlay: Overlay = { mode: 'patch', editingBlockId: null };
+  private readonly _overlay: Overlay = { mode: 'patch', editingBlockId: null };
+
+  /**
+   * What the renderer needs to know about the pointer's state this frame.
+   *
+   * **`heldWireId` is DERIVED here rather than assigned at the drag sites**, and
+   * that is the whole reason this is a getter. `this.drag` is set in a dozen
+   * places — port grabs, endpoint grabs, branch pulls, the touch paths — and a
+   * flag written at each of them is a flag that will be missed at one of them.
+   * `overlay.draggingWireEnd` already demonstrates this: `branchRoot` sets the
+   * drag and does not set the flag. Reading the answer off the drag state
+   * cannot go stale and cannot be forgotten.
+   */
+  get overlay(): Overlay {
+    const d = this.drag;
+    this._overlay.heldWireId = d.kind === 'wireEnd' ? d.wire.id : d.kind === 'branchRoot' ? d.wire.id : null;
+    this._overlay.handDrag =
+      d.kind === 'wireEnd' || d.kind === 'branchRoot' ? 'wire' : d.kind === 'blocks' ? 'block' : null;
+    return this._overlay;
+  }
   private drag: DragState = { kind: 'none' };
+  /** MINIONS: the last press that landed on a minion, for double-tap put-back
+   *  on touch. See the `MINIONS` block in `pointerDown`. */
+  private lastMinionTap: { id: string; t: number; p: Vec2 } = { id: '', t: 0, p: { x: 0, y: 0 } };
+  /** MINIONS: a minion whose load this press MIGHT be taking, resolved on the
+   *  first real movement. See `pointerDown`. */
+  private pendingSnatch: string | null = null;
+  /** True when the press landed on the machine rather than on what it holds,
+   *  so the drag has to be opened for you. See `pullFromMinion`. */
+  private pendingSnatchPull = false;
+  private pendingSnatchAt: Vec2 = { x: 0, y: 0 };
+
+  /**
+   * MINIONS: put what a minion was holding **into your drag**, rather than
+   * setting it down where the machine happened to be.
+   *
+   * Reaching into a robot's gripper and coming away with nothing in your hand
+   * is the wrong outcome of the right gesture: you pulled it out, so you are
+   * holding it. The drag states built here are exactly the ones the ordinary
+   * hit order would have built if the thing had been lying on the canvas, which
+   * is what makes everything downstream — snapping, drop targets, the wire
+   * latch, undo — work with no further help.
+   */
+  private pullFromMinion(load: Payload, p: Vec2): void {
+    doc.pushHistory();
+    if (load.kind === 'block') {
+      const b = doc.block(load.blockId);
+      if (!b) return;
+      doc.clearSelection();
+      b.selected = true;
+      this.drag = { kind: 'blocks', start: { ...p }, orig: new Map([[b.id, { ...b.pos }]]), moved: true };
+      doc.touch('selection');
+      return;
+    }
+    // A fistful of cable ends: you can only pull one, so it is the last one it
+    // took — the one nearest the top of the pile, which is what a hand grabbing
+    // into a bundle gets.
+    const end = load.ends[load.ends.length - 1];
+    const w = doc.wire(end.wireId);
+    if (!w) return;
+    // Anything it was still holding stays held rather than being dropped.
+    if (load.ends.length > 1) {
+      const rest = load.ends.slice(0, -1);
+      const hand = minionBodyAt(p, 4) ?? '';
+      if (hand) giveToMinion(hand, { kind: 'wire', ends: rest });
+    }
+    this.drag = { kind: 'wireEnd', wire: w, end: end.end, created: false };
+    this.overlay.draggingWireEnd = true;
+    doc.touch('structure');
+  }
+  /**
+   * The three services every artwork gesture needs (`ui/artworkdrag.ts`).
+   *
+   * `set` writes the document AND the engine, because these params are what the
+   * kernels run on — a peg toggled only in the document is a draft the sound
+   * has never heard of. Held as a field rather than rebuilt per event so a
+   * gesture cannot end up with two different contexts mid-drag.
+   */
+  private artCtx: ArtCtx = {
+    push: () => doc.pushHistory(),
+    set: (b, id, v) => {
+      b.params[id] = v;
+      runtime.sendParam(runtime.nodeId(b.id), id, v);
+    },
+  };
   private spaceDown = false;
   viewStack: Array<{ x: number; y: number; scale: number }> = [];
   onModeChange: (() => void) | null = null;
@@ -557,9 +687,21 @@ export class Editor {
   /** Write a param live: document + engine (+ portal port-kind side effects). */
   setParamLive(block: Block, spec: ParamSpec, v: number | string | boolean, child: Block | null): void {
     const target = child ?? block;
+    // MINIONS: every parameter write in the app funnels through here, so this is
+    // where a user taking a control back shatters the yellow work mark on it.
+    // A minion's own write is bracketed by `asMinion`, which `noteUserParam`
+    // ignores — otherwise he would shatter his own mark the instant he made it.
+    noteUserParam(target.id, spec.id);
     target.params[spec.id] = v;
     const nodeId = child ? runtime.nodeId(block.id, child.id) : runtime.nodeId(block.id);
     runtime.sendParam(nodeId, spec.id, v);
+    // A dynamic block DERIVES the numbers its kernel actually runs on from the
+    // ones you can turn: Mycelium's Growth/Spread/Seed decide which four
+    // fruiting bodies are tapped, Ripple Pool's Scale decides the pond in
+    // metres. Neither reaches the engine directly — the derived values do.
+    // Re-plan on every write and push whatever moved, or the picture changes
+    // and the sound does not.
+    for (const id of syncDynamic(target)) runtime.sendParam(nodeId, id, target.params[id]);
     if ((target.type === 'portal-in' || target.type === 'portal-out') && spec.id === 'kind') {
       // 'kind' is audio|cv|midi; cv is an audio port tagged role 'cv'.
       const pk = String(v);
@@ -630,6 +772,21 @@ export class Editor {
   private async runAction(block: Block, spec: ParamSpec, child: Block | null, nodeIdOverride?: string): Promise<void> {
     const target = child ?? block;
     const nodeId = nodeIdOverride ?? (child ? runtime.nodeId(block.id, child.id) : runtime.nodeId(block.id));
+    // Entanglement Field transport. Planning needs the surrounding patch — see
+    // core/entangle.ts — so it happens here, wherever the button was pressed:
+    // the block's own face, a Dock clone, or a custom block's face.
+    if (spec.id === 'adv' || spec.id === 'rev') {
+      doc.pushHistory();
+      const next = stepEntangle(doc.graph, target, spec.id === 'adv' ? 1 : -1);
+      target.params.state = next.state;
+      target.params.route = next.route;
+      // Both go to the engine: `route` is what the kernel applies, and `state`
+      // rides along so a scene reloaded later resumes the same walk.
+      runtime.sendParam(nodeId, 'route', next.route);
+      runtime.sendParam(nodeId, 'state', next.state);
+      doc.touch('param');
+      return;
+    }
     if (spec.id === 'showUi') {
       // Open the plugin's real editor: a pure engine action (the vst kernel's
       // setParam('showUi') calls uiOpen). Not persisted — it's a window opener,
@@ -792,11 +949,14 @@ export class Editor {
    * a second finger turns a drag into a gesture, or a long-press interrupts it.
    */
   private abortDrag(): void {
+    this.pendingSnatch = null;
+    this.pendingSnatchPull = false;
     const d = this.drag;
     this.drag = { kind: 'none' };
     this.overlay.marquee = null;
     this.overlay.draggingWireEnd = false;
     this.overlay.snapWire = null;
+    this.overlay.latchField = null;
     this.overlay.hotWidget = null;
     this.overlay.eqBand = null;
     this.overlay.sampleHandle = null;
@@ -957,11 +1117,58 @@ export class Editor {
     }
 
     const theme = doc.scene.theme;
+
     // Ports, wire ends and branch points are all a handful of pixels across —
     // fine for a cursor, hopeless for a fingertip that also covers what it is
     // aiming at. Every grab radius below this point widens for touch/pen, and
     // is unchanged for mouse.
     const grab = grabSlop(1, e);
+
+    // MINIONS: **double-TAP puts it back**, because `dblclick` is a mouse event
+    // and touch does not reliably produce one. Detected here rather than left
+    // to the browser so the gesture is identical on both: a second press on the
+    // same minion, soon enough and near enough to be one gesture.
+    const tapped = minionBodyAt(p, grab) ?? minionGripAt(p, grab);
+    const now = performance.now();
+    if (
+      tapped &&
+      minionCarrying(tapped) &&
+      tapped === this.lastMinionTap.id &&
+      now - this.lastMinionTap.t < 380 &&
+      Math.hypot(p.x - this.lastMinionTap.p.x, p.y - this.lastMinionTap.p.y) < 40 * grab
+    ) {
+      this.lastMinionTap = { id: '', t: 0, p };
+      doc.pushHistory();
+      minionPutBack(tapped);
+      return;
+    }
+    if (tapped) this.lastMinionTap = { id: tapped, t: now, p: { ...p } };
+
+    // MINIONS: **snatch — armed here, fired on the first real movement.**
+    //
+    // Pressing something is not taking it; dragging it is. Releasing on the
+    // press looked simpler and broke double-tap outright: the first tap of the
+    // two landed on the carried block, the drone let go, and by the time the
+    // second tap arrived there was nothing left to put back — so the block was
+    // abandoned wherever the machine happened to be hovering. Waiting for the
+    // drag threshold makes a tap a tap on both mouse and touch.
+    //
+    // Once it does fire it falls through to the ordinary hit order, which picks
+    // the block or the cable end up exactly as if it had been lying there —
+    // because a carried thing is genuinely where it is drawn (`payload.ts`).
+    //
+    // **Pressing the machine itself counts too**, not just the thing in its
+    // gripper. Grabbing at a robot to get what it is holding is the obvious
+    // gesture and it did nothing — you had to hit the payload, and if you
+    // missed you got a marquee. Which of the two you hit decides who starts the
+    // drag: on the payload the ordinary hit order below picks it up by itself,
+    // on the body there is nothing under your cursor to pick up, so the drag is
+    // opened explicitly in `pullFromMinion`.
+    const onLoad = minionGripAt(p, grab);
+    const onBody = onLoad ?? (minionCarrying(minionBodyAt(p, grab) ?? '') ? minionBodyAt(p, grab) : null);
+    this.pendingSnatch = onBody;
+    this.pendingSnatchPull = !onLoad && !!onBody;
+    this.pendingSnatchAt = { ...p };
 
     // 1. Ports: grab existing wire end (single-link unbind) or start a new wire.
     const ph = portAt(doc.graph, p, (theme.portRadius + 6) * grab);
@@ -990,6 +1197,33 @@ export class Editor {
     const wh = this.renderer.paths.hit(p, this.wireTol(theme, grab));
     const b = blockAt(doc.graph, p);
     if (b && !this.wireBeatsBlock(b, wh)) {
+      // Ripple Pool's buoys are the block's whole interaction, so they are
+      // tested before face widgets and before the body-drag that would
+      // otherwise just move the block out from under the pointer.
+      if (getDef(b.type).customFace === 'ripplepool') {
+        const bi = buoyAt(b, p.x, p.y);
+        if (bi) {
+          doc.pushHistory();
+          this.drag = { kind: 'buoy', block: b, i: bi };
+          return;
+        }
+      }
+      // Every other dynamic block's controls ARE its picture — a peg, an
+      // exciter, a bubble, a vial, a drill. Same reason as the buoys for
+      // testing it here: there is no widget under the pointer for `widgetDown`
+      // to find, and the body-drag would move the block out from under the
+      // gesture. `ui/artworkdrag.ts` owns all of them.
+      {
+        const art = artworkDown(b, p, this.artCtx, e.shiftKey);
+        if (art === 'done') {
+          doc.touch('param');
+          return;
+        }
+        if (art) {
+          this.drag = { kind: 'artwork', art };
+          return;
+        }
+      }
       const item = this.tangibleItemAt(b, p);
       if (item && item.ref !== 'title') {
         if (this.widgetDown(b, item, p, e.shiftKey)) return;
@@ -1012,12 +1246,23 @@ export class Editor {
     }
 
     // 3. Wires: endpoint grab / branch root / branch spawn / select.
-    if (wh) {
-      const wire = doc.wire(wh.wireId)!;
-      const path = this.renderer.paths.get(wh.wireId)!;
+    const END_GRAB = (BASE_END_GRAB / this.renderer.view.scale) * grab;
+    // **Which wire an endpoint grab belongs to is decided by the ENDPOINTS, not
+    // by whichever cable body happens to pass nearest the pointer.**
+    //
+    // `paths.hit` returns the closest wire *by body distance*, and the endpoint
+    // checks below then run against that wire. In a bundle — several cables
+    // dressed together and arriving at one block — a neighbour's body is
+    // routinely nearer than the end you are reaching for, so the wrong wire came
+    // back, its own ends were far away, every endpoint test failed, and the
+    // press fell through to `maybeBranch`. Which is the report: reaching for a
+    // cable end in a bunch spawns a branch instead.
+    const endHit = this.nearestWireEnd(p, END_GRAB);
+    if (endHit || wh) {
+      const wire = doc.wire(endHit ? endHit.wireId : wh!.wireId)!;
+      const path = this.renderer.paths.get(wire.id)!;
       const dStart = vDist(p, path.pts[0]);
       const dEnd = vDist(p, path.pts[path.pts.length - 1]);
-      const END_GRAB = BASE_END_GRAB * grab;
       if (dEnd < END_GRAB && !wire.b.port) {
         doc.pushHistory();
         this.drag = { kind: 'wireEnd', wire, end: 'b', created: false };
@@ -1054,12 +1299,47 @@ export class Editor {
         return;
       }
       // Middle of the wire: drag → branch (outside deadzones); click → select.
-      this.drag = { kind: 'maybeBranch', wire, t: wh.t, start: p };
+      // Only reachable when the press was a body hit; an endpoint grab that got
+      // this far has no arc ratio to branch at, and branching off the very end
+      // of a cable is not a thing you can have meant.
+      if (!wh) {
+        this.startMarquee(p, e.shiftKey);
+        return;
+      }
+      this.drag = { kind: 'maybeBranch', wire: doc.wire(wh.wireId)!, t: wh.t, start: p };
       return;
     }
 
     // 4. Empty canvas: marquee.
     this.startMarquee(p, e.shiftKey);
+  }
+
+  /**
+   * The nearest grabbable cable END within `tol`, across every wire.
+   *
+   * **Endpoints are searched globally, because a bundle puts several of them in
+   * the same few pixels** and the cable whose body is closest is very often not
+   * the cable whose end you are reaching for. Searching ends separately, and
+   * letting the nearest end win, is what makes grabbing one cable out of a
+   * dressed bunch possible at all.
+   *
+   * A branch root (`wire.parentId`, start end) counts: dragging it is how a
+   * branch is re-rooted, and it is exactly as hard to hit in a bundle.
+   */
+  private nearestWireEnd(p: Vec2, tol: number): { wireId: string; end: 'a' | 'b'; dist: number } | null {
+    let best: { wireId: string; end: 'a' | 'b'; dist: number } | null = null;
+    for (const [id, path] of this.renderer.paths.paths) {
+      if (path.pts.length < 2) continue;
+      const ends: Array<['a' | 'b', Vec2]> = [
+        ['a', path.pts[0]],
+        ['b', path.pts[path.pts.length - 1]],
+      ];
+      for (const [end, pt] of ends) {
+        const d = vDist(p, pt);
+        if (d <= tol && (!best || d < best.dist)) best = { wireId: id, end, dist: d };
+      }
+    }
+    return best;
   }
 
   /**
@@ -1207,8 +1487,8 @@ export class Editor {
       return true;
     }
     if (spec.widget === 'button') {
-      if (spec.type === 'action' && spec.dialogAction) {
-        this.runAction(b, spec, child);
+      if (spec.type === 'action' && (spec.dialogAction || spec.docAction)) {
+        void this.runAction(b, spec, child);
       } else {
         const nodeId = child ? runtime.nodeId(b.id, child.id) : runtime.nodeId(b.id);
         runtime.sendParam(nodeId, spec.id, 1);
@@ -1467,6 +1747,15 @@ export class Editor {
     } else {
       d.good = { pos: { x, y }, size: { w, h }, layout: d.block.layout.map((i) => ({ ...i })) };
     }
+    // A dynamic block's geometry IS a parameter of its sound: Ripple Pool's
+    // block size is the pond, Mycelium's field is where the tree grew,
+    // Sympathy's water is where a film can float. Re-parking the ports and
+    // re-planning here — and pushing whatever changed straight to the engine —
+    // is what makes dragging one bigger dig a larger pond rather than stretch a
+    // picture of the old one.
+    for (const id of syncDynamic(d.block)) {
+      runtime.sendParam(runtime.nodeId(d.block.id), id, d.block.params[id]);
+    }
     doc.touch('selection');
   }
 
@@ -1723,6 +2012,16 @@ export class Editor {
     // towards it, not only when you are idle.
     this.overlay.pointer = p;
 
+    // MINIONS: the snatch fires here, once the press has become a drag. See the
+    // `MINIONS` block in `pointerDown`.
+    if (this.pendingSnatch && Math.hypot(p.x - this.pendingSnatchAt.x, p.y - this.pendingSnatchAt.y) > dragThreshold(e)) {
+      const id = this.pendingSnatch;
+      const pull = this.pendingSnatchPull;
+      this.pendingSnatch = null;
+      const load = takeFromMinion(id);
+      if (pull && load) this.pullFromMinion(load, p);
+    }
+
     if (d.kind === 'none') {
       // Hover feedback only.
       const ph = portAt(doc.graph, p, theme.portRadius + 6);
@@ -1786,6 +2085,28 @@ export class Editor {
       return;
     }
 
+    if (d.kind === 'artwork') {
+      artworkMove(d.art, p, this.artCtx);
+      // A value change, not a structure change: pegging a draft or moving an
+      // exciter retunes the block, it does not rebuild the graph (docs/08
+      // rule 8).
+      doc.touch('param');
+      return;
+    }
+
+    if (d.kind === 'buoy') {
+      // Position is stored normalized to the water, which is exactly the space
+      // both kernels scale by `size` metres — so what you drag is what you hear
+      // and what the face prints, with no third representation in between.
+      const f = poolFractionAt(d.block, p.x, p.y);
+      d.block.params[`b${d.i}x`] = f.x;
+      d.block.params[`b${d.i}y`] = f.y;
+      // A value change, not a structure change: moving a buoy retunes a delay,
+      // it does not rebuild the graph (docs/08 rule 8).
+      doc.touch('param');
+      return;
+    }
+
     if (d.kind === 'resize') {
       this.applyResize(d, p);
       return;
@@ -1837,8 +2158,15 @@ export class Editor {
       const end = d.end === 'a' ? d.wire.a : d.wire.b;
       end.float = { ...p };
       end.port = undefined;
+      // Pulled clear of every bundle-mate → out of the ribbon now, so the cable
+      // you are holding straightens out under your hand instead of staying
+      // dressed into a lane until you let go.
+      if (this.breakBundleIfPulledAway(d.wire, p)) doc.touch('layout');
       const ph = portAt(doc.graph, p, theme.portRadius + 8);
       this.overlay.hoverPort = ph && this.canConnect(d.wire, d.end, ph.block, ph.port) ? { blockId: ph.block.id, portId: ph.port.id } : null;
+      // Entanglement Field: the plate lights while a drop here would latch, so
+      // the pull is visible before you let go rather than only after.
+      this.overlay.latchField = ph ? null : this.fieldLatchAt(d.wire, d.end, p)?.block.id ?? null;
       // Bundle preview: highlight a nearby wire we would join on release.
       if (!ph) {
         const near = this.renderer.paths.hit(p, BUNDLE_SNAP, this.treeIds(d.wire));
@@ -1962,6 +2290,41 @@ export class Editor {
     }
   }
 
+  /**
+   * While a wire end is being dragged: if it is now further than
+   * `BUNDLE_BREAK` from every cable it shares a bundle with, take it out of
+   * that bundle. Returns whether anything changed.
+   *
+   * Measured against the mates' *drawn* paths — the ribbon itself — rather than
+   * against their ports, because the ribbon is what you can see yourself
+   * pulling away from.
+   */
+  private breakBundleIfPulledAway(w: Wire, p: Vec2): boolean {
+    if (!w.bundle) return false;
+    // `paths.hit` takes an exclude set, so "only my bundle-mates" is everything
+    // else: other bundles, loose cables, and my own branch tree.
+    const exclude = this.treeIds(w);
+    for (const x of doc.graph.wires) if (x.bundle !== w.bundle) exclude.add(x.id);
+    if (this.renderer.paths.hit(p, BUNDLE_BREAK, exclude)) return false;
+    this.leaveBundle(w);
+    return true;
+  }
+
+  /**
+   * Take a wire out of its bundle.
+   *
+   * A bundle of one is not a bundle: releasing the last partner tidies the
+   * marker away too, so the group does not linger as invisible state that
+   * re-forms the moment anything else is dropped near it.
+   */
+  private leaveBundle(w: Wire): void {
+    const mine = w.bundle;
+    if (!mine) return;
+    w.bundle = undefined;
+    const rest = doc.graph.wires.filter((x) => x.bundle === mine);
+    if (rest.length < 2) for (const x of rest) x.bundle = undefined;
+  }
+
   private treeIds(w: Wire): Set<string> {
     // The wire plus its ancestors and descendants (no self-bundling/dropping).
     const ids = new Set<string>([w.id]);
@@ -2007,9 +2370,54 @@ export class Editor {
     return true;
   }
 
+  /**
+   * Where a wire end would latch if it were released at `p`: an Entanglement
+   * Field under the pointer, plus the direction the new terminal has to take.
+   *
+   * Returns null when the drop should behave normally — not over a field, over
+   * a field's plate but outside the viewport, carrying something that is not
+   * audio, or carrying a far end that does not say which direction this one is.
+   */
+  private fieldLatchAt(
+    wire: Wire,
+    end: 'a' | 'b',
+    p: Vec2,
+  ): { block: Block; dir: PortDir; kind: SignalKind } | null {
+    const other = end === 'a' ? wire.b : wire.a;
+    let otherDir: PortDir | null = null;
+    let kind: SignalKind | null = null;
+    if (other.port) {
+      const f = doc.port(other.port.blockId, other.port.portId);
+      if (!f) return null;
+      otherDir = f.port.dir;
+      kind = f.port.kind;
+    } else if (wire.parentId && end === 'b') {
+      // A branch inherits its trunk's net: the net's sources decide.
+      const net = doc.netOfWire(wire.id);
+      if (!net) return null;
+      kind = net.kind;
+      otherDir = net.sources.length ? 'out' : null;
+    }
+    // Every cable kind latches — audio, MIDI, tape and roll. The terminal takes
+    // the cable's own kind, and the field only ever pairs like with like
+    // (`core/entangle.ts` plans one permutation per kind).
+    if (!otherDir || !kind) return null;
+    // Topmost first, so a field stacked over another takes the drop.
+    for (let i = doc.graph.blocks.length - 1; i >= 0; i--) {
+      const b = doc.graph.blocks[i];
+      if (b.type !== 'entangle') continue;
+      if (!inEntangleField(b, p.x, p.y)) continue;
+      if (b.ports.filter((q) => isTerminal(q.id)).length >= ENT_MAX * 2) return null;
+      return { block: b, dir: otherDir === 'out' ? 'in' : 'out', kind };
+    }
+    return null;
+  }
+
   // ---------- pointer up ----------
   private pointerUp(e: PointerEvent): void {
     this.clearLongPress();
+    // MINIONS: the press never became a drag, so nothing was snatched.
+    this.pendingSnatch = null;
     const wasGesture = this.gesture.active;
     if (this.drag.kind !== 'none' || wasGesture) this.dragEndedAt = performance.now();
     if (wasGesture) {
@@ -2041,6 +2449,7 @@ export class Editor {
     this.drag = { kind: 'none' };
     this.overlay.draggingWireEnd = false;
     this.overlay.snapWire = null;
+    this.overlay.latchField = null;
     this.overlay.hotWidget = null;
     this.overlay.eqBand = null;
     this.overlay.sampleHandle = null;
@@ -2054,6 +2463,14 @@ export class Editor {
         set.clear();
       }
       this.renderer.invalidate();
+      return;
+    }
+    if (d.kind === 'artwork') {
+      // Gestures that only commit on release live here — a species vial is
+      // carried over the tank and dropped, and one dropped outside the glass is
+      // one you changed your mind about.
+      artworkUp(d.art, p, this.artCtx);
+      doc.touch('param');
       return;
     }
     if (d.kind === 'wavedraw') {
@@ -2083,6 +2500,19 @@ export class Editor {
     }
 
     if (d.kind === 'blocks' && d.moved) {
+      // MINIONS: **give.** One block dropped on a minion goes into its gripper,
+      // with where it came from remembered so a double-click can put it back.
+      // Only one — a fistful of cables is useful, an armful of blocks is a
+      // machine deciding your layout for you, which is the thing this character
+      // stopped doing.
+      const hand = d.orig.size === 1 ? minionBodyAt(p) : null;
+      if (hand) {
+        const [id, orig] = [...d.orig][0];
+        if (giveToMinion(hand, { kind: 'block', blockId: id, origin: { kind: 'at', pos: { ...orig } } })) {
+          doc.touch('structure');
+          return;
+        }
+      }
       // Drop onto the Library panel to delete the dragged block(s).
       const overLib = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(
         '.panel[data-panel="library"]',
@@ -2120,10 +2550,44 @@ export class Editor {
 
     if (d.kind === 'wireEnd') {
       const end = d.end === 'a' ? d.wire.a : d.wire.b;
+      // MINIONS: **give.** Dropped on a minion, the cable end goes into its
+      // gripper instead of onto the canvas. Checked before the port hit because
+      // a minion hovering over a port would otherwise lose the gesture to it —
+      // and you aimed at the robot.
+      const hand = minionBodyAt(p);
+      if (hand) {
+        const origin: Origin = end.port
+          ? { kind: 'port', blockId: end.port.blockId, portId: end.port.portId }
+          : { kind: 'float', pos: { ...(end.float ?? p) } };
+        if (giveToMinion(hand, { kind: 'wire', ends: [{ wireId: d.wire.id, end: d.end, origin }] })) {
+          doc.touch('structure');
+          return;
+        }
+      }
       const ph = portAt(doc.graph, p, theme.portRadius + 8);
       if (ph && this.canConnect(d.wire, d.end, ph.block, ph.port)) {
         end.port = { blockId: ph.block.id, portId: ph.port.id };
         end.float = undefined;
+        doc.syncRigPorts();
+        doc.touch('structure');
+        return;
+      }
+      // Entanglement Field: a wire end released anywhere inside the field
+      // latches where it landed, and the terminal is created there. There is no
+      // port to aim at — that is the whole interaction — so the direction comes
+      // from the other end of the wire: a cable from an effect's output makes an
+      // input, a cable to an effect's input makes an output. A wire with
+      // nothing on its far end says nothing about which it should be, so it
+      // stays floating rather than guessing.
+      const latch = this.fieldLatchAt(d.wire, d.end, p);
+      if (latch) {
+        const port = doc.addFieldTerminal(latch.block, latch.dir, latch.kind, fieldFractionAt(latch.block, p.x, p.y));
+        end.port = { blockId: latch.block.id, portId: port.id };
+        end.float = undefined;
+        // Plugging something in changes what routes are possible, so the field
+        // re-plans at its current state rather than waiting to be advanced.
+        latch.block.params.route = replanEntangle(doc.graph, latch.block);
+        runtime.sendParam(runtime.nodeId(latch.block.id), 'route', latch.block.params.route);
         doc.touch('structure');
         return;
       }
@@ -2143,20 +2607,33 @@ export class Editor {
           return;
         }
       }
-      // Near another wire → bundle with it.
+      // Near another wire → bundle with it. Dropped away from its own bundle →
+      // out of it (if the drag itself has not already taken it out — see
+      // `breakBundleIfPulledAway`, which is the same rule at a longer range and
+      // is what usually fires first).
+      //
+      // **Leaving a bundle is the same gesture as joining one, and it was not.**
+      // Joining was a drop within `BUNDLE_SNAP` of another cable; leaving was
+      // a right-click and a menu item, which is not something you find and not
+      // something you do while you are already holding the wire. Now the drop
+      // decides both, symmetrically: near a bundle-mate keeps you in it, away
+      // from every mate takes you out.
       const near = this.renderer.paths.hit(p, BUNDLE_SNAP, this.treeIds(d.wire));
       if (near) {
         const other = doc.wire(near.wireId)!;
         const bundleId = other.bundle ?? `bd${Date.now().toString(36)}`;
         other.bundle = bundleId;
         d.wire.bundle = bundleId;
-      }
+      } else this.leaveBundle(d.wire);
       // Otherwise: stays free-floating exactly where dropped.
       if (d.created && d.wire.parentId == null && !d.wire.a.port && !d.wire.b.port) {
         // A wire dragged from nothing to nothing was an accident — remove.
         doc.deleteWires([d.wire.id]);
         return;
       }
+      // A cable pulled out of a field takes its terminal with it: a socket with
+      // no wire is a ghost, not a spare (`syncEntangleTerminals`).
+      doc.syncRigPorts();
       doc.touch('structure');
       return;
     }
@@ -2202,6 +2679,15 @@ export class Editor {
   private doubleClick(e: MouseEvent): void {
     const p = this.pt(e);
     const theme = doc.scene.theme;
+    // MINIONS: **put it back.** Before `blockAt`, because a carried block is
+    // genuinely at the gripper — so without this a double-click on a robot
+    // holding a block would open the rename dialog for it.
+    const hand = minionBodyAt(p) ?? minionGripAt(p);
+    if (hand && minionCarrying(hand)) {
+      doc.pushHistory();
+      minionPutBack(hand);
+      return;
+    }
     const b = blockAt(doc.graph, p);
     if (b) {
       const item = this.tangibleItemAt(b, p);
@@ -2330,6 +2816,31 @@ export class Editor {
   private contextMenu(e: MouseEvent): void {
     const p = this.pt(e);
     const theme = doc.scene.theme;
+    // MINIONS: a minion carrying something owns the menu, before the block it
+    // is holding gets a chance to claim it. **This is the discoverable route**
+    // — double-tap is quick once you know it exists, and a long press is how
+    // you find out that it does.
+    // A long press arrives here as a synthesised `MouseEvent` with no
+    // `pointerType`, so ask the event and fall back to coarse — a menu opened
+    // by a finger wants the finger's slop.
+    const slop = grabSlop(1, e as { pointerType?: string });
+    const hand = minionBodyAt(p, slop) ?? minionGripAt(p, slop);
+    if (hand && minionCarrying(hand)) {
+      showContextMenu(e.clientX, e.clientY, [
+        {
+          label: 'Put it back',
+          action: () => {
+            doc.pushHistory();
+            minionPutBack(hand);
+          },
+        },
+        {
+          label: 'Take it',
+          action: () => takeFromMinion(hand),
+        },
+      ]);
+      return;
+    }
     // Same rule as the press: a wire painted in front of a block is what the
     // menu is about. A right-click that offered the block's menu where a left
     // click selects the wire would be two answers to one question.

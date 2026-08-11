@@ -98,10 +98,34 @@ export interface Kernel {
    * event's sub-quantum arrival time so instruments can start voices
    * sample-accurately — hardware MIDI feels rock-steady instead of
    * quantized to quantum starts. Omitted/0 = start of quantum (UI events).
+   *
+   * `port` is the kernel's own in-port the event arrived on. Almost every MIDI
+   * kernel has exactly one and ignores it; a kernel with several (the
+   * Entanglement Field) needs to know which cable an event came down, because
+   * where it goes next depends on it.
    */
-  midiIn?(ev: MidiEvent, offset?: number): void;
-  /** Assigned by the graph for MIDI net sources. */
+  midiIn?(ev: MidiEvent, offset?: number, port?: string): void;
+  /** Assigned by the graph for MIDI net sources — the kernel's FIRST midi out
+   *  port. One-MIDI-out kernels use this and need nothing else. */
   midiOut?: ((ev: MidiEvent, offset?: number) => void) | null;
+  /**
+   * Assigned by the graph for kernels with more than one MIDI out port: send an
+   * event out of a NAMED port.
+   *
+   * `midiOut` cannot express this — it is one callback per kernel, so a kernel
+   * with three MIDI outputs could only ever broadcast to all of them at once.
+   * Declaring `multiPortEvents` is what asks the graph to build this table.
+   */
+  midiOutAt?: ((port: string, ev: MidiEvent, offset?: number) => void) | null;
+  /**
+   * This kernel routes events per PORT, so the graph builds `midiOutAt` /
+   * `tapeOutAt` for it and passes the arrival port to `midiIn` / `tapeIn`.
+   *
+   * Opt-in rather than automatic: every other event kernel has exactly one in
+   * and one out, and building a dispatch table per port for all of them would
+   * be a map lookup per event for nothing.
+   */
+  multiPortEvents?: boolean;
   /** Hardware MIDI / renderer-forwarded events (midi-in kernel). */
   externalMidi?(device: string, ev: MidiEvent, offset?: number): void;
   /**
@@ -122,7 +146,9 @@ export interface Kernel {
    * eject the deck stops and falls back to its own cassette (if any).
    * Repeated pushes of the same id are no-ops.
    */
-  tapeIn?(id: string | null): void;
+  tapeIn?(id: string | null, port?: string): void;
+  /** Per-port tape/roll send, for `multiPortEvents` kernels (see `midiOutAt`). */
+  tapeOutAt?: ((port: string, id: string) => void) | null;
   /**
    * An asset's *bytes* changed while its id stayed the same — a recorder
    * punching into its take, or a destructive edit in the Clip tab.
@@ -3817,6 +3843,174 @@ registerKernel('matrix', (params) => {
 });
 
 /**
+ * Entanglement Field — the hidden permutation.
+ *
+ * Structurally a Matrix whose grid is a permutation the user never sees, and
+ * whose crossfade is long enough to be musical. It contains **no DSP of its
+ * own**: everything a signal passes through between entering and leaving is the
+ * user's own patch, re-ordered by which terminal feeds which.
+ *
+ * The routing itself is planned in the renderer (`src/core/entangle.ts`),
+ * because the guarantee that a signal which enters can leave depends on which
+ * outputs come back round to which inputs through the surrounding graph — and a
+ * kernel is handed its own port buffers and nothing else. This end just applies
+ * what it is given, exactly like the Matrix applying its grid.
+ *
+ * The route string format is mirrored from the renderer rather than imported:
+ * the engine builds separately and cannot reach `src/`, the same arrangement as
+ * `note-space`'s axis names. It is `<outId>:<inId>` pairs, comma-separated,
+ * with terminal ids `i<k>` / `o<k>`, 1-based.
+ */
+const ENT_MAX = 12; // mirrors ENT_MAX in src/core/entangle.ts
+
+registerKernel('entangle', (params) => {
+  // One buffer per possible output. Twelve stereo MAXQ pairs is the price of
+  // never branching on "does this terminal exist yet" in the audio path, and of
+  // never allocating when the user drops another wire into the field.
+  const bufs: Buf[] = [];
+  for (let o = 0; o < ENT_MAX; o++) bufs.push(stereo());
+  const widths = new Int32Array(ENT_MAX).fill(2);
+  // Port names built once: `ins['i' + (i + 1)]` in the loop is a string per
+  // terminal per quantum, and a string is an allocation (docs/10).
+  const inNames: string[] = [];
+  const outIndex = new Map<string, number>();
+  for (let k = 0; k < ENT_MAX; k++) {
+    inNames.push('i' + (k + 1));
+    outIndex.set('o' + (k + 1), k);
+  }
+  const cur = new Float32Array(ENT_MAX * ENT_MAX);
+  const tgt = new Float32Array(ENT_MAX * ENT_MAX);
+  const gain = new Smooth(num(params.gain, 1));
+  let settleS = Math.max(0.001, num(params.settle, 120) / 1000);
+
+  const slot = (id: string, prefix: string): number => {
+    if (id.length < 2 || id[0] !== prefix) return -1;
+    const k = parseInt(id.slice(1), 10) - 1;
+    return Number.isFinite(k) && k >= 0 && k < ENT_MAX ? k : -1;
+  };
+
+  /** Parse `route` into `tgt`: one live crossing per pair named. */
+  const loadRoute = (v: ParamValue | undefined): void => {
+    tgt.fill(0);
+    const s = str(v);
+    if (!s) return;
+    for (const pair of s.split(',')) {
+      const c = pair.indexOf(':');
+      if (c < 0) continue;
+      const o = slot(pair.slice(0, c).trim(), 'o');
+      const i = slot(pair.slice(c + 1).trim(), 'i');
+      if (o >= 0 && i >= 0) tgt[o * ENT_MAX + i] = 1;
+    }
+  };
+  // Event routing uses the SAME route, resolved the other way round: audio is
+  // pulled (an output asks which input feeds it), events are pushed (an input
+  // asks which outputs it feeds). One input may feed several outputs if the
+  // plan says so, so this is a list rather than a single target.
+  const evTargets = new Map<string, string[]>();
+  const loadEvents = (v: ParamValue | undefined): void => {
+    evTargets.clear();
+    const s = str(v);
+    if (!s) return;
+    for (const pair of s.split(',')) {
+      const c = pair.indexOf(':');
+      if (c < 0) continue;
+      const o = pair.slice(0, c).trim();
+      const i = pair.slice(c + 1).trim();
+      if (!o || !i) continue;
+      const list = evTargets.get(i);
+      if (list) list.push(o);
+      else evTargets.set(i, [o]);
+    }
+  };
+
+  loadRoute(params.route);
+  loadEvents(params.route);
+  cur.set(tgt); // a rebuilt graph starts patched; it does not fade itself in
+
+  const k: Kernel = {
+    // The field carries MIDI, tape and roll cables as well as audio, and each
+    // kind only ever meets its own kind (the plan is built per kind — see
+    // `core/entangle.ts`). Events have no crossfade: `settle` is a gain ramp
+    // and there is no such thing as half a note-on, so a re-route takes effect
+    // on the next event.
+    multiPortEvents: true,
+    midiIn: (ev, offset, port) => {
+      if (!port) return;
+      const outs = evTargets.get(port);
+      if (!outs) return;
+      for (const o of outs) k.midiOutAt?.(o, ev, offset);
+    },
+    tapeIn: (id, port) => {
+      if (!port || id == null) return;
+      const outs = evTargets.get(port);
+      if (!outs) return;
+      for (const o of outs) k.tapeOutAt?.(o, id);
+    },
+    out: (port) => {
+      const o = outIndex.get(port);
+      return o !== undefined ? bufs[o] : null;
+    },
+    // Set-graph time only, never from `process` — this reallocates.
+    setWidth: (port, width) => {
+      const o = outIndex.get(port);
+      if (o === undefined) return;
+      widths[o] = Math.max(2, Math.min(MAXCH, width));
+      if (bufs[o].length < widths[o]) bufs[o] = allocBuf(widths[o]);
+    },
+    setParam: (id, v) => {
+      if (id === 'gain') gain.set(num(v, 1));
+      else if (id === 'settle') settleS = Math.max(0.001, num(v, 120) / 1000);
+      else if (id === 'route') {
+        params.route = v;
+        loadRoute(v);
+        loadEvents(v);
+      }
+      // `seed` and `state` are the renderer's bookkeeping for the walk; they
+      // reach the node so a reloaded scene resumes it, and mean nothing here.
+    },
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      const g = gain.step(ctx);
+      const inv = 1 / n;
+      // How far a crossing may travel this quantum. Advancing swaps every
+      // crossing at once, so this ramp is the whole of the block's Settle: a
+      // step would be a click, and the field is usually full of feedback paths
+      // where it is a bang (docs/10 rule 10). Per-QUANTUM, like Smooth.step.
+      const maxStep = n / (ctx.sr * settleS);
+      for (let o = 0; o < ENT_MAX; o++) {
+        const dst = bufs[o];
+        const w = Math.min(dst.length, widths[o]);
+        for (let c = 0; c < dst.length; c++) dst[c].fill(0, 0, n);
+        for (let i = 0; i < ENT_MAX; i++) {
+          const k = o * ENT_MAX + i;
+          const g0 = cur[k];
+          const want = tgt[k];
+          // Settle toward the target rather than snapping to it.
+          let g1 = g0;
+          if (want > g0) g1 = g0 + maxStep > want ? want : g0 + maxStep;
+          else if (want < g0) g1 = g0 - maxStep < want ? want : g0 - maxStep;
+          cur[k] = g1;
+          // Nothing to add and nothing to ramp: skip. A full field is 144
+          // crossings and a patch uses a handful, so this branch is most of
+          // the block's performance.
+          if (g0 === 0 && g1 === 0) continue;
+          const src = ins[inNames[i]];
+          if (!src) continue;
+          const step = (g1 - g0) * inv;
+          const cw = Math.min(w, src.length);
+          for (let c = 0; c < cw; c++) {
+            const s = src[c];
+            const d = dst[c];
+            for (let j = 0; j < n; j++) d[j] += s[j] * (g0 + step * j) * g;
+          }
+        }
+      }
+    },
+  };
+  return k;
+});
+
+/**
  * Speaker Monitor — per-speaker mute/solo and metering, in line with the bus.
  *
  * Wide in, the same bus out, with a smoothed per-channel level published for
@@ -4197,6 +4391,428 @@ registerKernel('delay', (params, _sv) => {
         r[i] = x1 * dry + d1 * m;
       }
     },
+  };
+});
+
+/**
+ * Ripple Pool — delay as distance. Def in `blocks/defs.ts`, web twin in
+ * `src/blocks/units.ts`.
+ *
+ * Four outputs, five taps each: the inlet, plus the inlet mirrored across each
+ * of the four walls. That is the image-source method, and it is why one bounce
+ * off a wall needs no explicit reflection code — a mirrored source at the right
+ * distance *is* the reflection.
+ *
+ * The geometry constants below are duplicated in the web unit (the engine
+ * cannot import renderer code, same as `note-space`). Change one, change both
+ * in the same edit or the engines disagree about where the taps are.
+ *
+ * Allocation: the ring is built lazily and only on a sample-rate change, like
+ * `delay`. Everything else — tap delays, tap gains, filter state — lives in
+ * preallocated typed arrays, so `process` allocates nothing.
+ */
+const POOL_INX = 0.055;
+const POOL_INY = 0.312;
+const POOL_C = 343;
+const POOL_MAXD = 5;
+
+registerKernel('ripple-pool', (params) => {
+  const N = 4;
+  const IMG = 5;
+  const outs: Record<string, StereoBuf> = {
+    out1: stereo(), out2: stereo(), out3: stereo(), out4: stereo(),
+  };
+  const outArr: StereoBuf[] = [outs.out1, outs.out2, outs.out3, outs.out4];
+  let ring: StereoBuf | null = null;
+  let ringSr = 0;
+  let widx = 0;
+  // The pond's real dimensions, measured by the document from the block's size.
+  // A kernel cannot know how big the block is on screen, so resizing arrives
+  // here as these two numbers changing — which is what makes a bigger block a
+  // genuinely bigger body of water rather than a stretched picture of one.
+  const poolW = new Smooth(num(params.poolw, 112), 0.08);
+  const poolH = new Smooth(num(params.poolh, 81), 0.08);
+  const damp = new Smooth(num(params.damp, 0.55));
+  const walls = new Smooth(num(params.walls, 0.62));
+  const bxs = [
+    new Smooth(num(params.b1x, 0.333), 0.05), new Smooth(num(params.b2x, 0.597), 0.05),
+    new Smooth(num(params.b3x, 0.25), 0.05), new Smooth(num(params.b4x, 0.792), 0.05),
+  ];
+  const bys = [
+    new Smooth(num(params.b1y, 0.204), 0.05), new Smooth(num(params.b2y, 0.446), 0.05),
+    new Smooth(num(params.b3y, 0.742), 0.05), new Smooth(num(params.b4y, 0.796), 0.05),
+  ];
+  // Scratch, sized once. Tap delays in samples and tap gains, per output.
+  const tD = new Float64Array(N * IMG);
+  const tG = new Float64Array(N * IMG);
+  // Damping one-pole state for the reflection sum: two channels per output.
+  const lpZ = new Float64Array(N * 2);
+  return {
+    out: (port) => outs[port] ?? null,
+    setParam: (id, v) => {
+      if (id === 'poolw') poolW.set(Math.max(0.5, Math.min(4000, num(v, 112))));
+      else if (id === 'poolh') poolH.set(Math.max(0.5, Math.min(4000, num(v, 81))));
+      else if (id === 'damp') damp.set(Math.max(0, Math.min(1, num(v, 0.55))));
+      else if (id === 'walls') walls.set(Math.max(0, Math.min(0.95, num(v, 0.62))));
+      else if (id.length === 3 && id[0] === 'b') {
+        const i = id.charCodeAt(1) - 49;
+        if (i >= 0 && i < N) {
+          const t = Math.max(0, Math.min(1, num(v, 0.5)));
+          if (id[2] === 'x') bxs[i].set(t);
+          else bys[i].set(t);
+        }
+      }
+    },
+    process: (ins, ctx) => {
+      if (!ring || ringSr !== ctx.sr) {
+        ringSr = ctx.sr;
+        ring = [new Float32Array(POOL_MAXD * ctx.sr + 8), new Float32Array(POOL_MAXD * ctx.sr + 8)];
+        widx = 0;
+        lpZ.fill(0);
+      }
+      const len = ring[0].length;
+      const [rl, rr] = ring;
+      // Geometry is resolved once per quantum, not per sample: a fractional
+      // read position that moves every sample buys nothing audible and costs
+      // real time (the `delay` kernel does the same).
+      const w = Math.max(0.5, poolW.step(ctx));
+      const h = Math.max(0.5, poolH.step(ctx));
+      const wl = walls.step(ctx);
+      const dp = damp.step(ctx);
+      const sx = POOL_INX * w;
+      const sy = POOL_INY * h;
+      const ref = w * 0.2;
+      const fc = Math.max(200, Math.min(19000, 400 + 17600 * (1 - dp) * (1 - dp)));
+      const a = Math.exp((-2 * Math.PI * fc) / ctx.sr);
+      const b = 1 - a;
+      for (let o = 0; o < N; o++) {
+        const px = bxs[o].step(ctx) * w;
+        const py = bys[o].step(ctx) * h;
+        for (let m = 0; m < IMG; m++) {
+          const ix = m === 1 ? -sx : m === 2 ? 2 * w - sx : sx;
+          const iy = m === 3 ? -sy : m === 4 ? 2 * h - sy : sy;
+          const dx = px - ix;
+          const dy = py - iy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          const k = o * IMG + m;
+          tD[k] = Math.max(1, Math.min(len - 3, (d / POOL_C) * ctx.sr));
+          tG[k] = (m === 0 ? 1 : wl) / (1 + d / ref);
+        }
+      }
+      const inb = ins.in;
+      for (let i = 0; i < ctx.n; i++) {
+        rl[widx] = inb ? inb[0][i] : 0;
+        rr[widx] = inb ? inb[1][i] : 0;
+        for (let o = 0; o < N; o++) {
+          const ob = outArr[o];
+          let dirL = 0;
+          let dirR = 0;
+          let refL = 0;
+          let refR = 0;
+          for (let m = 0; m < IMG; m++) {
+            const k = o * IMG + m;
+            let ri = widx - tD[k];
+            if (ri < 0) ri += len;
+            const i0 = ri | 0;
+            const frac = ri - i0;
+            const i1 = i0 + 1 >= len ? 0 : i0 + 1;
+            const g = tG[k];
+            const sL = (rl[i0] * (1 - frac) + rl[i1] * frac) * g;
+            const sR = (rr[i0] * (1 - frac) + rr[i1] * frac) * g;
+            if (m === 0) {
+              dirL += sL;
+              dirR += sR;
+            } else {
+              refL += sL;
+              refR += sR;
+            }
+          }
+          // Only the bounces are damped — a reflection is darker than the
+          // straight path, and filtering the direct tap too would just make
+          // the whole block a lowpass.
+          const zl = o * 2;
+          lpZ[zl] = lpZ[zl] * a + refL * b;
+          lpZ[zl + 1] = lpZ[zl + 1] * a + refR * b;
+          ob[0][i] = dirL + lpZ[zl];
+          ob[1][i] = dirR + lpZ[zl + 1];
+        }
+        widx = widx + 1 >= len ? 0 : widx + 1;
+      }
+    },
+  };
+});
+
+/**
+ * Mycelium — a delay tree that grows. Def in `blocks/defs.ts`, web twin in
+ * `src/blocks/units.ts`.
+ *
+ * The branching is NOT here. `core/mycelium.ts` grows the tree in the document
+ * layer and writes each tap's delay and depth into params, because a kernel
+ * cannot see the graph a tree is planned against and a growth function written
+ * twice is a growth function that drifts. What is here is the part that makes
+ * depth audible: level and high end are lost once per junction, compounding.
+ *
+ * The two per-junction laws are duplicated in the web unit. Change one, change
+ * both in the same edit.
+ *
+ * Allocation: ring built lazily and only on a rate change, like `delay`.
+ */
+const MYC_MAXD = 4.2;
+const MYC_JUNCTION_GAIN = 0.82;
+
+registerKernel('mycelium', (params) => {
+  const N = 4;
+  const outs: Record<string, StereoBuf> = {
+    out1: stereo(), out2: stereo(), out3: stereo(), out4: stereo(),
+  };
+  const outArr: StereoBuf[] = [outs.out1, outs.out2, outs.out3, outs.out4];
+  let ring: StereoBuf | null = null;
+  let ringSr = 0;
+  let widx = 0;
+  const damp = new Smooth(num(params.damp, 0.42));
+  const ms = [
+    new Smooth(num(params.t1ms, 120), 0.06), new Smooth(num(params.t2ms, 240), 0.06),
+    new Smooth(num(params.t3ms, 360), 0.06), new Smooth(num(params.t4ms, 480), 0.06),
+  ];
+  const dep = new Float64Array([
+    num(params.t1d, 1), num(params.t2d, 2), num(params.t3d, 3), num(params.t4d, 4),
+  ]);
+  const lpZ = new Float64Array(N * 2);
+  const tD = new Float64Array(N);
+  const tG = new Float64Array(N);
+  const tA = new Float64Array(N);
+  return {
+    out: (port) => outs[port] ?? null,
+    setParam: (id, v) => {
+      if (id === 'damp') damp.set(Math.max(0, Math.min(1, num(v, 0.42))));
+      else if (id.length === 4 && id[0] === 't' && id[2] === 'm') {
+        const i = id.charCodeAt(1) - 49;
+        if (i >= 0 && i < N) ms[i].set(Math.max(0, Math.min(MYC_MAXD * 1000 - 10, num(v, 0))));
+      } else if (id.length === 3 && id[0] === 't' && id[2] === 'd') {
+        const i = id.charCodeAt(1) - 49;
+        if (i >= 0 && i < N) dep[i] = Math.max(0, Math.min(9, num(v, 0)));
+      }
+    },
+    process: (ins, ctx) => {
+      if (!ring || ringSr !== ctx.sr) {
+        ringSr = ctx.sr;
+        ring = [new Float32Array(MYC_MAXD * ctx.sr + 8), new Float32Array(MYC_MAXD * ctx.sr + 8)];
+        widx = 0;
+        lpZ.fill(0);
+      }
+      const len = ring[0].length;
+      const [rl, rr] = ring;
+      const dp = damp.step(ctx);
+      // Resolved once per quantum, like `delay` and `ripple-pool`.
+      for (let i = 0; i < N; i++) {
+        tD[i] = Math.max(1, Math.min(len - 3, (ms[i].step(ctx) / 1000) * ctx.sr));
+        tG[i] = Math.pow(MYC_JUNCTION_GAIN, dep[i]);
+        const fc = Math.max(180, 19000 * Math.pow(1 - dp * 0.55, dep[i]));
+        tA[i] = Math.exp((-2 * Math.PI * Math.min(fc, ctx.sr * 0.45)) / ctx.sr);
+      }
+      const inb = ins.in;
+      for (let i = 0; i < ctx.n; i++) {
+        rl[widx] = inb ? inb[0][i] : 0;
+        rr[widx] = inb ? inb[1][i] : 0;
+        for (let o = 0; o < N; o++) {
+          let ri = widx - tD[o];
+          if (ri < 0) ri += len;
+          const i0 = ri | 0;
+          const frac = ri - i0;
+          const i1 = i0 + 1 >= len ? 0 : i0 + 1;
+          const a = tA[o];
+          const bcoef = 1 - a;
+          const zl = o * 2;
+          lpZ[zl] = lpZ[zl] * a + (rl[i0] * (1 - frac) + rl[i1] * frac) * bcoef;
+          lpZ[zl + 1] = lpZ[zl + 1] * a + (rr[i0] * (1 - frac) + rr[i1] * frac) * bcoef;
+          const ob = outArr[o];
+          ob[0][i] = lpZ[zl] * tG[o];
+          ob[1][i] = lpZ[zl + 1] * tG[o];
+        }
+        widx = widx + 1 >= len ? 0 : widx + 1;
+      }
+    },
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Sympathy — a raft of modal resonators. Def in `blocks/defs.ts`, web twin in
+// `src/blocks/units.ts`, geometry and bank format in `src/core/sympathy.ts`.
+//
+// The three surface-mode ratios, the raft's ceiling and the 55-cent response
+// width are duplicated from there. **Change one, change all three** — the width
+// in particular IS the block ("only what agrees survives"), so a resonator that
+// quietly got broader would turn it into a reverb.
+// ---------------------------------------------------------------------------
+const SYM_MAX_K = 20;
+const SYM_RATIOS_K = [1, 1.94, 3.0];
+const SYM_CENTS_K = 55;
+/** Widest a film's response may be, as a half-bandwidth fraction of its centre. */
+const SYM_BW_MAX = Math.pow(2, SYM_CENTS_K / 2400) - Math.pow(2, -SYM_CENTS_K / 2400);
+
+/**
+ * Sympathy.
+ *
+ * One two-pole resonator per surface mode per bubble, driven by the mono sum
+ * and panned back out by the bubble's place on the raft — so the picture's
+ * left-to-right really is the sound's.
+ *
+ * A slot whose frequency moved is a bubble that burst: it gets a short spray of
+ * noise, which is the transient the block dumps when a film reaches black. That
+ * needs no extra message, because the burst is already visible in the `bank`
+ * string arriving with a different number in that slot.
+ *
+ * Allocation: every array is sized for the ceiling at construction. `setParam`
+ * parses the bank string (off the audio thread, like every other setParam) and
+ * `process` allocates nothing.
+ */
+registerKernel('sympathy', (params) => {
+  const NM = SYM_RATIOS_K.length;
+  const N = SYM_MAX_K * NM;
+  const outs: Record<string, Buf> = { out: stereo(), pitch: stereo() };
+  const freq = new Float64Array(SYM_MAX_K);
+  const px = new Float64Array(SYM_MAX_K);
+  const live = new Uint8Array(SYM_MAX_K);
+  const co = new Float64Array(N);
+  const r2 = new Float64Array(N);
+  const gg = new Float64Array(N);
+  const y1 = new Float64Array(N);
+  const y2 = new Float64Array(N);
+  /** Ring energy per bubble, for the PITCH out. */
+  const env = new Float64Array(SYM_MAX_K);
+  /** Samples of spray left in a slot that just burst. */
+  const spray = new Int32Array(SYM_MAX_K);
+  let decay = num(params.decay, 0.6);
+  let bright = num(params.bright, 0.5);
+  let damp = Math.round(num(params.damp, -1));
+  let pitchCv = 0;
+  let dirty = true;
+
+  const setBank = (s: string): void => {
+    live.fill(0);
+    let i = 0;
+    for (const part of s.split(';')) {
+      if (!part || i >= SYM_MAX_K) continue;
+      const n = part.split(',').map(Number);
+      if (n.length < 5 || !(n[0] > 0)) continue;
+      const f = Math.max(70, Math.min(1400, n[0]));
+      // A frequency that moved is a film that burst — spray a transient.
+      if (live[i] === 0 && freq[i] > 0 && Math.abs(freq[i] - f) > freq[i] * 0.01) spray[i] = 1;
+      freq[i] = f;
+      px[i] = Math.max(0, Math.min(1, n[1]));
+      live[i] = 1;
+      i++;
+    }
+    dirty = true;
+  };
+  setBank(str(params.bank, ''));
+
+  return {
+    out: (port) => outs[port] ?? null,
+    setParam: (id, v) => {
+      if (id === 'decay') decay = Math.max(0, Math.min(1, num(v, 0.6)));
+      else if (id === 'bright') bright = Math.max(0, Math.min(1, num(v, 0.5)));
+      else if (id === 'damp') damp = Math.round(num(v, -1));
+      else if (id === 'bank') {
+        setBank(str(v, ''));
+        return;
+      } else return;
+      dirty = true;
+    },
+    process: (ins, ctx) => {
+      const ob = outs.out;
+      const pb = outs.pitch;
+      ob[0].fill(0, 0, ctx.n);
+      ob[1].fill(0, 0, ctx.n);
+      if (dirty) {
+        dirty = false;
+        for (let i = 0; i < SYM_MAX_K; i++) {
+          for (let k = 0; k < NM; k++) {
+            const n = i * NM + k;
+            if (!live[i]) {
+              gg[n] = 0;
+              continue;
+            }
+            const f = Math.max(20, Math.min(ctx.sr * 0.45, freq[i] * SYM_RATIOS_K[k]));
+            // Decay falls with pitch, and the upper surface modes stop sooner
+            // than the fundamental — both true of a real film.
+            let tau = ((0.35 + decay * 2.6) / SYM_RATIOS_K[k]) * (240 / Math.max(60, freq[i]));
+            // **The 55-cent floor.** A two-pole resonator's bandwidth is
+            // 1/(π·τ), so a short τ is a WIDE response — and a wide response is
+            // a film that answers to a semitone away, which this block must
+            // never do. So τ has a floor, not a ceiling.
+            tau = Math.max(tau, 1 / (Math.PI * f * SYM_BW_MAX));
+            const rr = Math.exp(-1 / (tau * ctx.sr));
+            const w = (2 * Math.PI * f) / ctx.sr;
+            co[n] = 2 * rr * Math.cos(w);
+            r2[n] = rr * rr;
+            const modeLvl = k === 0 ? 1 : bright * (k === 1 ? 0.7 : 0.45);
+            gg[n] = (damp === i ? 0.02 : modeLvl) * (1 - r2[n]) * 0.5;
+          }
+        }
+      }
+      const inb = ins.in;
+      let loudest = -1;
+      let loudestE = 1e-6;
+      for (let i = 0; i < SYM_MAX_K; i++) {
+        if (!live[i]) {
+          env[i] *= 0.9;
+          continue;
+        }
+        // Equal-power pan from the bubble's place on the raft.
+        const t = px[i];
+        const gl = Math.cos(t * Math.PI * 0.5);
+        const gr = Math.sin(t * Math.PI * 0.5);
+        let e = env[i];
+        for (let k = 0; k < NM; k++) {
+          const n = i * NM + k;
+          const g = gg[n];
+          if (g === 0) continue;
+          const c = co[n];
+          const q = r2[n];
+          let a1 = y1[n];
+          let a2 = y2[n];
+          for (let s = 0; s < ctx.n; s++) {
+            // Mono drive: the raft's stereo image is its geometry, not its
+            // input's, which is also why sixty resonators cost thirty.
+            const x = inb ? (inb[0][s] + inb[1][s]) * 0.5 : 0;
+            // The spray a burst throws. Two milliseconds of noise straight into
+            // the resonators, so the pop is the film's own pitch, not a click.
+            const exc = spray[i] > 0 ? (Math.random() * 2 - 1) * 0.6 : 0;
+            const y = g * (x + exc) + c * a1 - q * a2;
+            a2 = a1;
+            a1 = y;
+            ob[0][s] += y * gl;
+            ob[1][s] += y * gr;
+            const ay = y < 0 ? -y : y;
+            if (ay > e) e = ay;
+          }
+          if (!Number.isFinite(a1) || !Number.isFinite(a2)) {
+            a1 = 0;
+            a2 = 0;
+          }
+          y1[n] = a1;
+          y2[n] = a2;
+        }
+        if (spray[i] > 0) spray[i] = Math.max(0, spray[i] - ctx.n);
+        env[i] = e * Math.pow(0.9995, ctx.n);
+        if (env[i] > loudestE) {
+          loudestE = env[i];
+          loudest = i;
+        }
+      }
+      // PITCH: the loudest ringing element, as 1V/oct against C4 — the
+      // convention every `cvLaw: '1v/oct'` input in the app expects.
+      if (loudest >= 0) {
+        const want = Math.log2(freq[loudest] / 261.626);
+        pitchCv += (want - pitchCv) * 0.08;
+      }
+      for (let s = 0; s < ctx.n; s++) {
+        pb[0][s] = pitchCv;
+        pb[1][s] = pitchCv;
+      }
+    },
+    liveParams: () => ({}),
   };
 });
 

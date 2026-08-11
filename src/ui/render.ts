@@ -5,25 +5,23 @@
 // ============================================================================
 import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
-import { ParamSpec, cvTriggerPorts, getDef, paramSpec } from '../core/registry';
-import { Block, FaceItem, ParamValue, Theme, Vec2, Wire } from '../core/types';
+import { ParamSpec, cvTriggerPorts, getDef, isArtworkFace, paramSpec } from '../core/registry';
+import { Block, BlockShape, FaceItem, ParamValue, ShapePoint, Theme, Vec2, Wire } from '../core/types';
 import { parsePoints, samplePath } from '../core/trajectory';
 import { runtime } from '../engine/runtime';
 import {
+  type PathData,
   WirePaths,
   buildPathData,
-  closestOnPath,
-  offsetPolyline,
   pointAtRatio,
   portPos,
   resizeHandlePoints,
   setShapeDefaults,
-  subPath,
   traceBlockShape,
-  vDist,
   vNorm,
   vSub,
 } from './geometry';
+import { type BundleMember, ribbonPaths } from './bundling';
 import { TITLE_H, contentOrigin, faceItems, linkTarget, padOf, syncBlockSize } from './layout';
 import {
   SPEAKER_METER_PAD,
@@ -43,11 +41,37 @@ import {
 import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
 import { Rect, ResolvedRef, paintFaceWidget } from './facepaint';
 import { drawPanelGlyph } from './glyphs';
+import { entangleFacePrune, paintEntangleFace } from './entangleface';
+import { paintRipplePoolFace, ripplePoolFacePrune } from './ripplepoolface';
+import { myceliumFacePrune, paintMyceliumFace } from './myceliumface';
+import { paintSympathyFace, sympathyFacePrune } from './sympathyface';
 import { uiScale } from './uiscale';
 import { isSpeakerSilenced } from '../core/rig';
 import { fmtDuration, getCassette } from '../core/cassettes';
 import { getRollData, getRollMeta } from '../core/rolls';
 import { drawFitted, imageBitmap } from './images';
+// LIVE VISUALS (src/ui/visuals) — optional animated layer. Every use below is
+// behind a `visuals()` flag; deleting the folder and the `V.`-guarded lines
+// removes the feature entirely. See docs/07-ui.md "Live visuals".
+import {
+  drawFaultHeat,
+  drawFocusBlocks,
+  drawFocusWires,
+  drawWireFlow,
+  flowFocus,
+  type FocusMap,
+  noteFaults,
+  visuals as visualFlags,
+  visualsAnimating,
+  visualsFrame,
+} from './visuals';
+import { cvRipplePoints, flowPrune } from './visuals/flow';
+// MINIONS (src/ui/minions) — optional animated characters that tidy the patch.
+// Deletable exactly like the live-visuals layer: this import and the single
+// `MINIONS`-marked draw call below are the only renderer references. See
+// docs/07-ui.md.
+import { drawMinions } from './minions/layer';
+import { minionsAnimating, minionsFrame } from './minions/clock';
 
 export interface View {
   x: number;
@@ -111,8 +135,19 @@ export interface Overlay {
   hoverPort?: { blockId: string; portId: string } | null;
   hoverWire?: { wireId: string; t: number; pt: Vec2 } | null;
   draggingWireEnd?: boolean;
+  /** The wire whose end is in the user's hand, if any. Derived from the drag
+   *  state — see the getter in `Editor`. Read by the minions layer, which must
+   *  never plug in a cable you are still holding. */
+  heldWireId?: string | null;
+  /** What the user has hold of, if anything. Also derived from the drag state;
+   *  read by the minions layer to decide whether someone coming towards it is
+   *  offering it something. */
+  handDrag?: 'wire' | 'block' | null;
   hotWidget?: { blockId: string; ref: string } | null;
   snapWire?: string | null;
+  /** Entanglement Field whose viewport a dragged wire end would latch into:
+   *  the plate lights so the pull is visible before the drop, not after. */
+  latchField?: string | null;
   /** Band handle being dragged on an eq-curve visual (1-based band index). */
   eqBand?: { blockId: string; band: number } | null;
   /** Sampleview handle being dragged (start/end/fade markers). */
@@ -390,6 +425,12 @@ export class Renderer {
     const dpr = window.devicePixelRatio || 1;
     const vw = this.canvas.width / dpr;
     const vh = this.canvas.height / dpr;
+    // LIVE VISUALS: advance the animation clock once, before anything paints.
+    const V = visualFlags();
+    visualsFrame();
+    // MINIONS: advance their frame clock alongside the visuals clock.
+    minionsFrame();
+    if (V.flow) flowPrune();
 
     // Geometry (hit-testing, wire routing) resolves theme shape defaults from
     // here — publish before anything asks for a port position.
@@ -406,19 +447,31 @@ export class Renderer {
     // Auto-size before routing so wires land on current port positions.
     for (const b of graph.blocks) if (b.autoSize) syncBlockSize(b, theme);
 
-    // ---- wire paths (+ bundle ribbons) ----
-    this.paths.rebuild(graph, theme.wireStyle);
-    this.applyBundles(graph, theme);
-
-    const netByWire = this.netStyles();
-
     // Per-block wire thickness (`style.wireWidth`). Built only when some block
     // actually declares one, so the overwhelmingly common case allocates
     // nothing in a function that runs every frame while audio is on
     // (docs/10-performance.md).
+    //
+    // Built BEFORE the bundle pass, which needs it: a ribbon has to space its
+    // lanes by how thick the cables in it actually are.
     let wireW: Map<string, number> | null = null;
     for (const b of graph.blocks)
       if (b.style.wireWidth != null) (wireW ??= new Map<string, number>()).set(b.id, b.style.wireWidth);
+
+    // ---- wire paths (+ bundle ribbons) ----
+    // Net styles are resolved BEFORE the bundle pass, which needs them: a
+    // multichannel bus is drawn thicker, and a ribbon has to leave room for the
+    // width its cables are actually painted at. (Cached by `netRevision`, so
+    // moving the call earlier costs nothing.)
+    const netByWire = this.netStyles();
+    this.paths.rebuild(graph, theme.wireStyle);
+    this.applyBundles(graph, theme, wireW, netByWire);
+    this.pruneFaceStates();
+
+    // LIVE VISUALS: fault scan (reads the same levels the wire colouring does)
+    // and the upstream/downstream map for this frame's anchor.
+    if (V.faults) noteFaults(graph, netByWire);
+    const focus = V.chain ? flowFocus(graph, overlay.pointer) : null;
 
     // ---- blocks sent behind the wires ----
     // Paint order only: geometry and hit-testing are untouched, so a block back
@@ -426,13 +479,51 @@ export class Renderer {
     // running across its face instead of vanishing under it.
     for (const b of graph.blocks) if (b.style.wireLayer === 'behind') this.drawBlock(b, theme, overlay);
 
-    for (const w of graph.wires) this.drawWire(w, theme, netByWire, overlay, wireW);
+    for (const w of graph.wires) this.drawWire(w, theme, netByWire, overlay, wireW, focus);
     for (const w of graph.wires) this.drawWireEnds(w, theme, netByWire);
     // Chips last, so a crossing wire never draws over a channel count.
     for (const w of graph.wires) this.drawWireChip(w, theme, netByWire);
+    // LIVE VISUALS: push unrelated wires back — here, while the blocks are not
+    // yet painted, so the scrim can never land on top of one.
+    if (focus) drawFocusWires(g, graph, this.paths, theme, focus, theme.wireWidth);
 
     // ---- blocks ----
     for (const b of graph.blocks) if (b.style.wireLayer !== 'behind') this.drawBlock(b, theme, overlay);
+    // LIVE VISUALS: focus scrim/tint and fault heat, over the finished blocks.
+    // Outside `drawBlock` on purpose — it writes `globalAlpha` per face item
+    // and resets it to 1, so an alpha set by a caller is silently discarded.
+    if (focus) drawFocusBlocks(g, graph, theme, focus, this.view.scale);
+    const heat = V.faults && drawFaultHeat(g, graph, theme, this.view.scale);
+    // LIVE VISUALS: ports go back on top of anything those two painted. Both
+    // trace the block SILHOUETTE, and a port sits on that silhouette, so one
+    // pass buried the ports under the wash — and a port is the thing you are
+    // always aiming at. Only when an overlay actually painted, so an ordinary
+    // frame does not pay for a second port pass.
+    if (focus || heat) for (const b of graph.blocks) this.drawPorts(b, theme);
+
+    // MINIONS: the characters, their tools and their work marks, over the
+    // finished blocks and ports. Still in world space (the transform set at the
+    // top of the frame). One guarded call — deleting the folder and this line
+    // removes the feature. `vw/vh` in UI px would be wrong here: the minions
+    // live in world coordinates, so the visible rect is expressed that way.
+    drawMinions(
+      g,
+      theme,
+      this.paths,
+      {
+        x: this.view.x,
+        y: this.view.y,
+        w: vw / this.view.scale,
+        h: vh / this.view.scale,
+        scale: this.view.scale,
+      },
+      {
+        pointer: overlay.pointer ?? null,
+        view: { x: this.view.x, y: this.view.y, w: vw / this.view.scale, h: vh / this.view.scale },
+        heldWireId: overlay.heldWireId ?? null,
+        handDrag: overlay.handDrag ?? null,
+      },
+    );
 
     // ---- overlays ----
     if (overlay.hoverWire && overlay.mode === 'patch' && !overlay.draggingWireEnd) {
@@ -511,6 +602,14 @@ export class Renderer {
       g.stroke();
       g.setLineDash([]);
     }
+    // LIVE VISUALS: something is mid-animation (a drifting CV band, a cooling
+    // fault flash, a trail running out) and the frame loop only redraws when
+    // `dirty` or audio is on. Without this the animation would freeze halfway
+    // the moment audio stopped.
+    if (visualsAnimating()) this.dirty = true;
+    // MINIONS: a character mid-motion (walking, a shatter cooling) keeps the
+    // canvas live the same way, and by the same on-demand rule.
+    if (minionsAnimating()) this.dirty = true;
   }
 
   /**
@@ -738,35 +837,77 @@ export class Renderer {
     }
   }
 
-  /** Reroute bundle members along their leader with parallel offsets. */
-  private applyBundles(graph: { wires: Wire[] }, theme: Theme): void {
-    const groups = new Map<string, Wire[]>();
+  /**
+   * Gather bundled wires into ribbons.
+   *
+   * The rules — lanes packed by real cable width, ordered by which side of the
+   * corridor each cable approaches from, and each member **spliced** as
+   * lead-in + shared corridor + lead-out — live in `./bundling` as pure
+   * geometry so they can be measured without a canvas
+   * (`scripts/bundle-route-test.mjs`). All this does is collect the groups,
+   * hand over the paths, and put the results back in the cache.
+   */
+  /**
+   * Half the width a bundled cable actually occupies on screen — the number
+   * the ribbon packs its lanes by.
+   *
+   * **The width that matters is the one on the glass, not `theme.wireWidth`.**
+   * The signal stroke is only the core: `drawWire` paints a border of
+   * `wireBorderWidth` on *each* side under it, and a multichannel bus is
+   * `wireWideExtra` thicker again. Packing by the core alone put a cable drawn
+   * 6.5 units wide into a 7.5-unit lane pitch — one unit of daylight, less than
+   * the border it is drawn with. With this, a `bundleSpacing` of 0 puts
+   * neighbouring cables edge to edge: **touching and not overlapping**, which is
+   * what a bundle is meant to look like, and the setting adds daylight from
+   * there.
+   *
+   * The level swell (`wireLevelGain`) is deliberately NOT reserved. Holding
+   * room for it leaves a permanent gap for something that is usually not there,
+   * and lanes that track the live level instead would breathe with the audio —
+   * a ribbon that shimmers is worse than either.
+   */
+  private bundleHalf(w: Wire, theme: Theme, wireW: Map<string, number> | null, info: NetInfo | undefined): number {
+    const wide = !!info && info.kind === 'audio' && info.width > 2;
+    return (
+      (this.wireWidthFor(w, theme, wireW) +
+        (wide ? theme.wireWideExtra : 0) +
+        theme.wireBorderWidth * 2) /
+      2
+    );
+  }
+
+  private applyBundles(
+    graph: { wires: Wire[] },
+    theme: Theme,
+    wireW: Map<string, number> | null,
+    netByWire: Map<string, NetInfo>,
+  ): void {
+    // Every group is collected BEFORE any path is replaced. A branch resolves
+    // its `a` end against its trunk's path, so reading ends while ribbons are
+    // being written would let a wire's facing depend on whether its trunk had
+    // been re-laid yet — an ordering bug that would show up only in patches
+    // that bundle a branch and its trunk.
+    const groups = new Map<string, BundleMember[]>();
     for (const w of graph.wires) {
       if (!w.bundle) continue;
+      const path = this.paths.get(w.id);
+      const a = this.paths.endInfo(w, 'a', new Set());
+      const b = this.paths.endInfo(w, 'b', new Set());
+      if (!path || !a || !b) continue;
       let arr = groups.get(w.bundle);
       if (!arr) groups.set(w.bundle, (arr = []));
-      arr.push(w);
+      arr.push({
+        id: w.id,
+        path,
+        half: this.bundleHalf(w, theme, wireW, netByWire.get(w.id)),
+        ends: { a: { dir: a.dir, attached: a.attached }, b: { dir: b.dir, attached: b.attached } },
+      });
     }
+
     for (const members of groups.values()) {
       if (members.length < 2) continue;
-      members.sort((a, b) => (a.id < b.id ? -1 : 1));
-      const leader = members[0];
-      const lead = this.paths.get(leader.id);
-      if (!lead) continue;
-      for (let i = 1; i < members.length; i++) {
-        const m = members[i];
-        const own = this.paths.get(m.id);
-        if (!own || own.pts.length < 2) continue;
-        const start = own.pts[0];
-        const end = own.pts[own.pts.length - 1];
-        const tEnter = closestOnPath(lead, start).t;
-        const tExit = closestOnPath(lead, end).t;
-        if (Math.abs(tExit - tEnter) < 0.02) continue;
-        const off = Math.ceil(i / 2) * (i % 2 ? 1 : -1) * theme.bundleSpacing;
-        const mid = offsetPolyline(subPath(lead, tEnter, tExit), off);
-        const pts = [start, ...mid, end].filter((p, idx, arr2) => idx === 0 || vDist(p, arr2[idx - 1]) > 0.01);
-        this.paths.paths.set(m.id, buildPathData(pts));
-      }
+      for (const [id, pts] of ribbonPaths(members, theme.wireStyle, theme.bundleSpacing))
+        this.paths.paths.set(id, buildPathData(pts));
     }
   }
 
@@ -777,6 +918,13 @@ export class Renderer {
     if (info?.kind === 'roll') return { color: theme.wireRollColor, extra: 0 };
     const lvl = runtime.levelFor(w.id);
     if (info?.cv) {
+      // LIVE VISUALS: in the `direction + waveform` cable style a CV cable
+      // holds ONE gauge — its strength is the ripple's amplitude instead.
+      // Thickness that tracks a control voltage is unreadable past a few Hz
+      // (a cable breathing 60 times a second) and it deformed everything drawn
+      // on top of it. `flow: false` is the classic style and falls through to
+      // the stock branch below, unchanged.
+      if (visualFlags().flow) return { color: theme.wireControlColor, extra: 0 };
       // CV is audio-rate: show activity as thickness, but keep the control hue.
       const extra = lvl ? levelStyle(theme, lvl.rms, lvl.peak).extra : 0;
       return { color: theme.wireControlColor, extra };
@@ -824,6 +972,7 @@ export class Renderer {
     netByWire: Map<string, NetInfo>,
     overlay: Overlay,
     wireW: Map<string, number> | null = null,
+    focus: FocusMap | null = null,
   ): void {
     const path = this.paths.get(w.id);
     if (!path || path.pts.length < 2) return;
@@ -834,16 +983,42 @@ export class Renderer {
     // a glance and at any zoom, without competing with the bundle ribbon
     // (which already means "several wires travelling together").
     const wide = !!info && info.kind === 'audio' && info.width > 2;
-    const width = this.wireWidthFor(w, theme, wireW) + extra + (wide ? theme.wireWideExtra : 0);
-    if (w.selected) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 4, theme.selectionColor + '88');
-    if (overlay.snapWire === w.id) this.strokePath(path.pts, width + theme.wireBorderWidth * 2 + 6, theme.selectionColor + '55');
+    const baseWidth = this.wireWidthFor(w, theme, wireW);
+    const width = baseWidth + extra + (wide ? theme.wireWideExtra : 0);
+
+    // LIVE VISUALS: **a CV cable does not get a wave drawn on it — the cable
+    // IS the wave.** The first version stroked a pale line over the straight
+    // purple cable, which read as two objects ("a faint white wave in front of
+    // the original purple") instead of one control line doing something. So
+    // the ripple is a replacement GEOMETRY: everything below strokes `pts`,
+    // and for a CV wire those points are the displaced ones. Border, colour
+    // and selection halo all follow it, so it is the cable itself that bends.
+    //
+    // Hit-testing deliberately keeps using the straight `path` (see
+    // `Editor.wireTol`): grabbing a cable should not mean chasing a moving
+    // curve, and the ripple stays within about a wire-width of the centreline
+    // so the grab band still covers what you see.
+    let pts = path.pts;
+    if (visualFlags().flow && info?.cv && info.kind === 'audio') {
+      pts = cvRipplePoints(w, path, this.paths, baseWidth, this.view.scale, focus ? focus.wires.has(w.id) : null) ?? pts;
+    }
+
+    if (w.selected) this.strokePath(pts, width + theme.wireBorderWidth * 2 + 4, theme.selectionColor + '88');
+    if (overlay.snapWire === w.id) this.strokePath(pts, width + theme.wireBorderWidth * 2 + 6, theme.selectionColor + '55');
     // Solid border first, signal color on top. A wire on a cycle swaps the
     // border for the loop tint — the signal color still carries the level, so
     // a looped wire stays as readable as any other (see `loopNets`).
     const border = info?.loop ? theme.wireLoopColor : theme.wireBorderColor;
-    this.strokePath(path.pts, width + theme.wireBorderWidth * 2, border);
-    this.strokePath(path.pts, width, color);
-    if (wide) this.strokePath(path.pts, Math.max(0.6, width * 0.3), theme.wireCoreColor + 'cc');
+    this.strokePath(pts, width + theme.wireBorderWidth * 2, border);
+    this.strokePath(pts, width, color);
+    if (wide) this.strokePath(pts, Math.max(0.6, width * 0.3), theme.wireCoreColor + 'cc');
+    // Marching dashes / tape sprockets. CV is excluded inside — its waveform
+    // above already carries direction, and two moving patterns on one cable
+    // read as interference.
+    // `baseWidth`, deliberately not `width`: nothing drawn ON the cable may be
+    // pitched by a live value, or it squeezes and stretches as the level moves.
+    if (visualFlags().flow)
+      drawWireFlow(this.g, w, path, info, theme, baseWidth, this.view.scale);
     // Branch root dot, exactly on the trunk.
     if (w.parentId) {
       const g = this.g;
@@ -1213,11 +1388,32 @@ export class Renderer {
 
     // ---- face items ----
     const o = contentOrigin(b, theme);
-    const items = def.customFace ? [] : faceItems(b, theme);
+    // `customFace` normally means "this block draws itself instead of having
+    // face items". The Entanglement Field is the one that means "as well as":
+    // its plate is artwork, but its controls are real params, so that they
+    // mirror into the Dock, take MIDI learns and CV ports, and export onto the
+    // face of a custom block built around it (docs/07 invariant 2). The artwork
+    // paints first and the widgets land on top of it.
+    const artworkPlusWidgets = isArtworkFace(def);
+    const items = def.customFace && !artworkPlusWidgets ? [] : faceItems(b, theme);
     const textColor = st.textColor ?? theme.blockText;
     if (def.customFace === 'cassette') this.drawCassetteFace(b, theme);
     else if (def.customFace === 'roll') this.drawRollFace(b, theme);
     else if (def.customFace === 'comment') this.drawCommentFace(b, theme);
+    else if (def.customFace === 'entangle') {
+      // Returns true while anything on the plate is still moving — the haze,
+      // a settle flash, a socket flare. The app has one rAF loop and this is
+      // how a block asks it for the next frame (docs/10 rule 9).
+      if (paintEntangleFace(g, b, theme, overlay.latchField === b.id)) this.dirty = true;
+    } else if (def.customFace === 'ripplepool') {
+      // Always returns true: the surface never fully stills, which is the
+      // block's whole "alive" property. Same rAF contract as the field.
+      if (paintRipplePoolFace(g, b, theme)) this.dirty = true;
+    } else if (def.customFace === 'mycelium') {
+      if (paintMyceliumFace(g, b, theme)) this.dirty = true;
+    } else if (def.customFace === 'sympathy') {
+      if (paintSympathyFace(g, b, theme)) this.dirty = true;
+    }
     const editingThis = overlay.mode === 'edit' && overlay.editingBlockId === b.id;
     // Proximity focus dims everything except the title, which is the whole
     // point: a collapsed block still says what it is.
@@ -1351,6 +1547,60 @@ export class Renderer {
     }
 
     // ---- ports ----
+    this.drawPorts(b, theme);
+
+    // ---- block-edit mode handles ----
+    if (overlay.mode === 'edit' && overlay.editingBlockId === b.id) {
+      this.drawEditHandles(b, theme, overlay, items, shape, radius, custom);
+    }
+  }
+
+  /**
+   * Drop the per-block animation state held by every custom face.
+   *
+   * Each of these faces keeps a Map keyed by block id — a pool's rings, a
+   * tree's pulses, a raft's ringing — because that state is *animation*, not
+   * document, and must not be serialised. Nothing was calling the prune
+   * functions those modules already exported, so deleting a block leaked its
+   * state for the life of the session and, worse, a NEW block that happened to
+   * reuse the id would have inherited it.
+   *
+   * Run on `netRevision`, which bumps on structure and selection changes, never
+   * per frame: building the live-id set every frame to delete nothing is not
+   * work an idle canvas should be doing.
+   */
+  private pruneRev = -1;
+  private pruneFaceStates(): void {
+    const rev = doc.netRevision;
+    if (rev === this.pruneRev) return;
+    this.pruneRev = rev;
+    const live = new Set<string>();
+    const walk = (g: { blocks: Block[] }): void => {
+      for (const b of g.blocks) {
+        live.add(b.id);
+        if (b.graph) walk(b.graph);
+      }
+    };
+    walk(doc.scene.root);
+    entangleFacePrune(live);
+    ripplePoolFacePrune(live);
+    myceliumFacePrune(live);
+    sympathyFacePrune(live);
+  }
+
+  /**
+   * A block's ports, drawn as their own pass.
+   *
+   * Split out of `drawBlock` (2026-08-05) so the ports can be re-laid over any
+   * overlay painted on top of the blocks — the live-visuals focus scrim and
+   * fault heat trace the block *silhouette*, and a port sits on that
+   * silhouette, so a single pass buried them under the wash. A port is the one
+   * thing on a block you are always aiming at, and a target you cannot see is
+   * worse than any highlight is good. Re-drawing is idempotent: the same
+   * circles land in the same places.
+   */
+  private drawPorts(b: Block, theme: Theme): void {
+    const g = this.g;
     setFont(g, uiFont(theme.portLabelSize));
     // Trigger inputs (clock / gate / trig / sync / reset) drive no knob, so
     // there is no widget to put a CV marker on — the indicator goes on the
@@ -1435,15 +1685,32 @@ export class Renderer {
       }
     }
 
-    // ---- block-edit mode handles ----
-    if (overlay.mode === 'edit' && overlay.editingBlockId === b.id) {
-      g.save();
-      g.setLineDash([4, 3]);
+  }
+
+  /**
+   * Block-edit mode's dashed boundary, per-item outlines and resize handles.
+   * Split out of `drawBlock` alongside `drawPorts` purely so that function
+   * stays readable after the port pass moved; the behaviour is unchanged.
+   */
+  private drawEditHandles(
+    b: Block,
+    theme: Theme,
+    overlay: Overlay,
+    items: FaceItem[],
+    shape: BlockShape,
+    radius: number,
+    custom: ShapePoint[] | undefined,
+  ): void {
+    const g = this.g;
+    const { x, y } = b.pos;
+    const o = contentOrigin(b, theme);
+    g.save();
+    g.setLineDash([4, 3]);
       g.strokeStyle = theme.selectionColor;
       g.lineWidth = 1;
       // The boundary widgets are actually held to: the block's own outline,
       // eroded by padding. Skipped entirely when widgets are unbound.
-      if (!st.freeWidgets) {
+      if (!b.style.freeWidgets) {
         const pad = padOf(b, theme);
         const iw = Math.max(10, b.size.w - pad.l - pad.r);
         const ih = Math.max(10, b.size.h - pad.t - pad.b);
@@ -1477,8 +1744,7 @@ export class Renderer {
         g.fillRect(p.x - hs, p.y - hs, hs * 2, hs * 2);
         g.strokeRect(p.x - hs, p.y - hs, hs * 2, hs * 2);
       }
-      g.restore();
-    }
+    g.restore();
   }
 
   /** Custom cassette-tape face: label strip, tape window with two reels. */

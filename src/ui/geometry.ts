@@ -473,7 +473,65 @@ export function subPath(path: PathData, t0: number, t1: number): Vec2[] {
   return out;
 }
 
-/** Offset a polyline perpendicular by d (miter-averaged normals). */
+/**
+ * Which side of a path a point falls on, as a signed distance.
+ *
+ * Positive is the side the path's own normals point to — the same side
+ * `offsetPolyline` moves toward for a positive `d`, so a point with a positive
+ * side wants a positive lane offset. That agreement is the whole reason this
+ * exists: bundled cables are ordered across the ribbon by this, and if the sign
+ * convention disagreed with the offset's, every ribbon would be laid out
+ * back-to-front and its members would cross.
+ */
+export function sideOfPath(path: PathData, p: Vec2): number {
+  const c = closestOnPath(path, p);
+  const dir = directionAtRatio(path, c.t);
+  // Perpendicular, matching `offsetPolyline`'s normal ( -dir.y, dir.x ).
+  return (p.x - c.pt.x) * -dir.y + (p.y - c.pt.y) * dir.x;
+}
+
+/**
+ * A 0 → 1 → 0 window over `u` in 0..1, ramping in over `leadIn` and out over
+ * `leadOut` (both in the same 0..1 units).
+ *
+ * Used to merge a bundled cable into its ribbon: zero at both ports (so the
+ * cable leaves and arrives exactly as its own wire style routed it) and one
+ * across the middle (where it runs with the others). Smoothstep rather than a
+ * linear ramp — a linear one leaves a visible kink where the blend starts.
+ *
+ * **The two ends are separate because they are rarely symmetric.** A cable may
+ * be beside its ribbon at one end and a long way from it at the other, and the
+ * end that has further to travel needs a correspondingly longer peel-off or it
+ * leaves the bundle at an angle that reads as a kink rather than as cable.
+ */
+export function rampWindow(u: number, leadIn: number, leadOut = leadIn): number {
+  const s = (x: number): number => {
+    const t = Math.max(0, Math.min(1, x));
+    return t * t * (3 - 2 * t);
+  };
+  const a = leadIn <= 0 ? 1 : s(u / leadIn);
+  const b = leadOut <= 0 ? 1 : s((1 - u) / leadOut);
+  return Math.min(a, b);
+}
+
+/**
+ * Offset a polyline perpendicular by d — a true **miter**, not an averaged
+ * normal.
+ *
+ * The difference is the whole reason bundled `ortho` cables came out as
+ * diagonals. Moving each vertex along the *average* of its two normals is only
+ * correct on a straight run: at a right-angled corner the average points 45°
+ * out and is one `d` short, so the corner lands off both offset segment lines
+ * and the two legs either side of it tilt. A parallel copy of an axis-aligned
+ * path stops being axis-aligned exactly where it turns — which is every corner
+ * an `ortho` route has.
+ *
+ * The miter is the bisector scaled by `d / cos(half-angle)`, which is the point
+ * where the two offset lines actually meet, so every segment stays parallel to
+ * the segment it came from. Clamped, because that scale runs to infinity as a
+ * path doubles back on itself.
+ */
+const MITER_LIMIT = 4;
 export function offsetPolyline(pts: Vec2[], d: number): Vec2[] {
   if (pts.length < 2 || d === 0) return pts.slice();
   const normals: Vec2[] = [];
@@ -486,7 +544,10 @@ export function offsetPolyline(pts: Vec2[], d: number): Vec2[] {
     const n0 = normals[Math.max(0, i - 1)];
     const n1 = normals[Math.min(normals.length - 1, i)];
     const n = vNorm({ x: n0.x + n1.x, y: n0.y + n1.y });
-    out.push({ x: pts[i].x + n.x * d, y: pts[i].y + n.y * d });
+    // cos(half-angle between the two normals); 1 on a straight run.
+    const cos = Math.sqrt(Math.max(0, (1 + (n0.x * n1.x + n0.y * n1.y)) / 2));
+    const k = cos > 1 / MITER_LIMIT ? 1 / cos : MITER_LIMIT;
+    out.push({ x: pts[i].x + n.x * d * k, y: pts[i].y + n.y * d * k });
   }
   return out;
 }
@@ -512,16 +573,38 @@ function bezier(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, segments: number): Vec2[
   return pts;
 }
 
-function routePoints(a: EndInfo, b: EndInfo, style: Theme['wireStyle']): Vec2[] {
+/**
+ * Route a cable between two ends in the current wire style.
+ *
+ * **Exported so bundling can route its own joins.** A bundled cable is spliced
+ * — its own routed lead-in, the shared corridor, its own routed lead-out — and
+ * the two end pieces have to be produced by the same router as every other
+ * cable or the style is lost exactly where the eye checks it, at the ports.
+ * Drawing those pieces as straight chords instead is the original bundling bug.
+ *
+ * `turn` is where an `ortho` route changes axis, and it exists for those joins.
+ * The default halfway split is right for a cable in open space; for a lead-in
+ * it puts the crossing leg **halfway between the port and the ribbon**, which
+ * is precisely where the other cables' lanes are — measured: a lead-in running
+ * 1.0 units from a neighbour's lane, parallel, for 25 units. `'late'` changes
+ * axis at `b` instead, so the cable runs out along its own port's line and then
+ * crosses every intervening lane square. Ignored by the other styles.
+ */
+export function routePoints(
+  a: EndInfo,
+  b: EndInfo,
+  style: Theme['wireStyle'],
+  turn: 'mid' | 'late' = 'mid',
+): Vec2[] {
   if (style === 'straight') return [a.pos, b.pos];
   if (style === 'ortho') {
     const horizA = a.dir.x !== 0 || (!a.attached && Math.abs(b.pos.x - a.pos.x) > Math.abs(b.pos.y - a.pos.y));
     const pts: Vec2[] = [a.pos];
     if (horizA) {
-      const midX = (a.pos.x + b.pos.x) / 2;
+      const midX = turn === 'late' ? b.pos.x : (a.pos.x + b.pos.x) / 2;
       pts.push({ x: midX, y: a.pos.y }, { x: midX, y: b.pos.y });
     } else {
-      const midY = (a.pos.y + b.pos.y) / 2;
+      const midY = turn === 'late' ? b.pos.y : (a.pos.y + b.pos.y) / 2;
       pts.push({ x: a.pos.x, y: midY }, { x: b.pos.x, y: midY });
     }
     pts.push(b.pos);
@@ -530,7 +613,16 @@ function routePoints(a: EndInfo, b: EndInfo, style: Theme['wireStyle']): Vec2[] 
   }
   // curved
   const dist = vDist(a.pos, b.pos);
-  const pull = Math.min(140, Math.max(30, dist * 0.45));
+  // The `30` floor gives a short cable in open space a proper bulge instead of
+  // a taut string. It is exactly wrong for a join, where the two ends can be a
+  // couple of units apart: a control point pulled 30 units out of a 5-unit span
+  // sends the curve out and back, and a bundle full of them reads as a knot of
+  // little loops where the cables meet the ribbon. `'late'` keeps the pull
+  // inside the span, so a short join is a short curve.
+  const pull =
+    turn === 'late'
+      ? Math.min(140, Math.max(30, dist * 0.45), dist * 0.5)
+      : Math.min(140, Math.max(30, dist * 0.45));
   const c1 = a.attached ? vAdd(a.pos, vScale(a.dir, pull)) : vAdd(a.pos, vScale(vNorm(vSub(b.pos, a.pos)), pull * 0.5));
   const c2 = b.attached ? vAdd(b.pos, vScale(b.dir, pull)) : vAdd(b.pos, vScale(vNorm(vSub(a.pos, b.pos)), pull * 0.5));
   const segs = Math.max(12, Math.min(40, Math.round(dist / 12)));

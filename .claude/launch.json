@@ -5,7 +5,8 @@
       "name": "livepatch-dev",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
-      "port": 5199
+      "port": 5199,
+      "autoPort": true
     },
     {
       "name": "repo-static",

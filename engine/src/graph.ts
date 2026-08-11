@@ -138,7 +138,14 @@ export class GraphExec {
     for (const rec of this.nodes.values()) {
       if (rec.kernel.midiOut !== undefined) rec.kernel.midiOut = null;
       if (rec.kernel.tapeOut !== undefined) rec.kernel.tapeOut = null;
+      if (rec.kernel.midiOutAt !== undefined) rec.kernel.midiOutAt = null;
+      if (rec.kernel.tapeOutAt !== undefined) rec.kernel.tapeOutAt = null;
     }
+    // Per-port event fan-out for `multiPortEvents` kernels, collected while
+    // walking the nets and installed once at the end — a net names one source
+    // port at a time, so the table cannot be built in a single pass.
+    const multiMidi = new Map<Kernel, Map<string, (ev: MidiEvent, offset?: number) => void>>();
+    const multiTape = new Map<Kernel, Map<string, (id: string) => void>>();
 
     // ---- nets ----
     const nodeParams = new Map(g.nodes.map((n) => [n.id, n.params]));
@@ -149,15 +156,26 @@ export class GraphExec {
     const tapeConnected = new Set<Kernel>();
     for (const net of g.nets) {
       if (net.kind === 'midi') {
+        // The SINK PORT travels with the sink. Almost every MIDI kernel has one
+        // in-port and ignores it, but a kernel that routes per port (the
+        // Entanglement Field) has to know which cable an event came down —
+        // and this net already knew, it was simply being dropped here.
         const sinks = net.sinks
-          .map((s) => this.nodes.get(s.node)?.kernel)
-          .filter((k): k is Kernel => !!k?.midiIn);
+          .map((s) => ({ k: this.nodes.get(s.node)?.kernel, port: s.port }))
+          .filter((s): s is { k: Kernel; port: string } => !!s.k?.midiIn);
         for (const src of net.sources) {
           const k = this.nodes.get(src.node)?.kernel;
-          if (k && k.midiOut !== undefined)
-            k.midiOut = (ev: MidiEvent, offset?: number) => {
-              for (const s of sinks) s.midiIn!(ev, offset);
-            };
+          if (!k) continue;
+          const send = (ev: MidiEvent, offset?: number): void => {
+            for (const s of sinks) s.k.midiIn!(ev, offset, s.port);
+          };
+          // A multi-port kernel gets a per-port table; `midiOut` is one
+          // callback per kernel and could only ever broadcast.
+          if (k.multiPortEvents) {
+            const table = (multiMidi.get(k) ?? new Map<string, typeof send>());
+            table.set(src.port, send);
+            multiMidi.set(k, table);
+          } else if (k.midiOut !== undefined) k.midiOut = send;
         }
         continue;
       }
@@ -165,18 +183,22 @@ export class GraphExec {
       // transport, different families (see core/types.ts SignalKind).
       if (net.kind === 'tape' || net.kind === 'roll') {
         const sinks = net.sinks
-          .map((s) => this.nodes.get(s.node)?.kernel)
-          .filter((k): k is Kernel => !!k?.tapeIn);
-        for (const s of sinks) tapeConnected.add(s);
+          .map((s) => ({ k: this.nodes.get(s.node)?.kernel, port: s.port }))
+          .filter((s): s is { k: Kernel; port: string } => !!s.k?.tapeIn);
+        for (const s of sinks) tapeConnected.add(s.k);
         for (const src of net.sources) {
           const k = this.nodes.get(src.node)?.kernel;
           if (!k) continue;
-          if (k.tapeOut !== undefined)
-            k.tapeOut = (id: string) => {
-              for (const s of sinks) s.tapeIn!(id);
-            };
+          const send = (id: string): void => {
+            for (const s of sinks) s.k.tapeIn!(id, s.port);
+          };
+          if (k.multiPortEvents) {
+            const table = multiTape.get(k) ?? new Map<string, typeof send>();
+            table.set(src.port, send);
+            multiTape.set(k, table);
+          } else if (k.tapeOut !== undefined) k.tapeOut = send;
           const cur = k.tapeAssetId?.();
-          if (cur) for (const s of sinks) s.tapeIn!(cur);
+          if (cur) send(cur);
         }
         continue;
       }
@@ -226,6 +248,13 @@ export class GraphExec {
       }
       this.nets.push(rec);
     }
+    // Install the per-port event tables. A port with nothing wired to it is
+    // simply absent from the map, so sending out of it is a no-op rather than
+    // a broadcast to everything.
+    for (const [k, table] of multiMidi)
+      k.midiOutAt = (port, ev, offset) => table.get(port)?.(ev, offset);
+    for (const [k, table] of multiTape) k.tapeOutAt = (port, id) => table.get(port)?.(id);
+
     // Tape decks whose wire is gone get an explicit eject — otherwise a wired
     // cassette would keep playing after the wire is pulled. tapeIn(null) is
     // idempotent, so unaffected rebuilds are no-ops.

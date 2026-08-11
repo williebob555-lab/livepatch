@@ -34,6 +34,8 @@ import {
   val2norm,
   xyAxes,
 } from './widgets';
+// LIVE VISUALS (src/ui/visuals) — see the guarded block in `paintFaceWidget`.
+import { rigPadApplies, rigPadOverlay, visuals as visualFlags } from './visuals';
 
 export type Rect = { x: number; y: number; w: number; h: number };
 
@@ -165,9 +167,13 @@ export function refSize(r: ResolvedRef, cs?: ControlStyle): { w: number; h: numb
  * (which is keyed on the block) so the Dock honours the same swap rules.
  */
 export function controlOfStyle(spec: ParamSpec, cs?: ControlStyle): { kind: ParamSpec['widget']; variant?: string } {
-  if (!SWAPPABLE_WIDGETS.has(spec.widget)) return { kind: spec.widget, variant: cs?.variant };
+  // The clone's own variant wins, then the spec's default (`ParamSpec.variant`)
+  // — so a docked control comes up looking like the one on the block face
+  // rather than reverting to the widget's plain form.
+  const variant = cs?.variant ?? spec.variant;
+  if (!SWAPPABLE_WIDGETS.has(spec.widget)) return { kind: spec.widget, variant };
   const kind = cs?.kind && SWAPPABLE_WIDGETS.has(cs.kind) ? cs.kind : spec.widget;
-  return { kind, variant: cs?.variant };
+  return { kind, variant };
 }
 
 /**
@@ -332,7 +338,10 @@ export function paintFaceWidget(
   // bottom of the item. Carved off here, once, so every painter below sees the
   // widget's own box and none of them has to know the mark exists. Drawn last
   // (after the widget) so a mark can never be painted over.
-  const mark = o.cs?.showMark === false ? undefined : spec.mark;
+  // The machined 'panel' button engraves its own mark into the key, so it gets
+  // no printed strip — and `layout.ts` reserved none for it either.
+  const engraves = controlOfStyle(spec, o.cs).variant === 'panel';
+  const mark = o.cs?.showMark === false || engraves ? undefined : spec.mark;
   const rect: Rect = mark && rect0.h > MARK_H * 2 ? { ...rect0, h: rect0.h - MARK_H } : rect0;
   const paintMark = (): void => {
     if (!mark || rect === rect0) return;
@@ -402,6 +411,38 @@ export function paintFaceWidget(
   const mod = modOf(t, spec.id, r.nodeId, r.container);
   const modY = spec.yParam ? modOf(t, spec.yParam, r.nodeId, r.container) : null;
   const mod2 = axes && modY != null ? val2norm(axes.y, modY) : modY;
+  // LIVE VISUALS (src/ui/visuals) — the scene's real speaker layout drawn into
+  // a rig-aware XY pad, with a trail of where the source has been. Behind a
+  // flag; delete this block and the import to remove the feature. It lives
+  // here rather than in the Renderer so a Panner mirrored into the Dock shows
+  // the same picture as its face (docs/07-ui.md invariant 8).
+  //
+  // **Drawn UNDER the pad, not over it (fixed 2026-08-05).** The first version
+  // painted after `paintWidget` and buried the thing the pad is actually for:
+  // the purple post-CV ring stopped being readable, reported as *"the panner's
+  // CV indicator doesn't move at all"*. The rig is context; the crosshair and
+  // the CV ring are the reading, and the reading goes on top. This works
+  // because the pad's own background is `rgba(0,0,0,0.4)` rather than opaque,
+  // so the layout still shows through — slightly recessed, which is what
+  // context should look like.
+  if (visualFlags().rigFace && spec.widget === 'xy' && axes && rigPadApplies(t, axes.x, axes.y)) {
+    // The pad's own normalized space, remapped from 0..1 to −1..+1 so the
+    // listener sits at the centre. `mod`/`mod2` are the post-CV values the
+    // engine is reporting; their absence means nothing is driving the block,
+    // and a trail is only recorded when they are present.
+    const nx = (val2norm(axes.x, Number(t.params[spec.id] ?? 0)) - 0.5) * 2;
+    const ny = ((v2 ?? 0.5) - 0.5) * 2;
+    const live = mod != null && mod2 != null;
+    rigPadOverlay(
+      g,
+      rect,
+      r.nodeId,
+      theme,
+      live ? (val2norm(axes.x, mod) - 0.5) * 2 : nx,
+      live ? (mod2 - 0.5) * 2 : ny,
+      live,
+    );
+  }
   paintWidget(
     g,
     rect,

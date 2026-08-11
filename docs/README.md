@@ -193,6 +193,8 @@ avoid stepping on the invariants that keep it fast and correct.
 | 11 | [`11-packaging.md`](11-packaging.md) | Building the installer, releasing, and in-app updates |
 | 12 | [`12-testing-checklist.md`](12-testing-checklist.md) | **The regression checklist for new features** |
 | 13 | [`13-vst-hosting.md`](13-vst-hosting.md) | VST3 hosting: the native addon, threading rules, GUI embedding, scanner |
+| 14 | [`14-dynamic-blocks.md`](14-dynamic-blocks.md) | The "alive" blocks — visual rules, per-block specs, and what building all seven taught. **Read before drawing any block face.** |
+| 15 | [`15-minions.md`](15-minions.md) | Characters that live in the patch: the pixel-art rules, the planted-foot walk, and the IK branch that cost 17 units. **Read before touching `src/ui/minions/`.** |
 | 14 | [`14-input.md`](14-input.md) | **Touch / trackpad / mouse / pen — the input standard (normative)** |
 
 ## Keeping this current

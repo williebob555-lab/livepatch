@@ -65,6 +65,8 @@ import { dock } from './dock';
 import { Editor } from './editor';
 import { MenuItem, confirmModal, promptModal, showContextMenu } from './menus';
 import { blockAt } from './geometry';
+// MINIONS: one guarded import, for the Library-drop-onto-a-minion case only.
+import { giveToMinion, minionBodyAt } from './minions/layer';
 import { renderBlockThumbnail, renderCassetteThumbnail, renderRollThumbnail } from './thumbnail';
 import { SWAPPABLE_WIDGETS, autoFace, clampFaceItem, controlOf, faceItems, fitFaceLayout, linkTarget, syncBlockSize, widgetSize } from './layout';
 import { SHAPE_PRESETS, listSavedShapes, openShapeEditor } from './shapeeditor';
@@ -82,6 +84,8 @@ import {
 } from './uiscale';
 import * as shell from './shell';
 import { LONGPRESS_NUDGE, capture, dragHandle, dragThreshold, isCoarse } from './input';
+// LIVE VISUALS (src/ui/visuals) — the Appearance section for the animated layer.
+import { RIPPLE_AMP_MAX, RIPPLE_AMP_MIN, resetVisuals, setVisuals, visuals } from './visuals';
 
 let ed: Editor;
 /** Properties-panel filter text for the (possibly huge) plugin param list. */
@@ -210,6 +214,13 @@ export function addBlockAt(type: string, pos: Vec2): void {
   b.pos.y -= b.size.h / 2;
   doc.clearSelection();
   b.selected = true;
+  // MINIONS: dropped from the Library straight onto a minion, it goes into the
+  // gripper rather than onto the canvas — and its origin is `library`, which is
+  // the one origin that is not a place. "Put it back" for a block that has
+  // never been anywhere means *back to stock*, not "set it down wherever the
+  // robot happens to be hovering". See `minions/payload.ts`.
+  const hand = minionBodyAt({ x: b.pos.x + b.size.w / 2, y: b.pos.y + b.size.h / 2 });
+  if (hand) giveToMinion(hand, { kind: 'block', blockId: b.id, origin: { kind: 'library' } });
   doc.touch('structure');
   pushRecent(type);
 }
@@ -2562,7 +2573,10 @@ const THEME_SCHEMA: ThemeField[] = [
   { key: 'wireWidth', label: 'Width', type: 'number', min: 1, max: 20, step: 0.5, section: 'Wires' },
   { key: 'wireBorderWidth', label: 'Border width', type: 'number', min: 0, max: 10, step: 0.5, section: 'Wires' },
   { key: 'wireBorderColor', label: 'Border color', type: 'color', section: 'Wires' },
-  { key: 'bundleSpacing', label: 'Bundle spacing', type: 'number', min: 2, max: 14, step: 1, section: 'Wires' },
+  // 0 = cables touching. The lane pitch is this PLUS each cable's drawn width,
+  // so the floor is "edge to edge", never "overlapping" — which is why the
+  // minimum is 0 and not 2.
+  { key: 'bundleSpacing', label: 'Bundle gap', type: 'number', min: 0, max: 14, step: 1, section: 'Wires' },
   { key: 'arrowSize', label: 'Arrow size', type: 'number', min: 5, max: 18, step: 1, section: 'Wires' },
   { key: 'branchDotRadius', label: 'Branch dot', type: 'number', min: 2, max: 9, step: 0.5, section: 'Wires' },
   { key: 'wireControlColor', label: 'Control color', type: 'color', section: 'Wires' },
@@ -2578,6 +2592,141 @@ const THEME_SCHEMA: ThemeField[] = [
   { key: 'levelClipDb', label: 'Clip ≥ dB', type: 'number', min: -12, max: 0, step: 0.5, section: 'Signal levels' },
   { key: 'wireLevelGain', label: 'Level thickness', type: 'number', min: 0, max: 8, step: 0.5, section: 'Signal levels' },
 ];
+
+/**
+ * LIVE VISUALS (src/ui/visuals) — the Appearance section for the animated
+ * layer. `invalidate` marks the renderer dirty (these settings are not in the
+ * doc, so `doc.touch` would not repaint an idle canvas); `rebuild` re-lays the
+ * whole Appearance panel, called after a discrete toggle so dependent rows
+ * update their enabled state. The amplitude slider deliberately does NOT
+ * rebuild — that would recreate the slider mid-drag.
+ */
+function buildLiveVisuals(body: HTMLElement, invalidate: () => void, rebuild: () => void): void {
+  const v = visuals();
+  const sec = section(body, 'Live visuals');
+
+  // A checkbox row: label on the left (via `row`), toggle on the right.
+  const bool = (label: string, on: boolean, set: (b: boolean) => void, opts: { disabled?: boolean; hint?: string } = {}): void => {
+    const r = row(sec, label);
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = on;
+    cb.disabled = !!opts.disabled;
+    cb.addEventListener('change', () => {
+      set(cb.checked);
+      invalidate();
+      rebuild();
+    });
+    r.appendChild(cb);
+    if (opts.hint) {
+      const h = document.createElement('div');
+      h.className = 'form-hint';
+      h.textContent = opts.hint;
+      sec.appendChild(h);
+    }
+  };
+
+  // A segmented pick: one button per option, the active one filled.
+  const seg = <T extends string>(label: string, cur: T, opts: Array<[T, string]>, set: (val: T) => void, disabled = false): void => {
+    const r = row(sec, label);
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;flex:1';
+    for (const [val, text] of opts) {
+      const b = document.createElement('button');
+      b.textContent = text;
+      b.disabled = disabled;
+      const active = val === cur;
+      b.setAttribute('aria-pressed', String(active));
+      b.style.cssText = active
+        ? 'flex:1;background:var(--accent,#4fd0c0);color:#0b1520;border-color:var(--accent,#4fd0c0)'
+        : 'flex:1';
+      b.addEventListener('click', () => {
+        set(val);
+        invalidate();
+        rebuild();
+      });
+      wrap.appendChild(b);
+    }
+    r.appendChild(wrap);
+  };
+
+  // ---- cables ----
+  seg('Cables', v.flow ? 'flow' : 'classic', [
+    ['flow', 'Direction + waveform'],
+    ['classic', 'Classic'],
+  ], (val) => setVisuals({ flow: val === 'flow' }));
+
+  seg('CV waveform', v.ripple, [
+    ['chain', 'On the chain'],
+    ['even', 'Every cable'],
+    ['off', 'Off'],
+  ], (val) => setVisuals({ ripple: val }), !v.flow);
+
+  // The amplitude slider — the whole reason this section exists. No rebuild on
+  // input (it would recreate the slider under the cursor); drag via the shared
+  // relative-drag handle, same as UI scale, because a native range remaps the
+  // pointer onto its own moving geometry.
+  {
+    const disabled = !v.flow || v.ripple === 'off';
+    const r = row(sec, 'CV wave height');
+    const range = document.createElement('input');
+    range.type = 'range';
+    range.min = String(RIPPLE_AMP_MIN);
+    range.max = String(RIPPLE_AMP_MAX);
+    range.step = '0.05';
+    range.value = String(v.rippleAmp);
+    range.disabled = disabled;
+    const valEl = document.createElement('span');
+    valEl.className = 'range-val';
+    const fmt = (): string => Math.round(visuals().rippleAmp * 100) + '%';
+    valEl.textContent = fmt();
+    const commit = (n: number): void => {
+      setVisuals({ rippleAmp: Math.max(RIPPLE_AMP_MIN, Math.min(RIPPLE_AMP_MAX, n)) });
+      range.value = String(visuals().rippleAmp);
+      valEl.textContent = fmt();
+      invalidate();
+    };
+    range.addEventListener('input', () => commit(parseFloat(range.value)));
+    const span = RIPPLE_AMP_MAX - RIPPLE_AMP_MIN;
+    let startValue = 1;
+    let perPx = span / 260;
+    dragHandle(range, {
+      start: () => {
+        range.focus();
+        startValue = visuals().rippleAmp;
+        perPx = span / Math.max(260, range.getBoundingClientRect().width);
+      },
+      move: (_ev, dx) => commit(startValue + dx * perPx),
+    });
+    r.append(range, valEl);
+  }
+
+  // ---- other layers ----
+  bool('Speaker layout in pads', v.rigFace, (b) => setVisuals({ rigFace: b }), {
+    hint: 'Draw the rig and a source trail inside a Panner / Path XY pad.',
+  });
+  bool('Fault heat', v.faults, (b) => setVisuals({ faults: b }), {
+    hint: 'Flash a block that clips, goes non-finite, folds or truncates; cools over ~2 s.',
+  });
+  bool('Chain highlight', v.chain, (b) => setVisuals({ chain: b }));
+  seg('Chain anchor', v.chainMode, [
+    ['hover', 'Pointer'],
+    ['select', 'Selection'],
+  ], (val) => setVisuals({ chainMode: val }), !v.chain);
+  bool('Shade chain by latency', v.latency, (b) => setVisuals({ latency: b }), { disabled: !v.chain });
+
+  const ra = document.createElement('div');
+  ra.className = 'form-actions';
+  const reset = document.createElement('button');
+  reset.textContent = 'Reset live visuals';
+  reset.addEventListener('click', () => {
+    resetVisuals();
+    invalidate();
+    rebuild();
+  });
+  ra.appendChild(reset);
+  sec.appendChild(ra);
+}
 
 function buildAppearance(body: HTMLElement): { refresh: () => void } {
   // Dropped and re-made on every rebuild — the row it updates is replaced too,
@@ -2707,6 +2856,14 @@ function buildAppearance(body: HTMLElement): { refresh: () => void } {
       mk('Reset to 100%', () => resetUiScale(), 'Ctrl + Shift + 0');
       sec.appendChild(ra);
     }
+
+    // LIVE VISUALS (src/ui/visuals) — the animated cable/canvas layer's
+    // settings. These live here, in Appearance, and NOT in the Options menu
+    // where they started: they are how the canvas looks, which is this panel's
+    // whole subject, and Appearance already hosts a non-theme app preference
+    // (UI scale) so the "it's stored outside the Theme" objection does not send
+    // them elsewhere. Deleting the visuals folder means deleting this block.
+    buildLiveVisuals(body, () => ed.renderer.invalidate(), refresh);
 
     const theme = doc.scene.theme as any;
     let curSection = '';

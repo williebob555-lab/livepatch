@@ -1307,6 +1307,207 @@ registerBlock({
     knob('mix', 'Mix', 0, 1, 0.3, { mark: 'mix', affects: ['time', 'feedback'] }),
   ],
 });
+
+// Ripple Pool — delay as distance.
+//
+// Not a simulation of water: a delay network whose delays ARE distances. The
+// input drops in at a fixed inlet; each output is a buoy you drag anywhere in
+// the pool; the delay you hear is how far you dragged it, attenuated by
+// distance, plus one reflection off each of the four walls.
+//
+// The reflections come from the **image-source method** — mirror the inlet
+// across each wall and treat the mirror as another source. That is worth
+// stating because it is why the picture and the sound cannot disagree: the
+// face draws expanding rings from the same five points the kernel reads its
+// taps from, so a wavefront visibly arriving at a buoy *is* the tap sounding.
+//
+// The trap here is dragging a buoy while it plays. A delay line whose read
+// pointer jumps clicks; both engines interpolate between the two samples
+// either side of a fractional read position, and the position itself is
+// recomputed once per quantum (the `delay` kernel's idiom), not per sample.
+//
+// Buoy positions are ordinary document params (normalized to the pool box) so
+// they undo, automate and export like anything else — `face: false` because
+// they are dragged on the artwork, not turned.
+registerBlock({
+  type: 'ripple-pool',
+  title: 'Ripple Pool',
+  category: 'Surround',
+  group: 'Spatial',
+  alsoIn: [{ category: 'Effects', group: 'Time' }],
+  desc: 'Four taps you place in a pool — the delay is the distance you dragged the buoy',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [
+    { id: 'out1', name: 'tap 1', kind: 'audio', dir: 'out' },
+    { id: 'out2', name: 'tap 2', kind: 'audio', dir: 'out' },
+    { id: 'out3', name: 'tap 3', kind: 'audio', dir: 'out' },
+    { id: 'out4', name: 'tap 4', kind: 'audio', dir: 'out' },
+  ],
+  params: [
+    // A SCALE, not a width: metres per 100 px of block. The block's own size is
+    // therefore the pond — drag it bigger and you have dug a larger body of
+    // water with longer delays, rather than stretched a fixed one. That is also
+    // what keeps metres-per-pixel equal on both axes, so a ripple is a circle.
+    // The face prints the resulting pond in metres.
+    knob('size', 'Scale', 2, 300, 45, { unit: 'm/100px', curve: 'log', mark: 'spread', cv: true }),
+    // Measured by the document from the block's size, read by both engines —
+    // a kernel cannot know how big the block is on screen. See `planRipplePool`.
+    { id: 'poolw', name: 'Pond width', type: 'float', min: 0.1, max: 4000, def: 112, widget: 'knob', face: false },
+    { id: 'poolh', name: 'Pond height', type: 'float', min: 0.1, max: 4000, def: 81, widget: 'knob', face: false },
+    knob('damp', 'Damp', 0, 1, 0.55, { mark: 'absorb', cv: true }),
+    knob('walls', 'Walls', 0, 0.95, 0.62, { mark: 'tail', cv: true, affects: ['damp'] }),
+    { id: 'b1x', name: 'Buoy 1 X', type: 'float', min: 0, max: 1, def: 0.333, widget: 'knob', face: false },
+    { id: 'b1y', name: 'Buoy 1 Y', type: 'float', min: 0, max: 1, def: 0.204, widget: 'knob', face: false },
+    { id: 'b2x', name: 'Buoy 2 X', type: 'float', min: 0, max: 1, def: 0.597, widget: 'knob', face: false },
+    { id: 'b2y', name: 'Buoy 2 Y', type: 'float', min: 0, max: 1, def: 0.446, widget: 'knob', face: false },
+    { id: 'b3x', name: 'Buoy 3 X', type: 'float', min: 0, max: 1, def: 0.250, widget: 'knob', face: false },
+    { id: 'b3y', name: 'Buoy 3 Y', type: 'float', min: 0, max: 1, def: 0.742, widget: 'knob', face: false },
+    { id: 'b4x', name: 'Buoy 4 X', type: 'float', min: 0, max: 1, def: 0.792, widget: 'knob', face: false },
+    { id: 'b4y', name: 'Buoy 4 Y', type: 'float', min: 0, max: 1, def: 0.796, widget: 'knob', face: false },
+  ],
+  // Artwork AND real widgets, the Entanglement Field's arrangement: the plate
+  // and the water are painted, but Size/Damp/Walls are ordinary params so they
+  // mirror into the Dock, take MIDI learns and CV, and export onto the face of
+  // a custom block built around this one (docs/07 invariant 2).
+  customFace: 'ripplepool',
+  // Sized so the water is roughly half the block. Below this the pool stops
+  // being something you can place a buoy in with any precision.
+  minW: 300,
+  minH: 340,
+  style: {
+    shape: 'chamfer',
+    fill: '#1d6157',
+    stroke: '#43b3a0',
+    // The title's INK, not its box, centres in the plate band between the top
+    // flange's scribe line (22) and the control recess (44). Measured at 20 the
+    // ink sat high against the scribe; 24 centres it. `ripplePoolLayout` drops
+    // its row by the same 4 so nothing below moves.
+    padTop: 24,
+    // Each tap port is pinned to its buoy's height (`syncRipplePoolPorts`)
+    // rather than auto-spaced down the edge, which is what put tap 1's label
+    // across the control recess.
+    freePorts: true,
+  },
+});
+
+// Mycelium — a branching delay tree that grows.
+//
+// Every junction splits the signal, delays it by that branch's length and loses
+// a little high end, so depth in the tree is audibly depth: a leaf six
+// junctions out is both later and darker than one at two.
+//
+// **The tree is planned in the document layer, not in a kernel.** A kernel sees
+// only its own buffers, and duplicating a branching growth function across two
+// engines is exactly how they drift. So `core/mycelium.ts` grows the tree from
+// `seed` + `growth` + `spread`, picks four fruiting bodies, and ships the
+// RESULT as eight ordinary params — a delay and a depth per tap. The kernel is
+// then four delay lines and four one-poles, which is all it ever needed to be.
+// Same arrangement as the Entanglement Field's `route`.
+//
+// `seed` is what makes a saved patch reopen as the same organism. Growth is
+// deterministic in it, so nothing about the tree is stored except the number
+// that regenerates it.
+registerBlock({
+  type: 'mycelium',
+  title: 'Mycelium',
+  category: 'Effects',
+  group: 'Time',
+  alsoIn: [{ category: 'Surround', group: 'Spatial' }],
+  desc: 'A delay tree that grows — every junction splits it, delays it and darkens it',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [
+    { id: 'out1', name: 'tap 1', kind: 'audio', dir: 'out' },
+    { id: 'out2', name: 'tap 2', kind: 'audio', dir: 'out' },
+    { id: 'out3', name: 'tap 3', kind: 'audio', dir: 'out' },
+    { id: 'out4', name: 'tap 4', kind: 'audio', dir: 'out' },
+  ],
+  params: [
+    // How far the organism has got. Turning it down does not un-grow the tree —
+    // it regrows a smaller one from the same seed, so the shape is stable and
+    // only its extent moves.
+    knob('growth', 'Growth', 0, 1, 0.34, { mark: 'rate', cv: true }),
+    knob('spread', 'Spread', 0, 1, 0.5, { mark: 'spread', cv: true }),
+    knob('damp', 'Damp', 0, 1, 0.42, { mark: 'absorb', cv: true, affects: ['growth'] }),
+    // Reseeding re-rolls the whole organism, so it is a deliberate trip to
+    // Properties rather than something to nudge on the face by accident.
+    { id: 'seed', name: 'Seed', type: 'int', min: 1, max: 999999, def: 4471, step: 1, widget: 'knob', face: false },
+    // Planned, never authored: the delay and depth of each fruiting body the
+    // taps are clamped to. Written by `planMycelium`, read by both engines.
+    { id: 't1ms', name: 'Tap 1 delay', type: 'float', min: 0, max: 4000, def: 120, widget: 'knob', face: false },
+    { id: 't2ms', name: 'Tap 2 delay', type: 'float', min: 0, max: 4000, def: 240, widget: 'knob', face: false },
+    { id: 't3ms', name: 'Tap 3 delay', type: 'float', min: 0, max: 4000, def: 360, widget: 'knob', face: false },
+    { id: 't4ms', name: 'Tap 4 delay', type: 'float', min: 0, max: 4000, def: 480, widget: 'knob', face: false },
+    { id: 't1d', name: 'Tap 1 depth', type: 'int', min: 0, max: 9, def: 1, step: 1, widget: 'knob', face: false },
+    { id: 't2d', name: 'Tap 2 depth', type: 'int', min: 0, max: 9, def: 2, step: 1, widget: 'knob', face: false },
+    { id: 't3d', name: 'Tap 3 depth', type: 'int', min: 0, max: 9, def: 3, step: 1, widget: 'knob', face: false },
+    { id: 't4d', name: 'Tap 4 depth', type: 'int', min: 0, max: 9, def: 4, step: 1, widget: 'knob', face: false },
+  ],
+  customFace: 'mycelium',
+  minW: 300,
+  minH: 340,
+  style: {
+    shape: 'chamfer',
+    fill: '#31220f',
+    stroke: '#7a5227',
+    // 21, three less than Ripple Pool's: against this plate's darker flange the
+    // same 24 read as sitting low. `myceliumLayout` adds the 3 back to its row
+    // so nothing below the title moves.
+    padTop: 21,
+    freePorts: true,
+  },
+});
+
+// Sympathy — only what agrees survives.
+//
+// A bank of modal resonators, each about 55 cents wide, so being a semitone off
+// genuinely does not excite it. Each carries the three real surface modes of a
+// liquid drop (1 : 1.94 : 3.0) with their own decays, and decay falls with
+// pitch — a high film stops ringing sooner, as one does.
+//
+// **The bank is not a setting; it is a population.** Films thin whether or not
+// you are there, a bubble that reaches black film bursts on its own and dumps a
+// transient out of the block, and a new one of some other size is blown
+// elsewhere. So the set of frequencies this block answers to is genuinely
+// different later on. That lifecycle runs in the document (`core/sympathy.ts`,
+// stepped by `core/living.ts`) so the picture and the sound are one bank.
+//
+// `pitch` carries the frequency of the loudest ringing element as 1V/oct — a
+// pitch tracker for free, out of machinery the block was going to run anyway.
+registerBlock({
+  type: 'sympathy',
+  title: 'Sympathy',
+  category: 'Effects',
+  group: 'Resonance',
+  desc: 'A raft of resonators that only answer to what agrees with them — and that dies and is replaced',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [
+    { id: 'out', name: 'out', kind: 'audio', dir: 'out' },
+    { id: 'pitch', name: 'pitch', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    knob('decay', 'Decay', 0, 1, 0.6, { mark: 'tail', cv: true }),
+    // How much of the second and third surface modes get through. Turning it
+    // down leaves the fundamentals, which is a duller raft, not a quieter one.
+    knob('bright', 'Modes', 0, 1, 0.5, { mark: 'highpass', cv: true }),
+    // How fast the films thin. At 0 the raft is frozen — which is the setting
+    // for anyone who wants a patch that sounds the same tomorrow.
+    knob('drift', 'Drift', 0, 2, 1, { mark: 'rate', affects: ['decay'] }),
+    // The raft itself, as one string: frequency, position, film age and life
+    // per bubble. One document value that undoes as a unit — the same
+    // arrangement as the Entanglement Field's route.
+    { id: 'bank', name: 'Raft', type: 'string', def: '', widget: 'select', face: false },
+    // Which film a finger is currently holding still, or −1. Written by the
+    // press-and-hold gesture, read by the kernel AND the face, so the damping
+    // you see is the damping you hear.
+    { id: 'damp', name: 'Damped', type: 'int', min: -1, max: 63, def: -1, step: 1, widget: 'knob', face: false },
+    { id: 'seed', name: 'Seed', type: 'int', min: 1, max: 999999, def: 8123, step: 1, widget: 'knob', face: false },
+  ],
+  customFace: 'sympathy',
+  minW: 300,
+  minH: 350,
+  style: { shape: 'chamfer', fill: '#4b4f57', stroke: '#8e97a3', padTop: 21, freePorts: true },
+});
+
 // Feedback — the block that makes a loop a patchable thing.
 //
 // Cycles already *work*: the executor's topological sort appends whatever the
@@ -2313,6 +2514,105 @@ registerBlock({
   minW: 132,
   minH: 104,
   style: { shape: 'chamfer', fill: '#25313d', stroke: '#68a6d8' },
+});
+
+// Entanglement Field — a router that will not tell you what it is doing.
+//
+// It contains no DSP whatsoever. You drop wire ends anywhere inside the field
+// (they latch where they land — `freePorts`, and the editor creates the port on
+// the drop), and it secretly permutes which of its inputs leaves by which of
+// its outputs. Everything the signal passes through on the way is the user's
+// own patch, re-ordered behind their back: plug a delay, a folder and a filter
+// into the field and Advance re-wires the order you hear them in.
+//
+// Ports are therefore NOT declared here. A fresh block has none at all, and the
+// terminal list is whatever has been dropped into it (`core/entangle.ts`).
+//
+// The routing itself is planned in the document layer, not in a kernel: the
+// promise that a signal which enters can leave depends on which outputs come
+// back round to which inputs through the surrounding patch, and a kernel sees
+// only its own buffers. `route` is the result, shipped like the Matrix's grid.
+registerBlock({
+  type: 'entangle',
+  title: 'Entanglement Field',
+  category: 'Structure & Custom',
+  group: 'Routing',
+  alsoIn: [{ category: 'Effects', group: 'Tools' }],
+  desc: 'Drop wire ends into the field; it secretly re-orders what runs through what. Advance for a new patch, Reverse to retrace',
+  inputs: [],
+  outputs: [],
+  params: [
+    // Advance / Reverse are ORDINARY action params with button widgets, not
+    // arrows drawn into the block's artwork. That is what makes them mirror
+    // into the Dock, take a MIDI learn, and export onto the face of a custom
+    // block that contains this one — a hand-drawn control does none of those
+    // things and, per docs/07 invariant 2, would also be a second copy of hit
+    // geometry that the face and the Dock could drift apart on. The face
+    // artwork below draws the milled recess they sit in, and nothing else.
+    // `docAction`: pressing these re-plans the route from the surrounding patch,
+    // which is document work, so they run in the editor wherever they are
+    // pressed. That also means they are not CV- or MIDI-drivable — a trigger
+    // arriving inside an engine cannot see the graph the plan comes from, and a
+    // port that looked like it advanced the field but silently did nothing is
+    // exactly the trap docs/08 warns about. Settle and Level, which are
+    // ordinary values, take CV normally.
+    // `variant: 'panel'` is the machined key: the mark is engraved into the
+    // button face instead of printed under it, so these read as transport keys
+    // on a panel and cost no mark strip of extra height.
+    { id: 'rev', name: 'Reverse', type: 'action', def: 0, widget: 'button', mark: 'reverse', variant: 'panel', docAction: true },
+    { id: 'adv', name: 'Advance', type: 'action', def: 0, widget: 'button', mark: 'advance', variant: 'panel', docAction: true },
+    // Advancing swaps every crossing at once. Stepping a gain on a running
+    // signal is a click (docs/10 rule 10) and the field is usually full of
+    // feedback paths, where it is a bang — so a configuration change is always
+    // a crossfade, and this is how long it takes.
+    knob('settle', 'Settle', 1, 2000, 120, { unit: 'ms', curve: 'log', cv: true, mark: 'decay' }),
+    knob('gain', 'Level', 0, 2, 1, { cv: true }),
+    // Reseeding re-rolls the whole walk, so it is a deliberate trip to
+    // Properties rather than something to nudge on the face by accident.
+    { id: 'seed', name: 'Seed', type: 'int', min: 1, max: 999999, def: 1, step: 1, widget: 'knob', face: false },
+    // Where the walk currently is, and the configuration that follows from it.
+    // Both are written by the transport, never by hand.
+    { id: 'state', name: 'State', type: 'int', min: 0, max: 1000000, def: 0, step: 1, widget: 'knob', face: false },
+    { id: 'route', name: 'Route', type: 'string', def: '', widget: 'select', face: false },
+  ],
+  customFace: 'entangle',
+  // The face is meant to be mostly field: at this size the viewport is ~210 of
+  // 320 px tall, everything else being the two flanges and one control row
+  // (`entangleface.ts`). Wide enough that the row fits without wrapping.
+  minW: 320,
+  minH: 350,
+  style: {
+    shape: 'custom',
+    // A machined plate: chamfered corners, and a shallow step milled into the
+    // middle of each long side. Greebling in the silhouette itself — small and
+    // regular, so it reads as a machined part rather than as a growth.
+    customShape: [
+      { x: 0.05, y: 0 }, { x: 0.95, y: 0 }, { x: 1, y: 0.08 },
+      { x: 1, y: 0.33 }, { x: 0.98, y: 0.37 }, { x: 0.98, y: 0.63 }, { x: 1, y: 0.67 },
+      { x: 1, y: 0.92 }, { x: 0.95, y: 1 }, { x: 0.05, y: 1 }, { x: 0, y: 0.92 },
+      { x: 0, y: 0.67 }, { x: 0.02, y: 0.63 }, { x: 0.02, y: 0.37 }, { x: 0, y: 0.33 },
+      { x: 0, y: 0.08 },
+    ],
+    fill: '#161a1f',
+    stroke: '#5c6773',
+    freePorts: true,
+    // Reserves the top flange. The title (face item y = 0, text drawn on the
+    // box's middle line) then sits centred in the plate band between the
+    // flange's scribe line at 22 and the top of the control recess at 44 —
+    // clear of the scribe above and of the recess edge below, which it used to
+    // sit across. The control row hangs below it and the artwork's viewport
+    // starts under that (`entangleFieldRect`).
+    // 20, not the 23 that centres the item's BOX: the text is drawn on the
+    // box's middle line, so the box's centre is not the ink's. Measured off the
+    // canvas, the glyphs run from the cap tops to the 'g' descender, and at 23
+    // that block sat 8 px under the scribe line and 1 px off the recess. 20
+    // puts 4 px of air on each side of the ink, which is what reads as centred.
+    padTop: 20,
+    // Cables cross the plate rather than vanishing behind it: a field with
+    // eight things plugged into it is unreadable otherwise, and it is what the
+    // block is *for* that the wires are visible right up to where they latch.
+    wireLayer: 'behind',
+  },
 });
 
 // Comment — a note to whoever opens this patch next, including you.

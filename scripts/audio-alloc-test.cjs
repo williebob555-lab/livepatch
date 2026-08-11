@@ -70,6 +70,13 @@ const TYPES = [
   // Tempo Follow runs a correlation sweep on the audio path — the one place in
   // the library that does real analysis there.
   ['tempo-follow', {}],
+  // The dynamic blocks (docs/14). Every one holds a long ring or a bank of
+  // recursive filters and resolves geometry per quantum, which is exactly the
+  // shape that grows an accidental array literal — and Sympathy takes a STRING
+  // param (the raft) that must be parsed in `setParam` and never in `process`.
+  ['ripple-pool', {}],
+  ['mycelium', {}],
+  ['sympathy', { bank: '110,0.3,0.4,0.2,60;220,0.6,0.5,0.5,80;330,0.4,0.7,0.8,50' }],
 ];
 
 const built = [];

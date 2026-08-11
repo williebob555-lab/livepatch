@@ -1,6 +1,6 @@
 # 08 — Extending: Adding Blocks, Widgets, Kernels, Visuals
 
-_Last verified: 2026-08-02._
+_Last verified: 2026-08-07._
 
 This is the how-to reference. Follow the checklists exactly — most of the steps
 prevent a specific silent failure (a block that does nothing on one engine, a
@@ -185,6 +185,47 @@ grep — read the loop, they're covered.)
 
 ---
 
+## Add a DYNAMIC block (a "give it life" block)
+
+A block from the [`14-dynamic-blocks.md`](14-dynamic-blocks.md) family — one
+whose face keeps changing on its own and whose controls *are* its picture — is
+an ordinary block plus **exactly four extra wiring points.** Getting three of
+four right produces a block that looks correct until something is dragged, which
+is why they are listed rather than described.
+
+1. **`ARTWORK_FACES`** (`src/core/registry.ts`). Add the `customFace` name.
+   That one list answers two questions at once: the face paints artwork *and*
+   keeps its face items (so its title and any real params still mirror into the
+   Dock and take MIDI learns), and the block must come up **fixed-size** — an
+   auto-sized block wraps its face ITEMS, so artwork the layout knows nothing
+   about gets shrunk to the height of a control row.
+2. **`src/core/dynamic.ts`.** Add a case to `dynamicLayout` (the hand-authored
+   face layout — `autoFace` would wrap the controls onto rows the artwork has
+   already spent) and one to `syncDynamic` (park the ports, run any
+   document-layer planning, return the param ids that changed). `syncDynamic`
+   must be idempotent and derived purely from the block: it is called on
+   creation, on **every frame of a resize drag**, and on both param-write paths.
+   Ripple Pool shipped with its planner written and nothing calling it, so
+   dragging the block bigger dug a pond neither engine heard about.
+3. **`src/ui/artworkdrag.ts`** if the block has gestures. `artworkDown` /
+   `artworkMove` / `artworkUp`, dispatched on `customFace`. The hit tests
+   themselves belong in the block's `core/` module, beside the numbers the face
+   paints from — a hit test computed from different constants than the picture
+   is a control that is not where it looks.
+4. **`src/ui/render.ts`**: the paint dispatch, and the block's `…FacePrune` in
+   `pruneFaceStates` (per-block animation state is a module Map keyed by block
+   id; without the prune it outlives the block). Plus a tile in `DYNAMIC_TILE`
+   (`src/ui/thumbnail.ts`) — the real painters are sized in absolute pixels
+   against a 300 px block and render one bezel at 96 × 54.
+
+If the block **evolves over time** rather than being a pure function of a seed,
+it also needs a case in `src/core/living.ts`, and its evolving state must live
+in a document param that the face and both engines all read. Two simulations —
+one for the picture, one for the sound — is how an "alive" block ends up reading
+as decoration with extra steps.
+
+---
+
 ## Add a control / CV block
 
 A pure emitter sets `isControl: true` and outputs a `role:'cv'` port. Its first
@@ -328,6 +369,47 @@ example — `in1..inN` and `out1..outM`, the two sides independent.
    **tolerant on parse** rather than migrated: the Matrix's grid is stored as
    ragged rows and padded/truncated to the current counts on read, so there is
    no migration step to get out of step with the ports.
+
+## Add a block whose PORTS ARE CREATED BY THE USER
+
+The Matrix's port count is a param; the Entanglement Field's is "however many
+wire ends have been dropped into it". Same class of problem — a port list that
+is not a constant — with three extra rules. The worked example is
+`core/entangle.ts` + `Editor.fieldLatchAt`; the design notes are in
+[`07-ui.md`](07-ui.md).
+
+1. **`style.freePorts` + `Port.free` is the whole persistence story.** Free
+   positions are block-box *fractions*, so a port created at a drop point rides
+   the block when it moves and keeps its place when it is resized. Do not invent
+   a parallel store for them.
+2. **Infer the direction, never guess it.** A wire end carries its far end's
+   direction and kind; that is what decides whether the new port is an input or
+   an output. When the far end says nothing (floating, or a branch off a net
+   with no source), create nothing and let the drop behave normally.
+3. **Ids are a high-water mark and are never recycled**, and a port with no wire
+   is removed in `syncRigPorts`. Reusing an id means a later wire can inherit a
+   dead port's identity; leaving wireless ports behind slowly fills the block
+   with sockets nothing can reach.
+
+## Add an action that the EDITOR runs (`ParamSpec.docAction`)
+
+Most `action` params are pressed and sent to a kernel. Some cannot be: the
+Entanglement Field's Advance has to re-plan a route from the *surrounding graph*
+before anything can be told anything, and no engine can see that.
+
+`docAction: true` routes the press through `Editor.runAction` from wherever it
+happened — the block face (`widgetDown`), a Dock clone (`beginOperate` →
+`runDockAction`), or a custom block's face — so the three surfaces share one
+implementation instead of three. Add the case to `runAction`, keyed on the param
+id.
+
+**A `docAction` is not CV- or MIDI-drivable, and that is the point.** Both of
+those are applied inside an engine. If your action needs the document, a CV port
+for it would be a port that appears to work and silently does nothing — the
+failure this document exists to prevent. Either leave the capability out (and
+say so in the def, as `entangle` does), or build the engine→renderer trigger
+with the transport pattern above so the renderer does the work on the engine's
+edge.
 
 ## Add a hardware IO block (native only)
 

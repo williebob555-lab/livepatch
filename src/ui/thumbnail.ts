@@ -6,7 +6,7 @@
 // tiles genuinely match the canvas — but this is a STATIC routine, separate
 // from the render hot path (see docs/07-ui.md). No live visuals/levels/mods.
 // ============================================================================
-import { BlockDef, defaultParams, defaultPorts, getDef, paramSpec } from '../core/registry';
+import { BlockDef, defaultParams, defaultPorts, getDef, isArtworkFace, paramSpec } from '../core/registry';
 import { Block, Port, Theme } from '../core/types';
 import { RollNote } from '../core/rolls';
 import { traceBlockShape, portPos } from './geometry';
@@ -22,6 +22,99 @@ const portColor = (theme: Theme, p: Port): string =>
         ? theme.portControlColor
         : theme.portAudioColor;
 
+/**
+ * Library-tile miniatures for the dynamic blocks.
+ *
+ * Keyed by `customFace`, drawn in tile-relative coordinates. Deliberately not
+ * the real face painters: those measure in absolute pixels against a 300 px
+ * block and would fill a 96 × 54 tile with one bezel. What a tile has to do is
+ * say *which block this is* at a glance.
+ */
+const DYNAMIC_TILE: Record<string, (g: CanvasRenderingContext2D, w: number, h: number, theme: Theme) => void> = {
+  // Expanding rings from an inlet, with a buoy on one of them.
+  ripplepool: (g, w, h) => {
+    g.fillStyle = '#052831';
+    g.fillRect(w * 0.08, h * 0.14, w * 0.84, h * 0.72);
+    const ix = w * 0.24;
+    const iy = h * 0.36;
+    for (let i = 1; i <= 3; i++) {
+      g.strokeStyle = `rgba(70,210,255,${0.7 - i * 0.16})`;
+      g.lineWidth = 1.4;
+      g.beginPath();
+      g.arc(ix, iy, i * Math.min(w, h) * 0.16, 0, Math.PI * 2);
+      g.stroke();
+    }
+    g.fillStyle = '#d0a83f';
+    g.beginPath();
+    g.arc(ix, iy, 2.6, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = '#ff6f3c';
+    g.beginPath();
+    g.moveTo(w * 0.66, h * 0.68);
+    g.lineTo(w * 0.74, h * 0.68);
+    g.lineTo(w * 0.72, h * 0.54);
+    g.lineTo(w * 0.68, h * 0.54);
+    g.closePath();
+    g.fill();
+    g.strokeStyle = '#43b3a0';
+    g.lineWidth = 1;
+    g.strokeRect(w * 0.08, h * 0.14, w * 0.84, h * 0.72);
+  },
+  // A branching tree with lit hyphae and one fruiting body.
+  mycelium: (g, w, h) => {
+    g.fillStyle = '#100a04';
+    g.fillRect(w * 0.08, h * 0.14, w * 0.84, h * 0.72);
+    const root = { x: w * 0.16, y: h * 0.62 };
+    const seg = (x0: number, y0: number, x1: number, y1: number, lw: number, a: number): void => {
+      g.strokeStyle = `rgba(${Math.round(40 + 200 * a)},${Math.round(120 + 135 * a)},${Math.round(105 + 130 * a)},1)`;
+      g.lineWidth = lw;
+      g.lineCap = 'round';
+      g.beginPath();
+      g.moveTo(x0, y0);
+      g.lineTo(x1, y1);
+      g.stroke();
+    };
+    const m1 = { x: w * 0.42, y: h * 0.5 };
+    const m2 = { x: w * 0.44, y: h * 0.74 };
+    seg(root.x, root.y, m1.x, m1.y, 3, 0.7);
+    seg(root.x, root.y, m2.x, m2.y, 2.4, 0.35);
+    seg(m1.x, m1.y, w * 0.68, h * 0.34, 2, 0.9);
+    seg(m1.x, m1.y, w * 0.7, h * 0.58, 1.6, 0.3);
+    seg(m2.x, m2.y, w * 0.72, h * 0.82, 1.6, 0.25);
+    g.lineCap = 'butt';
+    g.fillStyle = '#ff5d78';
+    g.beginPath();
+    g.ellipse(w * 0.68, h * 0.32, 5, 3.4, 0, Math.PI, 0);
+    g.fill();
+    g.strokeStyle = '#7a5227';
+    g.lineWidth = 1;
+    g.strokeRect(w * 0.08, h * 0.14, w * 0.84, h * 0.72);
+  },
+  // A raft: three bubbles of different sizes, in film colours.
+  sympathy: (g, w, h) => {
+    g.fillStyle = '#16221f';
+    g.beginPath();
+    g.ellipse(w / 2, h * 0.58, w * 0.44, h * 0.36, 0, 0, Math.PI * 2);
+    g.fill();
+    const bubbles: Array<[number, number, number, string]> = [
+      [0.34, 0.55, 0.17, '#e4c98a'],
+      [0.62, 0.46, 0.12, '#d97fc0'],
+      [0.56, 0.72, 0.09, '#8fb7e8'],
+    ];
+    for (const [bx, by, br, col] of bubbles) {
+      for (let c = 0; c < 3; c++) {
+        g.strokeStyle = col;
+        g.globalAlpha = 0.85 - c * 0.24;
+        g.lineWidth = c === 0 ? 1.8 : 1;
+        g.beginPath();
+        g.ellipse(w * bx, h * by, Math.min(w, h) * br * (1 - c * 0.2), Math.min(w, h) * br * (1 - c * 0.2), 0, 0, Math.PI * 2);
+        g.stroke();
+      }
+    }
+    g.globalAlpha = 1;
+  },
+};
+
 /** Construct a throwaway instance of a def, laid out and sized for drawing. */
 function transientBlock(def: BlockDef, theme: Theme, portsOverride?: Port[]): Block {
   const b: Block = {
@@ -30,7 +123,10 @@ function transientBlock(def: BlockDef, theme: Theme, portsOverride?: Port[]): Bl
     name: def.title,
     pos: { x: 0, y: 0 },
     size: { w: def.minW ?? 120, h: def.minH ?? 60 },
-    autoSize: true,
+    // An artwork face has few or no widgets, so auto-sizing collapses it to the
+    // height of a title and the tile draws a sliver. These come up at their
+    // declared minimum — the tile scales to fit either way.
+    autoSize: !isArtworkFace(def),
     ports: portsOverride ? portsOverride.map((p) => ({ ...p })) : defaultPorts(def),
     params: defaultParams(def),
     style: def.style ? { ...def.style } : {},
@@ -58,8 +154,49 @@ function drawBlockBody(g: CanvasRenderingContext2D, b: Block, def: BlockDef, the
   // drawn as a representative dark frame instead of an engine feed.
   if (def.customFace === 'cassette') {
     drawCassetteShell(g, 0, 0, w, h, theme, null);
+  } else if (def.customFace === 'entangle') {
+    // A miniature of the plate: the viewport, three sockets and a track between
+    // two of them. Drawn to the TILE rather than by calling the real painter —
+    // that one is sized in absolute px against a 300 px block, so at ~96 × 54 it
+    // renders a bezel and nothing else, which is what made the Library entry
+    // look broken. The tile has to say "a dark window with things in it".
+    const fx = w * 0.1;
+    const fy = h * 0.3;
+    const fw = w * 0.8;
+    const fh = h * 0.6;
+    traceBlockShape(g, fx, fy, fw, fh, st.shape ?? 'rounded', 3, st.customShape);
+    g.fillStyle = '#070a0d';
+    g.fill();
+    g.strokeStyle = '#3d4854';
+    g.lineWidth = 1;
+    g.stroke();
+    const pts = [
+      { x: fx + fw * 0.2, y: fy + fh * 0.3 },
+      { x: fx + fw * 0.78, y: fy + fh * 0.45 },
+      { x: fx + fw * 0.42, y: fy + fh * 0.78 },
+    ];
+    g.strokeStyle = '#8fd4e2';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(pts[0].x, pts[0].y);
+    g.quadraticCurveTo(fx + fw * 0.42, fy + fh * 0.16, pts[1].x, pts[1].y);
+    g.stroke();
+    for (const p of pts) {
+      g.fillStyle = '#dff2f8';
+      g.beginPath();
+      g.arc(p.x, p.y, 1.6, 0, Math.PI * 2);
+      g.fill();
+    }
   } else if (def.customFace === 'roll') {
     drawRollShell(g, 0, 0, w, h, theme, null, null);
+  } else if (DYNAMIC_TILE[def.customFace ?? '']) {
+    // The "give it life" blocks (docs/14). Their real painters are sized in
+    // absolute pixels against a 300 px block, so at ~96 × 54 they render a
+    // bezel and nothing else — the same failure the Entanglement Field's tile
+    // was written to avoid. Each tile below is a MINIATURE of what the block
+    // looks like, drawn to the tile's own proportions: enough for someone
+    // scanning the Library to tell the pool from the tree.
+    DYNAMIC_TILE[def.customFace!](g, w, h, theme);
   } else if (def.customFace === 'comment') {
     // Ruled lines, not real text: the tile is ~40 px tall and any legible
     // sample string would be a lie about what the block contains.

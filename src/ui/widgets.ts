@@ -5,6 +5,7 @@
 import { ParamSpec } from '../core/registry';
 import { ControlStyle, ParamValue, Theme } from '../core/types';
 import { setFont, uiFont } from './canvastext';
+import { drawPanelGlyph } from './glyphs';
 
 export const val2norm = (spec: ParamSpec, v: number): number => {
   const min = spec.min ?? 0;
@@ -1119,6 +1120,55 @@ export function paintWidget(
   if (spec.widget === 'button') {
     const pressed = value === 1 || value === true || mod === 1;
     const caption = pressed ? cs?.onLabel ?? label : label;
+    if (variant === 'panel') {
+      // A machined key: square body, milled bevel, and the spec's `mark` glyph
+      // ENGRAVED into the face instead of a caption. This is the front-panel
+      // vocabulary the mark strip already speaks, moved onto the key itself —
+      // a transport button on hardware carries its symbol, not its name, and a
+      // word centred in a 56 px box was the "janky" look this replaces.
+      const inset = 1.5;
+      const bx = r.x + inset;
+      const by = r.y + inset;
+      const bw = r.w - inset * 2;
+      const bh = r.h - inset * 2;
+      // The recess the key sits in.
+      g.fillStyle = '#0d1116';
+      g.beginPath();
+      (g as any).roundRect(r.x, r.y, r.w, r.h, 3);
+      g.fill();
+      // The key.
+      g.fillStyle = pressed ? accent : hot ? '#2b333d' : '#1e242b';
+      g.strokeStyle = pressed ? accent : hot ? '#7d8b99' : '#4d5865';
+      g.lineWidth = 1;
+      g.beginPath();
+      (g as any).roundRect(bx, by, bw, bh, 2);
+      g.fill();
+      g.stroke();
+      // Top bevel: one hairline, not a gradient — flat panel, lit from above.
+      if (!pressed) {
+        g.strokeStyle = 'rgba(255,255,255,0.07)';
+        g.beginPath();
+        g.moveTo(bx + 2, by + 1);
+        g.lineTo(bx + bw - 2, by + 1);
+        g.stroke();
+      }
+      const sym = spec.mark;
+      if (sym) {
+        const s = Math.min(bw, bh) * 0.46;
+        drawPanelGlyph(
+          g,
+          sym,
+          { x: bx + bw / 2 - s / 2, y: by + bh / 2 - s / 2, w: s, h: s },
+          pressed ? '#0b1520' : hot ? '#dff2f8' : '#b9cdd6',
+          1.5,
+        );
+      } else if (showLabel) {
+        g.fillStyle = pressed ? '#0b1520' : text;
+        g.textAlign = 'center';
+        g.fillText(caption, r.x + r.w / 2, r.y + r.h / 2);
+      }
+      return;
+    }
     if (variant === 'round') {
       // Drum pad: a circle inscribed in the box.
       const br = Math.min(r.w, r.h) / 2 - 2;

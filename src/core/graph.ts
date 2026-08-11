@@ -22,7 +22,10 @@ import {
   defaultTheme,
   emptyScene,
 } from './types';
-import { defaultParams, defaultPorts, getDef } from './registry';
+import { defaultParams, defaultPorts, getDef, isArtworkFace } from './registry';
+import { isTerminal, newTerminalId, replanEntangle } from './entangle';
+import { dynamicLayout, syncDynamic } from './dynamic';
+
 import { defaultDeviceFor } from './prefs';
 import { activeRig, dropStaleCals, setActiveRig } from './rig';
 
@@ -407,13 +410,33 @@ export class GraphDoc {
       name: type === 'portal-in' ? 'in' : type === 'portal-out' ? 'out' : def.title,
       pos: { ...pos },
       size: { w: def.minW ?? 120, h: def.minH ?? 60 },
-      autoSize: true,
+      // An auto-size block wraps its FACE ITEMS. A block whose artwork occupies
+      // space the layout knows nothing about — the field, the water, the loam,
+      // the cloth — would therefore shrink to the height of its control row and
+      // clip the part that matters, so it comes up fixed and is resized by hand.
+      // `ARTWORK_FACES` is the single list (`core/registry.ts`); adding a
+      // dynamic block to it is what stops this getting half-registered.
+      autoSize: !isArtworkFace(def),
       ports: defaultPorts(def),
       params: defaultParams(def),
       style: {},
       layout: [],
     };
     if (def.style) b.style = { ...def.style };
+    // Every dynamic block ships with a HAND-AUTHORED face layout: its controls
+    // go on the row the artwork left for them. Left to `autoFace` they wrap and
+    // spend a third of the block on widgets, and the artwork's own bands (a
+    // field top, a pool top, a waterline) would have to clear whatever the
+    // layout happened to do. Authoring it is what makes that a fact rather than
+    // a measurement that drifts. `syncDynamic` then parks the ports and runs
+    // any document-layer planning — Mycelium's tree, Ripple Pool's pond,
+    // Sympathy's raft — so a block that has just been dragged out already
+    // agrees with its own picture instead of waiting to be touched.
+    const dyn = dynamicLayout(def.customFace);
+    if (dyn) {
+      b.layout = dyn;
+      syncDynamic(b);
+    }
     // A hardware block comes up on the user's preferred device (Options ▸
     // Devices) instead of "(default)" — the setting exists precisely so this
     // does not have to be picked by hand on every new block. No preference
@@ -821,6 +844,14 @@ export class GraphDoc {
           // that is not a constant — so it is re-derived in the same place
           // rather than at every site that can edit the counts.
           if (this.syncMatrixPorts(g, b)) changed = true;
+        } else if (b.type === 'entangle') {
+          // A port list that is not a constant, like the Matrix's — except the
+          // counts are not a param here, they are however many wire ends have
+          // been dropped into the field. All this has to do is clear away
+          // terminals whose wire has gone (deleted, or dragged out to somewhere
+          // else) and re-plan if the route was written against a set of
+          // terminals that no longer exists.
+          if (this.syncEntangleTerminals(g, b)) changed = true;
         } else if (b.type === 'chan-split' || b.type === 'chan-merge') {
           // A count *and* a width: Count sets how many narrow ports the fanned
           // side has, and the single wide port's width follows Count (doubled in
@@ -902,6 +933,61 @@ export class GraphDoc {
     // Anything else on the block (a `cv:` port added by the user) stays put.
     for (const p of b.ports) if (!wanted.has(p.id)) ports.push(p);
     b.ports = ports;
+    return changed;
+  }
+
+  /**
+   * Create a terminal on an Entanglement Field where a wire end was dropped.
+   *
+   * The position is stored as block-box fractions (`Port.free`, which the
+   * block's `freePorts` style enables), so the socket rides the block when it
+   * is moved and holds its place in the field when it is resized. Ids are a
+   * high-water mark and never recycled — a wire can therefore never inherit a
+   * dead terminal's identity by landing on its id.
+   */
+  addFieldTerminal(block: Block, dir: PortDir, kind: SignalKind, free: Vec2): Port {
+    const port: Port = {
+      id: newTerminalId(block, dir),
+      name: '',
+      // The terminal takes the cable's own kind, so the field carries audio,
+      // MIDI, tape and roll alike — and only ever pairs like with like.
+      kind,
+      dir,
+      // Derived only: a free port ignores edge/t, but the fields are not
+      // optional and the wire's exit side is read off `edge` (`portNormal`).
+      edge: dir === 'in' ? 'left' : 'right',
+      t: 0.5,
+      free: { x: free.x, y: free.y },
+      showLabel: false,
+    };
+    block.ports.push(port);
+    this.touch('structure');
+    return port;
+  }
+
+  /**
+   * Drop Entanglement Field terminals that no longer have a wire on them, and
+   * re-plan the route when the terminal set has moved under it.
+   *
+   * A terminal exists *because* a wire was dropped into the field, so one with
+   * no wire is not an empty socket waiting to be used — it is the ghost of a
+   * cable that has been pulled out, and leaving it behind would slowly fill the
+   * field with sockets nothing can ever reach.
+   */
+  private syncEntangleTerminals(g: Graph, b: Block): boolean {
+    const wired = new Set<string>();
+    for (const w of g.wires)
+      for (const end of [w.a, w.b]) if (end.port?.blockId === b.id) wired.add(end.port.portId);
+    const before = b.ports.length;
+    b.ports = b.ports.filter((p) => !isTerminal(p.id) || wired.has(p.id));
+    const changed = b.ports.length !== before;
+    // The stored route may name terminals that just went away. `parseRoute`
+    // drops stale ids on read, so this is only about keeping what is saved
+    // honest — and about re-planning while the field still has both sides.
+    if (changed) {
+      const route = replanEntangle(g, b);
+      if (route !== b.params.route) b.params.route = route;
+    }
     return changed;
   }
 
@@ -1118,6 +1204,12 @@ export class GraphDoc {
     for (const id of ids) this.collectWireTree(id, doomed);
     const g = this.graph;
     g.wires = g.wires.filter((w) => !doomed.has(w.id));
+    // A port that exists BECAUSE a wire was dropped on it has to go when the
+    // wire does — however the wire went. Routing this through the editor's
+    // release path only covered cables pulled out by hand, and left a ghost
+    // socket behind for Delete, the context menu, cut, and every other way a
+    // wire can be removed (`syncEntangleTerminals`).
+    this.syncRigPorts();
     this.touch('structure');
   }
   deleteBlocks(ids: string[]): void {
@@ -1132,6 +1224,9 @@ export class GraphDoc {
     g.wires = g.wires.filter((w) => !doomedWires.has(w.id));
     // Portals removed inside a subgraph must reflect on the parent block.
     this.syncAllSubgraphPorts();
+    // Deleting the block on the far end of a cable takes the cable with it, and
+    // therefore the Entanglement Field terminal it was plugged into.
+    this.syncRigPorts();
     // A docked widget cannot outlive the block it mirrors.
     this.pruneDock();
     this.touch('structure');
@@ -1150,6 +1245,10 @@ export class GraphDoc {
     const b = this.block(blockId);
     if (!b) return;
     b.params[paramId] = v;
+    // Programmatic writes (Properties, automation, undo replay) must re-plan a
+    // dynamic block too — the live UI path does the same in `setParamLive`.
+    // Without it an automated Growth grows a tree nothing is tapped from.
+    syncDynamic(b);
     this.touch('param');
   }
 

@@ -26,6 +26,13 @@ import { MenuItem, buildModal, confirmModal, promptModal, showContextMenu } from
 import { checkForUpdatesFlow, checkForUpdatesQuietly } from './updates';
 import { installAndroidUpdateBridge, isAndroidApp } from './androidupdate';
 import { setEqDisplayRate } from './widgets';
+// LIVE VISUALS (src/ui/visuals) — the settings UI lives in the Appearance
+// panel (`buildLiveVisuals` in `panels.ts`); shell only clears fault heat on a
+// scene load.
+import { clearFaults } from './visuals';
+// MINIONS (src/ui/minions) — clear live characters/marks on scene load, same
+// contract as clearFaults. Deletable with the folder.
+import { clearMinions } from './minions/layer';
 
 let ed: Editor;
 let modeBtn: HTMLButtonElement;
@@ -68,6 +75,14 @@ export async function doSaveAs(): Promise<void> {
  */
 function afterSceneLoad(): void {
   syncRolls();
+  // LIVE VISUALS: fault heat is about what just happened *here*. Carrying it
+  // across a scene load would warn about a patch that is no longer on screen —
+  // and block ids repeat across saves of the same scene, so it would land on
+  // an unrelated block rather than harmlessly on nothing.
+  clearFaults();
+  // MINIONS: same reasoning — a work mark or a character's job belongs to the
+  // scene that was on screen, and block ids repeat across saves.
+  clearMinions();
 }
 
 export async function doLoad(name?: string): Promise<void> {

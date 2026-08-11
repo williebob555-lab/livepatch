@@ -109,6 +109,31 @@ export interface ParamSpec {
    */
   dialogAction?: boolean;
   /**
+   * Action button whose work is done by the EDITOR against the document, not
+   * by a kernel — the Entanglement Field's Advance/Reverse, which have to
+   * re-plan a route from the surrounding patch before any engine can be told
+   * anything. Like `dialogAction` it routes through `Editor.runAction` from
+   * wherever it was pressed (block face, Dock clone, a custom block's face), so
+   * the three surfaces share one implementation instead of three.
+   *
+   * Deliberately NOT CV- or MIDI-drivable: those arrive inside an engine, which
+   * cannot see the graph the route is planned from. A port that looked like it
+   * advanced the field and silently did nothing is the exact failure docs/08
+   * warns about, so the capability is absent rather than fake.
+   */
+  docAction?: boolean;
+  /**
+   * Default paint variant for this control, used when the instance has no
+   * `ControlStyle.variant` of its own — the block ships looking the way its
+   * panel wants, and the user can still restyle any single widget.
+   *
+   * Needed because `BlockDef.style` is the only default applied on creation and
+   * it covers the block, not its controls. Without it a def could only get a
+   * non-default widget look by hand-writing `controls` into factory data, which
+   * is how `keys`' pad layout stayed unreachable for a release.
+   */
+  variant?: string;
+  /**
    * A string param that holds a file/bundle path. Properties shows a native OS
    * picker ("Browse…") instead of a raw text box. 'vst3' picks a .vst3 plugin.
    */
@@ -198,7 +223,7 @@ export interface BlockDef {
   /** Live visual painted on the block face, fed by the engine. */
   visual?: VisualKind;
   /** Fully custom-drawn face (renderer special case) instead of face items. */
-  customFace?: 'cassette' | 'roll' | 'comment';
+  customFace?: 'cassette' | 'roll' | 'comment' | 'entangle' | 'ripplepool' | 'mycelium' | 'sympathy';
   /**
    * Never reaches an engine: the compiler skips the block entirely, so it has
    * no compiled node, no kernel, and no place in the parity audit. For blocks
@@ -229,6 +254,28 @@ export interface BlockDef {
 }
 
 const defs = new Map<string, BlockDef>();
+
+/**
+ * Custom faces that paint artwork **as well as** showing their face items,
+ * rather than instead of them.
+ *
+ * `customFace` normally means "this block draws itself and has no widgets"
+ * (Cassette, Roll, Comment). Every block in the "give it life" family
+ * (docs/14-dynamic-blocks.md) means the other thing: the plate is artwork, but
+ * its title and any real params are ordinary face items, so they mirror into
+ * the Dock, take MIDI learns and CV, and export onto the face of a custom block
+ * built around one (docs/07 invariant 2).
+ *
+ * The same set answers a second question, for the same reason: **these blocks
+ * must not auto-size.** An auto-sized block wraps its FACE ITEMS, and artwork
+ * the layout knows nothing about — the field, the water, the loam, the cloth —
+ * would be shrunk away to the height of a control row. One list, so adding a
+ * dynamic block cannot get half-registered.
+ */
+export const ARTWORK_FACES: ReadonlySet<string> = new Set(['entangle', 'ripplepool', 'mycelium', 'sympathy']);
+
+/** Whether this block paints artwork under its face items (see `ARTWORK_FACES`). */
+export const isArtworkFace = (def: BlockDef): boolean => !!def.customFace && ARTWORK_FACES.has(def.customFace);
 
 export function registerBlock(def: BlockDef): void {
   if (defs.has(def.type)) throw new Error(`duplicate block type: ${def.type}`);
