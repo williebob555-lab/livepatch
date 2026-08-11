@@ -213,6 +213,20 @@ const PATHS: Record<string, number[][][]> = {
     [[0, 1], [0.1, 0.06], [0.24, 1], [0.34, 0.53]],
     [[0.62, 1], [0.62, 0.06], [0.76, 0.06], [0.76, 1], [0.9, 1], [0.9, 0.06], [1, 0.06]],
   ],
+  // --- transport ------------------------------------------------------------
+  // A chevron against a stop bar: "step one configuration on / back", not
+  // "play" or "fast forward". The Entanglement Field's two buttons are the
+  // whole of its front panel, so they get a printed mark like any other
+  // hardware control rather than an arrow drawn into the block's artwork.
+  advance: [
+    [[0.24, 0.06], [0.62, 0.5], [0.24, 0.94]],
+    [[0.76, 0.06], [0.76, 0.94]],
+  ],
+  reverse: [
+    [[0.76, 0.06], [0.38, 0.5], [0.76, 0.94]],
+    [[0.24, 0.06], [0.24, 0.94]],
+  ],
+
   /** A line pivoting about its centre. */
   tilt: [
     [[0.08, 0.5], [0.34, 0.5]],

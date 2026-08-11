@@ -511,7 +511,11 @@ export const defaultTheme = (): Theme => ({
   wireMidiColor: '#7ee08a',
   wireTapeColor: '#e8a13d',
   wireRollColor: '#8ad6c8',
-  bundleSpacing: 5,
+  // Daylight BETWEEN bundled cables, edge to edge — 0 means touching, which is
+  // what a bundle is meant to look like. It is not the lane pitch: the ribbon
+  // adds each cable's real drawn width (core + border, see
+  // `Renderer.bundleHalf`) on top, so cables never overlap whatever this is.
+  bundleSpacing: 0,
   wireCoreColor: '#e8eef8',
   wireWideExtra: 2,
   wireLoopColor: '#e0b24f',

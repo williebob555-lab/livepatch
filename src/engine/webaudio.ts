@@ -36,12 +36,22 @@ export interface Unit {
   inlet(port: string): AudioNode | AudioParam | null;
   outlet(port: string): AudioNode | null;
   setParam(id: string, v: ParamValue): void;
-  midiIn?(ev: MidiEvent): void;
+  /** `port` is the unit's own in-port the event arrived on — only units that
+   *  route per port (the Entanglement Field) look at it. Mirrors the native
+   *  `Kernel.midiIn` signature. */
+  midiIn?(ev: MidiEvent, port?: string): void;
   setMidiOut?(cb: ((ev: MidiEvent) => void) | null): void;
+  /**
+   * Per-port MIDI send, for units with more than one MIDI out port. `setMidiOut`
+   * is one callback per unit and could only ever broadcast to all of them.
+   */
+  setMidiOutAt?(port: string, cb: ((ev: MidiEvent) => void) | null): void;
   /** Tape sink: receive a cassette (asset) reference from a tape net. */
-  tapeIn?(ref: TapeRef | null): void;
+  tapeIn?(ref: TapeRef | null, port?: string): void;
   /** Tape source: push the current cassette ref on connect and on change. */
   setTapeOut?(cb: ((ref: TapeRef | null) => void) | null): void;
+  /** Per-port tape/roll send (see `setMidiOutAt`). */
+  setTapeOutAt?(port: string, cb: ((ref: TapeRef | null) => void) | null): void;
   /**
    * Same asset id, new samples. Implement it wherever `getCassetteBuffer` is
    * called and the result kept — see `UnitEnv.assetChanged`.
@@ -415,15 +425,22 @@ export class WebAudioEngine implements EngineAdapter {
     const tapeConnected = new Set<Unit>();
     for (const net of g.nets) {
       if (net.kind === 'midi') {
+        // The sink PORT travels with the sink: a unit with several MIDI inputs
+        // has to know which cable an event came down (see `Unit.midiIn`).
         const sinks = net.sinks
-          .map((s) => this.units.get(s.node)?.unit)
-          .filter((u): u is Unit => !!u?.midiIn);
+          .map((s) => ({ u: this.units.get(s.node)?.unit, port: s.port }))
+          .filter((s): s is { u: Unit; port: string } => !!s.u?.midiIn);
         for (const src of net.sources) {
           const u = this.units.get(src.node)?.unit;
-          if (u?.setMidiOut) {
-            u.setMidiOut((ev) => {
-              for (const s of sinks) s.midiIn!(ev);
-            });
+          if (!u) continue;
+          const send = (ev: MidiEvent): void => {
+            for (const s of sinks) s.u.midiIn!(ev, s.port);
+          };
+          if (u.setMidiOutAt) {
+            u.setMidiOutAt(src.port, send);
+            this.midiSources.push(u);
+          } else if (u.setMidiOut) {
+            u.setMidiOut(send);
             this.midiSources.push(u);
           }
         }
@@ -437,15 +454,20 @@ export class WebAudioEngine implements EngineAdapter {
         // Sources push on connect and whenever their asset changes; repeated
         // pushes of the same ref must be idempotent at the sink.
         const sinks = net.sinks
-          .map((s) => this.units.get(s.node)?.unit)
-          .filter((u): u is Unit => !!u?.tapeIn);
-        for (const s of sinks) tapeConnected.add(s);
+          .map((s) => ({ u: this.units.get(s.node)?.unit, port: s.port }))
+          .filter((s): s is { u: Unit; port: string } => !!s.u?.tapeIn);
+        for (const s of sinks) tapeConnected.add(s.u);
         for (const src of net.sources) {
           const u = this.units.get(src.node)?.unit;
-          if (u?.setTapeOut) {
-            u.setTapeOut((ref) => {
-              for (const s of sinks) s.tapeIn!(ref);
-            });
+          if (!u) continue;
+          const send = (ref: TapeRef | null): void => {
+            for (const s of sinks) s.u.tapeIn!(ref, s.port);
+          };
+          if (u.setTapeOutAt) {
+            u.setTapeOutAt(src.port, send);
+            this.tapeSources.push(u);
+          } else if (u.setTapeOut) {
+            u.setTapeOut(send);
             this.tapeSources.push(u);
           }
         }

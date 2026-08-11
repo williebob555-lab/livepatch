@@ -696,3 +696,249 @@ body.dock-window #topbar { padding: 3px 6px; gap: 4px; }
   padding: 8px 10px; font: 11px/1.5 ui-monospace, Consolas, monospace;
   color: var(--text); white-space: pre-wrap; max-height: 45vh; overflow: auto;
 }
+
+/* ==========================================================================
+   Minions tab — the hiring hall. A horizontal row of résumé/trading-card
+   hybrids. See src/ui/minions/tab.ts. Deletable with the folder.
+   ========================================================================== */
+/* **A tab body must never set its own `display`.** `.dock-tab` hides every
+   inactive tab with `display: none` and `.dock-tab.on` turns it back to `flex`.
+   This rule used to say `display: flex` too — same specificity (one class),
+   later in the file — so it won the cascade unconditionally and the Minions
+   tab, which is `position: absolute; inset: 0`, sat on top of whichever tab you
+   had actually selected, for every tab, for ever. Layout only here. */
+.dock-minions { min-height: 0; }
+.minion-rail {
+  flex: 1 1 auto; min-height: 0; display: flex; gap: 12px;
+  padding: 12px; overflow-x: auto; overflow-y: hidden;
+  align-items: stretch;
+  /* A faint blueprint grid behind the cards — this is a maintenance office. */
+  background:
+    linear-gradient(var(--bg), var(--bg)),
+    repeating-linear-gradient(0deg, transparent 0 15px, rgba(255,255,255,0.02) 15px 16px),
+    repeating-linear-gradient(90deg, transparent 0 15px, rgba(255,255,255,0.02) 15px 16px);
+}
+/* **The card does not scroll; the sheet inside it does.**
+   It used to be the scroll container itself, with the stamps as absolutely
+   positioned children — and an absolutely positioned child of a scroller
+   scrolls with the CONTENT, while `top: 44%` resolves against the content
+   height rather than the visible height. So the stamp slid up the card as you
+   dragged the dock taller and drifted out of frame as you scrolled the résumé.
+   Splitting the two means the stamp is positioned against a box whose size is
+   the card you can see, which is the thing it is supposed to sit in the middle
+   of. */
+.minion-card {
+  position: relative; flex: 0 0 258px; width: 258px;
+  display: flex; flex-direction: column; min-height: 0;
+  background: linear-gradient(180deg, #262a31, #1f232a);
+  border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.03);
+  overflow: hidden;
+  cursor: pointer; transition: transform 0.12s, border-color 0.12s;
+}
+.minion-sheet {
+  position: relative;
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px;
+  padding: 10px;
+  /* Scroll a tall card inside its own frame rather than letting flexbox crush
+     the mugshot — the portrait keeps its height, the résumé scrolls. */
+  overflow-y: auto; overflow-x: hidden;
+}
+.minion-card:hover { transform: translateY(-2px); border-color: #55606f; }
+.minion-card.hired { cursor: default; border-color: #6a7360; }
+.minion-card.hired:hover { transform: none; }
+.minion-card.exemployee { border-color: #6f5250; }
+/* A punched hole at the top like a real ID card on a lanyard. */
+.minion-card::before {
+  content: ''; position: absolute; top: 7px; left: 50%; transform: translateX(-50%);
+  width: 26px; height: 5px; border-radius: 3px;
+  background: #14161a; box-shadow: inset 0 1px 1px rgba(0,0,0,0.8);
+  z-index: 2;
+}
+
+.minion-portrait {
+  position: relative; flex: 0 0 132px; height: 132px; border-radius: 7px;
+  /* A flat booth backdrop — even, slightly cold, like a real ID photo wall. */
+  background: linear-gradient(180deg, #414a56 0%, #363e49 60%, #2c333c 100%);
+  border: 1px solid #11141a; overflow: hidden;
+}
+.minion-portrait canvas { width: 100%; height: 100%; display: block; }
+/* The photo-booth number strip. */
+.minion-idstrip {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 15px;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0 6px; background: rgba(10,12,15,0.72);
+  font: 700 8px/1 ui-monospace, Consolas, monospace; letter-spacing: 0.5px;
+  color: #d7b34a; text-transform: uppercase;
+}
+
+.minion-head { display: flex; flex-direction: column; gap: 1px; }
+.minion-name {
+  font: 800 14px/1.05 'Segoe UI', sans-serif; letter-spacing: 0.3px; color: #eef1f6;
+}
+.minion-role {
+  font: 700 9px/1.1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px;
+  color: #d7b34a; text-transform: uppercase;
+}
+.minion-sub {
+  font: 500 8px/1.2 ui-monospace, Consolas, monospace; letter-spacing: 0.3px;
+  color: var(--text-dim); text-transform: uppercase;
+}
+.minion-quote {
+  margin-top: 3px; font: italic 500 11px/1.25 'Segoe UI', sans-serif; color: #b7bdc8;
+}
+
+.minion-facts {
+  display: grid; grid-template-columns: auto 1fr; gap: 2px 8px;
+  padding: 6px 7px; background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.04); border-radius: 6px;
+}
+.minion-fact { display: contents; }
+.minion-fact .fk {
+  font: 700 8px/1.5 ui-monospace, Consolas, monospace; letter-spacing: 0.6px;
+  color: var(--text-dim); text-transform: uppercase; white-space: nowrap;
+}
+.minion-fact .fv { font: 500 10px/1.4 'Segoe UI', sans-serif; color: #cdd3dc; text-align: right; }
+
+.minion-opts { display: flex; flex-direction: column; gap: 3px; }
+.minion-optgroup {
+  margin-top: 4px; font: 800 8px/1.6 ui-monospace, Consolas, monospace;
+  letter-spacing: 1.2px; color: #7f8896; text-transform: uppercase;
+  border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 1px;
+}
+.minion-opt {
+  display: flex; align-items: flex-start; gap: 6px; cursor: pointer;
+  padding: 2px 3px; border-radius: 4px;
+}
+.minion-opt:hover { background: rgba(255,255,255,0.03); }
+.minion-opt.range { flex-direction: column; align-items: stretch; gap: 2px; }
+.minion-opt input[type=checkbox] {
+  margin-top: 1px; accent-color: #c4a24a; width: 13px; height: 13px; flex: 0 0 auto;
+}
+.minion-opt-label { font: 500 11px/1.25 'Segoe UI', sans-serif; color: #c7ccd4; }
+.minion-opt-top { display: flex; justify-content: space-between; align-items: baseline; }
+.minion-opt-val {
+  font: 700 10px/1 ui-monospace, Consolas, monospace; color: #d7b34a;
+  font-variant-numeric: tabular-nums;
+}
+.minion-opt input[type=range] { width: 100%; accent-color: #c4a24a; height: 14px; }
+
+.minion-fineprint {
+  margin-top: 2px; font: 400 8px/1.3 'Segoe UI', sans-serif; color: #6b7381;
+  border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 5px;
+}
+
+.minion-foot { margin-top: auto; padding-top: 4px; }
+.minion-hire {
+  width: 100%; padding: 7px; border: 1px solid #c4a24a; border-radius: 6px;
+  background: linear-gradient(180deg, #d7b34a, #b9922f); color: #201a08;
+  font: 800 11px/1 'Segoe UI', sans-serif; letter-spacing: 1.5px; cursor: pointer;
+  text-transform: uppercase; transition: filter 0.12s;
+}
+.minion-hire:hover { filter: brightness(1.08); }
+.minion-card.hired .minion-hire {
+  background: none; color: var(--text-dim); border-color: var(--border);
+  letter-spacing: 0.4px; font-weight: 600; text-transform: none;
+}
+.minion-hire:disabled { opacity: 0.5; cursor: default; background: none; color: var(--text-dim); border-color: var(--border); }
+
+/* The stamps — a personnel file, so they ACCUMULATE. Green HIRED goes on when
+   he joins and stays on for ever; red FIRED is struck across it, the other way
+   up, when he is let go. A card that has never employed anybody carries neither.
+
+   **The resting state and the thump are separate rules on purpose.** The
+   animation used to be attached to `.hired`, which meant it replayed every time
+   the card element was recreated — opening the tab, flicking any switch on any
+   card. A stamp landing is an EVENT; it may only play when the event happened,
+   so `.thump` is added for exactly one rebuild and never by a re-render. */
+/* **A stamp is ink on the paper, so it sits at a fixed place on the SHEET.**
+   Two things it must not depend on, and it depended on both. `top: 44%` is a
+   percentage of the container's height, so every time the dock was resized the
+   stamp slid to a different part of the card. And when the card itself was the
+   scroll container, an absolutely positioned child scrolled with the content
+   while its percentage resolved against the content height — so it drifted on
+   resize AND on scroll, in different directions.
+
+   Now: a fixed pixel offset inside `.minion-sheet`, which lands it across the
+   mugshot. It scrolls with the résumé, because that is what ink does, and it is
+   in exactly the same place on every card at every dock size. */
+.minion-stamp {
+  position: absolute; top: 128px; left: 50%; z-index: 5; pointer-events: none;
+  font: 900 40px/1 'Arial Black', 'Segoe UI', sans-serif; letter-spacing: 3px;
+  border-width: 5px; border-style: solid; border-radius: 7px; padding: 3px 12px;
+  text-transform: uppercase;
+  display: none; opacity: 0;
+  /* **Textured AND faded, or neither.** This used to be a plain radial vignette
+     in `mask-image` with the speckle only in `-webkit-mask-image` — and
+     Chromium now supports the standard property, so it used the unprefixed one
+     and ignored the prefixed one entirely. The result was a solid, evenly
+     printed stamp that simply got dimmer towards one corner, which reads as a
+     rendering fault rather than as ink.
+
+     Now the grain and the fade are layers of the SAME mask, intersected, so the
+     patchiness runs all the way through: two crossed grain gradients thin the
+     ink unevenly everywhere, and the radial decides where the stamp was pressed
+     hardest. Prefixed and unprefixed carry identical layer lists — whichever
+     the engine picks, it gets both halves. */
+  --stamp-mask:
+    radial-gradient(135% 170% at 27% 33%, #000 0 52%, rgba(0, 0, 0, 0.62) 74%, transparent 97%),
+    repeating-linear-gradient(37deg, #000 0 2px, rgba(0, 0, 0, 0.3) 2px 3px),
+    repeating-linear-gradient(-51deg, #000 0 3px, rgba(0, 0, 0, 0.42) 3px 4px);
+  -webkit-mask-image: var(--stamp-mask);
+  -webkit-mask-composite: source-in, source-in, source-over;
+  mask-image: var(--stamp-mask);
+  mask-composite: intersect, intersect, add;
+  filter: drop-shadow(0 1px 0 rgba(0,0,0,0.25));
+}
+/* HIRED — green, leaning left, and the lower of the two. */
+.minion-stamp.st-hired {
+  color: #4f9d55; border-color: #4f9d55; z-index: 5;
+  text-shadow: 1px 0 0 rgba(79,157,85,0.4), -1px 0 0 rgba(79,157,85,0.3);
+}
+/* FIRED — red, leaning the OTHER way so it reads as struck across the first,
+   and above it. */
+.minion-stamp.st-fired {
+  color: #c4392c; border-color: #c4392c; z-index: 6;
+  text-shadow: 1px 0 0 rgba(196,57,44,0.4), -1px 0 0 rgba(196,57,44,0.3);
+}
+
+/* Which stamps are on the card at all. */
+.minion-card.hired .st-hired,
+.minion-card.exemployee .st-hired,
+.minion-card.exemployee .st-fired { display: block; }
+
+/* Resting state — where a stamp that is already on the card sits. No animation:
+   this is what a rebuild for any other reason must land on. */
+.minion-card.hired .st-hired,
+.minion-card.exemployee .st-hired { opacity: 0.9; transform: translate(-50%,-50%) rotate(-13deg) scale(1); }
+.minion-card.exemployee .st-hired { opacity: 0.55; }
+.minion-card.exemployee .st-fired { opacity: 0.92; transform: translate(-50%,-50%) rotate(8deg) scale(1.06); }
+
+/* The thump — added for one rebuild, by an actual hire or fire. */
+.minion-card.thump.hired .st-hired { animation: stamp-in-hired 0.42s cubic-bezier(0.2,1.5,0.4,1) forwards; }
+.minion-card.thump.exemployee .st-fired { animation: stamp-in-fired 0.42s cubic-bezier(0.2,1.5,0.4,1) forwards; }
+@keyframes stamp-in-hired {
+  0%   { opacity: 0; transform: translate(-50%,-50%) rotate(-14deg) scale(2.4); }
+  55%  { opacity: 1; transform: translate(-50%,-50%) rotate(-13deg) scale(0.92); }
+  70%  { transform: translate(-50%,-50%) rotate(-13.5deg) scale(1.06); }
+  100% { opacity: 0.9; transform: translate(-50%,-50%) rotate(-13deg) scale(1); }
+}
+@keyframes stamp-in-fired {
+  0%   { opacity: 0; transform: translate(-50%,-50%) rotate(9deg) scale(2.6); }
+  55%  { opacity: 1; transform: translate(-50%,-50%) rotate(8deg) scale(0.96); }
+  70%  { transform: translate(-50%,-50%) rotate(8.5deg) scale(1.14); }
+  100% { opacity: 0.92; transform: translate(-50%,-50%) rotate(8deg) scale(1.06); }
+}
+
+/* Vacancy cards — dimmed, dashed, obviously empty desks. */
+.minion-card.vacant {
+  cursor: default; opacity: 0.62; border-style: dashed;
+  background: repeating-linear-gradient(135deg, #202429 0 8px, #1c2026 8px 16px);
+}
+.minion-card.vacant:hover { transform: none; border-color: var(--border); }
+.minion-portrait.vacant {
+  display: flex; align-items: center; justify-content: center;
+  background: repeating-linear-gradient(45deg, #23272e 0 10px, #1e2229 10px 20px);
+}
+.vacant-mark { font: 900 46px/1 'Segoe UI', sans-serif; color: #3b424c; }
+.vacant-blurb { border-top: none; padding-top: 0; }

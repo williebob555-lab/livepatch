@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-08-02._
+_Last verified: 2026-08-10._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -12,6 +12,22 @@ here and now doesn't, that's the bug.
 - [ ] `npm run typecheck` clean (covers renderer **and** engine).
 - [ ] `npm run build` clean (Vite + engine).
 - [ ] App boots, restores last session, no console errors.
+
+## Wires: routing, bundling, or anything in `geometry.ts`
+
+- [ ] `node scripts/bundle-route-test.mjs` passes. Five geometries × three wire
+      styles: ports unmoved, `ortho` axis-aligned along its **whole** length
+      including inside a ribbon, each port met no worse than the cable's own
+      route managed, members actually running together, and no two parallel
+      cables touching. Every one of those is a bug that was reported by eye and
+      then argued about — the script exists so the next one is a number.
+      (`routePoints`, `offsetPolyline` and `subPath` are all under it, so run it
+      for edits to `geometry.ts` too, not only to bundling.)
+- [ ] Bundle two cables in the app and switch `Appearance ▸ Wires ▸ style`
+      through all three. Nothing should change character where a cable meets a
+      port, and nothing should loop.
+- [ ] Grab a bundled cable's end and pull: it leaves the ribbon **while you
+      drag**, not on release.
 
 ## Adding/changing a block
 
@@ -584,6 +600,76 @@ dropout, start audio, and then:
       legitimately disable it: **Mode: Edit** (toolbar; `E`/`Escape` leaves),
       `Space` held, and a stale entry in `editor.pointers` (press read as a
       second finger). See docs/07-ui.md.
+
+## Minions (`src/ui/minions/`)
+
+Deletable by design, so nothing here is load-bearing for correctness — but every
+item below is something that was reported by eye, argued about, and only settled
+by a number or a picture. See [`15-minions.md`](15-minions.md).
+
+- [ ] `node scripts/minion-gait-test.cjs` passes. Mandatory for anything
+      touching Gus's legs, the IK, or the walk constants — a planted foot that
+      slides a fraction of a pixel per frame reads as "cheap" long before anyone
+      can point at it.
+- [ ] Adding a duty? Two questions first, and the answer to both has to be yes
+      or it should not exist (docs/15 ▸ *A minion cannot win by doing an edit
+      you can already do*): **is it a fault rather than an opinion**, and **is it
+      better because a creature does it** than it would be as a menu item?
+- [ ] Adding a duty that edits the same thing as another one? It must be a
+      **fixed point of every other duty**, not just of its own measurement.
+      `align` and `space` were each correct alone and together had no fixed
+      point, and one frame of the resulting oscillation looks exactly like one
+      frame of a machine doing its job.
+- [ ] **Carrying** (`payload.ts`): give it a block, drag it about, snatch it
+      back, and check the block's own cables followed it the whole way. Then
+      give it a block and **wire something to the block while it is held** —
+      that must work, and it works only because a carried thing is genuinely at
+      the gripper rather than drawn there.
+- [ ] Double-click it while it is carrying: straight back where it came from.
+      A block dragged out of the Library goes **back to the Library**, not down
+      on the canvas — it has never been anywhere, so there is no "there".
+- [ ] Delete the thing it is holding while it is holding it. It must let go
+      cleanly rather than carry a ghost.
+- [ ] **Every carry gesture with a finger, not only a mouse.** Give, snatch and
+      double-*tap* put-back. `dblclick` is a mouse event and touch does not
+      reliably produce one, so the double-tap has its own detection — and the
+      snatch fires on the first *movement*, never on the press, or the first of
+      the two taps takes the load and the second has nothing to put back.
+- [ ] **Levels.** Carry a block into a subpatch: the drone comes through a rift,
+      the block moves into that graph, its cables are cut and it says so, and
+      **Gus stays where he was**. Come back out and he is still there. Carrying
+      a *cable*, it must refuse, stay behind, and still be holding it when you
+      return.
+- [ ] The rift must stay **where it was torn** while the machine flies out of
+      it. If it travels with the machine it is a halo, not a portal. It must
+      also **wind open and shut** rather than appearing at full size, and be
+      measured big enough for whatever came through it — carry a wide block in
+      and check the hole grew for it.
+- [ ] `node scripts/minion-art-test.mjs` passes. Mandatory whenever an authored
+      sprite or its anchor changes: it checks every CRT raster lands inside the
+      glass it is stamped into. A fix with two axes gets applied to one of them,
+      and the other one is invisible in a typecheck.
+- [ ] Anything that has to **contain** a character uses `MinionBody.extent()`,
+      not `height`. A declared height is not a bounding box — the drone is much
+      wider than it is tall.
+- [ ] `node scripts/visual/look.mjs` and `node scripts/visual/look-orderly.mjs`
+      write PNGs to `dev/visual/`. **Look at them together** rather than
+      iterating one guess at a time (docs/15 §0). ORDERLY 7's six states —
+      hover, cruise, launch, grip, rest, and cruise facing the other way — are
+      six different silhouettes and a change that fixes one routinely breaks
+      another.
+- [ ] Hire both, drop a block a few units off the grid inside a row of three,
+      and **watch for a full minute**. Nothing may be moved twice.
+- [ ] Grab a cable end and hold it near an open port while Gus is hired. He must
+      not come and plug it in, and if he was already on his way he must give up.
+      Then drop it and he may.
+- [ ] Leave a tidy patch alone for two minutes with `lunch` on. He must
+      eventually stop wandering, sit down, and then eat — reachably, not in
+      principle. (It was unreachable for the whole life of the feature.)
+- [ ] Every switch on both cards **does something**. Flick each one and confirm
+      the behaviour changes. Three had been shipped dead; a switch for a
+      behaviour that does not exist is as much a bug as a behaviour with no
+      switch.
 
 ## Detaching the Dock (`dock.html`, `src/dockwindow.ts`, `src/ui/docklink.ts`)
 

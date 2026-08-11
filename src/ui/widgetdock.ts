@@ -518,10 +518,12 @@ function build(body: HTMLElement): DockTabHandle {
       return true;
     }
     if (spec.widget === 'button') {
-      if (spec.type === 'action' && spec.dialogAction) {
-        // Dialog actions (Load…, Write…) belong to the editor: they open
-        // pickers and mutate the document. Route to the real widget's owner,
-        // with the absolute node id (the editor's own is path-relative).
+      if (spec.type === 'action' && (spec.dialogAction || spec.docAction)) {
+        // Dialog actions (Load…, Write…) and document actions (the
+        // Entanglement Field's Advance/Reverse) belong to the editor: they open
+        // pickers, or re-plan from the graph, and mutate the document. Route to
+        // the real widget's owner, with the absolute node id (the editor's own
+        // is path-relative).
         ed.runDockAction(L.r.host, L.r.child, spec, L.r.nodeId);
         hotRef = null;
         return true;
@@ -1332,7 +1334,7 @@ function variantsFor(spec: ParamSpec | undefined, cs?: ControlStyle): string[] {
   if (kind === 'knob') return ['arc', 'needle', 'ring'];
   if (kind === 'fader' || kind === 'hfader') return ['track', 'slim', 'led'];
   if (kind === 'toggle') return ['switch', 'check', 'led', 'rocker', 'power'];
-  if (kind === 'button') return ['rect', 'pill', 'round', 'flat'];
+  if (kind === 'button') return ['rect', 'pill', 'round', 'flat', 'panel'];
   if (kind === 'keys') return ['piano', 'pad'];
   return [];
 }

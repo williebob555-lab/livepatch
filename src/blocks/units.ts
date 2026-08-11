@@ -11,6 +11,16 @@ import { RollNote, getRollData, saveRoll, setRollData } from '../core/rolls';
 import { forgetTakeHistory } from '../core/takehistory';
 import { parseSliceKeys, parseSlicePoints, sliceEdges, sliceForNote, velAmp } from '../core/sampler';
 import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
+import { ENT_MAX, parseRoute } from '../core/entangle';
+import { SYM_CENTS, SYM_MAX, SYM_RATIOS, parseBank } from '../core/sympathy';
+
+/**
+ * The narrowest a film may be allowed to be — and therefore the WIDEST its
+ * response can get. `SYM_CENTS` is the design constraint ("a semitone off does
+ * not excite it"); this is that constraint expressed as a biquad Q, which is
+ * the only form the web engine can enforce it in.
+ */
+const SYM_QMIN = 1 / (Math.pow(2, SYM_CENTS / 2400) - Math.pow(2, -SYM_CENTS / 2400));
 import { encodeWavFloat } from '../core/encode/wav';
 
 type P = Record<string, ParamValue>;
@@ -485,6 +495,130 @@ registerUnit('matrix', (params, env) => {
   };
 });
 
+/**
+ * Entanglement Field — the hidden permutation (def in `src/blocks/defs.ts`).
+ *
+ * Structurally the Matrix with the grid replaced by a `route` string and the
+ * crossfade lengthened: one GainNode per terminal, one crossing per pair, all
+ * built up front and left at zero. Terminals are created and destroyed by the
+ * editor as wire ends are dropped in and pulled out, so the unit allocates for
+ * the full `ENT_MAX` on both sides once and never touches the node graph again
+ * — building a crossing from `setParam` would mean rewiring a live graph with
+ * audio running through it.
+ *
+ * Advancing swaps every crossing at once, so the ramp is the block's `settle`
+ * time rather than the default smoothing: a step here is a click, and the field
+ * is usually full of feedback paths where it is a bang (docs/10 rule 10).
+ */
+registerUnit('entangle', (params, env) => {
+  const inG: GainNode[] = [];
+  const outG: GainNode[] = [];
+  const cross: GainNode[] = new Array(ENT_MAX * ENT_MAX);
+  for (let k = 0; k < ENT_MAX; k++) {
+    inG.push(env.ctx.createGain());
+    const o = env.ctx.createGain();
+    o.gain.value = num(params.gain, 1);
+    outG.push(o);
+  }
+  for (let o = 0; o < ENT_MAX; o++)
+    for (let i = 0; i < ENT_MAX; i++) {
+      const c = env.ctx.createGain();
+      c.gain.value = 0;
+      inG[i].connect(c);
+      c.connect(outG[o]);
+      cross[o * ENT_MAX + i] = c;
+    }
+  let routeStr = str(params.route);
+  let settleS = Math.max(0.001, num(params.settle, 120) / 1000);
+  // Event routing (MIDI / tape / roll) uses the SAME route, resolved the other
+  // way round: audio is pulled (an output asks which input feeds it), events
+  // are pushed (an input asks which outputs it feeds).
+  const midiSends = new Map<string, (ev: MidiEvent) => void>();
+  const tapeSends = new Map<string, (ref: TapeRef | null) => void>();
+  let evTargets = new Map<string, string[]>();
+  const loadEvents = (): void => {
+    evTargets = new Map();
+    for (const [outId, inId] of parseRoute(routeStr)) {
+      const list = evTargets.get(inId);
+      if (list) list.push(outId);
+      else evTargets.set(inId, [outId]);
+    }
+  };
+  loadEvents();
+
+  /** Terminal id ('i3' / 'o7') → slot index, or -1. */
+  const slot = (id: string, prefix: string): number => {
+    if (!id.startsWith(prefix)) return -1;
+    const k = parseInt(id.slice(prefix.length), 10) - 1;
+    return Number.isFinite(k) && k >= 0 && k < ENT_MAX ? k : -1;
+  };
+
+  const apply = (): void => {
+    const live = parseRoute(routeStr);
+    const want = new Float32Array(ENT_MAX * ENT_MAX);
+    for (const [outId, inId] of live) {
+      const o = slot(outId, 'o');
+      const i = slot(inId, 'i');
+      if (o >= 0 && i >= 0) want[o * ENT_MAX + i] = 1;
+    }
+    for (let k = 0; k < cross.length; k++) {
+      // setTargetAtTime with the block's own time constant: the whole point of
+      // Settle is that the user chooses how abruptly the field re-patches.
+      cross[k].gain.setTargetAtTime(want[k], env.ctx.currentTime, settleS / 3);
+    }
+  };
+  apply();
+
+  return {
+    inlet: (port) => {
+      const i = slot(port, 'i');
+      return i >= 0 ? inG[i] : null;
+    },
+    outlet: (port) => {
+      const o = slot(port, 'o');
+      return o >= 0 ? outG[o] : null;
+    },
+    // MIDI, tape and roll cables latch into the same field and follow the same
+    // hidden plan — the field pairs like with like, so a note stream can only
+    // ever leave by a MIDI terminal. Events have no crossfade: `settle` is a
+    // gain ramp, and there is no such thing as half a note-on.
+    setMidiOutAt: (port, cb) => {
+      if (cb) midiSends.set(port, cb);
+      else midiSends.delete(port);
+    },
+    midiIn: (ev, port) => {
+      if (!port) return;
+      for (const o of evTargets.get(port) ?? []) midiSends.get(o)?.(ev);
+    },
+    setTapeOutAt: (port, cb) => {
+      if (cb) tapeSends.set(port, cb);
+      else tapeSends.delete(port);
+    },
+    tapeIn: (ref, port) => {
+      if (!port) return;
+      for (const o of evTargets.get(port) ?? []) tapeSends.get(o)?.(ref);
+    },
+    setParam: (id, v) => {
+      if (id === 'gain') {
+        const g = num(v, 1);
+        for (const o of outG) smooth(o.gain, env.ctx, g);
+        return;
+      }
+      if (id === 'settle') settleS = Math.max(0.001, num(v, 120) / 1000);
+      else if (id === 'route') {
+        routeStr = str(v);
+        loadEvents();
+      } else return; // seed/state are the editor's bookkeeping; the unit ignores them
+      apply();
+    },
+    dispose: () => {
+      for (const c of cross) c.disconnect();
+      for (const g of inG) g.disconnect();
+      for (const g of outG) g.disconnect();
+    },
+  };
+});
+
 registerUnit('subtract', (_params, env) => {
   const ga = env.ctx.createGain();
   const gb = env.ctx.createGain();
@@ -582,6 +716,318 @@ registerUnit('delay', (params, env) => {
   };
 });
 
+/**
+ * Ripple Pool — mirrors the `ripple-pool` kernel in `engine/src/dsp.ts`.
+ *
+ * Five taps per output: the inlet itself, plus the inlet mirrored across each
+ * of the four walls (the image-source method). The geometry below is duplicated
+ * in the kernel rather than shared, because the engine cannot import renderer
+ * code — the same arrangement as `note-space`. **If you change the pool aspect,
+ * the inlet position, the attenuation law or the damping curve here, change
+ * them there in the same edit**, or the two engines quietly disagree about
+ * where the taps are.
+ *
+ * The reflections are lowpassed and the direct tap is not, which is what makes
+ * a bounce sound like a bounce. Delay changes ride `smooth()` so dragging a
+ * buoy slides the tap instead of clicking.
+ */
+const POOL_INX = 0.055; // inlet, normalized to the pool box
+const POOL_INY = 0.312;
+const SPEED_OF_SOUND = 343; // m/s
+const POOL_MAXD = 5; // seconds of delay line; matches the kernel
+
+registerUnit('ripple-pool', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const N = 4;
+  const IMG = 5;
+  const outG: GainNode[] = [];
+  const dly: DelayNode[][] = [];
+  const tapG: GainNode[][] = [];
+  const refLp: BiquadFilterNode[] = [];
+  for (let o = 0; o < N; o++) {
+    const og = ctx.createGain();
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 0.707;
+    lp.connect(og);
+    const ds: DelayNode[] = [];
+    const gs: GainNode[] = [];
+    for (let m = 0; m < IMG; m++) {
+      const d = ctx.createDelay(POOL_MAXD);
+      const g = ctx.createGain();
+      g.gain.value = 0;
+      inG.connect(d);
+      d.connect(g);
+      // Tap 0 is the direct path and stays bright; the four mirrors go through
+      // the damping filter together.
+      g.connect(m === 0 ? og : lp);
+      ds.push(d);
+      gs.push(g);
+    }
+    outG.push(og);
+    dly.push(ds);
+    tapG.push(gs);
+    refLp.push(lp);
+  }
+
+  // The pond's real dimensions, measured by the document from the block's size
+  // and shipped as params — a unit cannot know how big the block is on screen.
+  const P = {
+    w: num(params.poolw, 112),
+    h: num(params.poolh, 81),
+    damp: num(params.damp, 0.55),
+    walls: num(params.walls, 0.62),
+  };
+  const bx = [num(params.b1x, 0.333), num(params.b2x, 0.597), num(params.b3x, 0.25), num(params.b4x, 0.792)];
+  const by = [num(params.b1y, 0.204), num(params.b2y, 0.446), num(params.b3y, 0.742), num(params.b4y, 0.796)];
+
+  const apply = (): void => {
+    const w = Math.max(0.5, P.w);
+    const h = Math.max(0.5, P.h);
+    const sx = POOL_INX * w;
+    const sy = POOL_INY * h;
+    const ref = w * 0.2; // distance at which a tap is half as loud
+    const fc = 400 + 17600 * (1 - P.damp) * (1 - P.damp);
+    for (let o = 0; o < N; o++) {
+      smooth(refLp[o].frequency, ctx, Math.max(200, Math.min(19000, fc)));
+      const px = Math.max(0, Math.min(1, bx[o])) * w;
+      const py = Math.max(0, Math.min(1, by[o])) * h;
+      for (let m = 0; m < IMG; m++) {
+        // Mirror the inlet across the wall this image belongs to.
+        const ix = m === 1 ? -sx : m === 2 ? 2 * w - sx : sx;
+        const iy = m === 3 ? -sy : m === 4 ? 2 * h - sy : sy;
+        const wallGain = m === 0 ? 1 : P.walls;
+        const d = Math.hypot(px - ix, py - iy);
+        smooth(dly[o][m].delayTime, ctx, Math.min(POOL_MAXD - 0.01, d / SPEED_OF_SOUND));
+        smooth(tapG[o][m].gain, ctx, wallGain / (1 + d / ref));
+      }
+    }
+  };
+  apply();
+
+  return {
+    inlet: () => inG,
+    outlet: (port) => {
+      const o = parseInt(String(port).replace('out', ''), 10) - 1;
+      return o >= 0 && o < N ? outG[o] : null;
+    },
+    setParam: (id, v) => {
+      if (id === 'poolw') P.w = num(v, 112);
+      else if (id === 'poolh') P.h = num(v, 81);
+      else if (id === 'damp') P.damp = num(v, 0.55);
+      else if (id === 'walls') P.walls = num(v, 0.62);
+      else if (/^b[1-4][xy]$/.test(id)) {
+        const i = Number(id[1]) - 1;
+        (id[2] === 'x' ? bx : by)[i] = num(v, 0.5);
+      } else return;
+      apply();
+    },
+    dispose: () => {
+      inG.disconnect();
+      outG.forEach((n) => n.disconnect());
+      refLp.forEach((n) => n.disconnect());
+      dly.forEach((a) => a.forEach((n) => n.disconnect()));
+      tapG.forEach((a) => a.forEach((n) => n.disconnect()));
+    },
+  };
+});
+
+/**
+ * Mycelium — mirrors the `mycelium` kernel in `engine/src/dsp.ts`.
+ *
+ * Four taps, and that is the whole engine side: the branching lives in
+ * `core/mycelium.ts`, which plans the tree and writes each tap's delay and
+ * depth into params. What makes depth *audible* is here — a tap loses level and
+ * high end once per junction it is past, so a deep leaf is later, quieter and
+ * darker than a shallow one without anything having to say so.
+ *
+ * The per-junction laws are duplicated in the kernel (the engine cannot import
+ * renderer code). Change one, change both in the same edit.
+ */
+const MYC_MAXD = 4.2; // seconds of delay line; matches the kernel
+/** Level kept per junction. Compounding, so depth 6 is ~30 % of depth 0. */
+const MYC_JUNCTION_GAIN = 0.82;
+/** Cutoff kept per junction, scaled by Damp. */
+const mycCutoff = (depth: number, damp: number): number =>
+  Math.max(180, 19000 * Math.pow(1 - damp * 0.55, depth));
+
+registerUnit('mycelium', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const N = 4;
+  const dly: DelayNode[] = [];
+  const lp: BiquadFilterNode[] = [];
+  const outG: GainNode[] = [];
+  for (let i = 0; i < N; i++) {
+    const d = ctx.createDelay(MYC_MAXD);
+    const f = ctx.createBiquadFilter();
+    f.type = 'lowpass';
+    f.Q.value = 0.707;
+    const o = ctx.createGain();
+    inG.connect(d);
+    d.connect(f);
+    f.connect(o);
+    dly.push(d);
+    lp.push(f);
+    outG.push(o);
+  }
+  let damp = num(params.damp, 0.42);
+  const ms = [num(params.t1ms, 120), num(params.t2ms, 240), num(params.t3ms, 360), num(params.t4ms, 480)];
+  const dep = [num(params.t1d, 1), num(params.t2d, 2), num(params.t3d, 3), num(params.t4d, 4)];
+
+  const apply = (): void => {
+    for (let i = 0; i < N; i++) {
+      smooth(dly[i].delayTime, ctx, Math.max(0, Math.min(MYC_MAXD - 0.01, ms[i] / 1000)));
+      smooth(lp[i].frequency, ctx, mycCutoff(dep[i], damp));
+      smooth(outG[i].gain, ctx, Math.pow(MYC_JUNCTION_GAIN, dep[i]));
+    }
+  };
+  apply();
+
+  return {
+    inlet: () => inG,
+    outlet: (port) => {
+      const o = parseInt(String(port).replace('out', ''), 10) - 1;
+      return o >= 0 && o < N ? outG[o] : null;
+    },
+    setParam: (id, v) => {
+      if (id === 'damp') damp = num(v, 0.42);
+      else if (/^t[1-4]ms$/.test(id)) ms[Number(id[1]) - 1] = num(v, 0);
+      else if (/^t[1-4]d$/.test(id)) dep[Number(id[1]) - 1] = num(v, 0);
+      else return;
+      apply();
+    },
+    dispose: () => {
+      inG.disconnect();
+      dly.forEach((n) => n.disconnect());
+      lp.forEach((n) => n.disconnect());
+      outG.forEach((n) => n.disconnect());
+    },
+  };
+});
+
+/**
+ * Sympathy — mirrors the `sympathy` kernel in `engine/src/dsp.ts`.
+ *
+ * One bandpass per surface mode per bubble, at the real drop ratios
+ * (1 : 1.94 : 3.0). The **55-cent response width** is the whole mechanism —
+ * being a semitone off must not excite a film — so Q is floored at
+ * `SYM_QMIN`, computed from `SYM_CENTS`, whatever Decay says. Decay may make a
+ * film ring longer (a narrower response); it may never make one broader.
+ *
+ * Nodes are built for the ceiling (`SYM_MAX`) once and reused as the raft
+ * changes, because the raft changes *while the patch is running* — rebuilding
+ * sixty biquads every time a bubble bursts would click on every pop.
+ *
+ * `pitch` is the loudest ringing element as 1V/oct against C4, which is the
+ * convention `cvLaw: '1v/oct'` inputs expect. On this engine the level is read
+ * off one analyser per bubble at the control rate, which is why the tracker is
+ * a `tick` and not a sample-accurate one.
+ */
+registerUnit('sympathy', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const outG = ctx.createGain();
+  const pitchOut = ctx.createConstantSource();
+  pitchOut.offset.value = 0;
+  pitchOut.start();
+  const NM = SYM_RATIOS.length;
+  const res: BiquadFilterNode[] = [];
+  const gat: GainNode[] = [];
+  const pan: StereoPannerNode[] = [];
+  const ana: AnalyserNode[] = [];
+  const probe = new Float32Array(64);
+  for (let i = 0; i < SYM_MAX; i++) {
+    const p = ctx.createStereoPanner();
+    const a = ctx.createAnalyser();
+    a.fftSize = 64;
+    p.connect(outG);
+    p.connect(a);
+    pan.push(p);
+    ana.push(a);
+    for (let k = 0; k < NM; k++) {
+      const f = ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      const g = ctx.createGain();
+      g.gain.value = 0;
+      inG.connect(f);
+      f.connect(g);
+      g.connect(p);
+      res.push(f);
+      gat.push(g);
+    }
+  }
+  const P = {
+    decay: num(params.decay, 0.6),
+    bright: num(params.bright, 0.5),
+    damp: Math.round(num(params.damp, -1)),
+    bank: parseBank(str(params.bank)),
+  };
+  const apply = (): void => {
+    for (let i = 0; i < SYM_MAX; i++) {
+      const bb = P.bank[i];
+      smooth(pan[i].pan, ctx, bb ? bb.x * 1.6 - 0.8 : 0);
+      for (let k = 0; k < NM; k++) {
+        const n = i * NM + k;
+        if (!bb) {
+          smooth(gat[n].gain, ctx, 0);
+          continue;
+        }
+        const f = Math.max(20, Math.min(ctx.sampleRate * 0.45, bb.f * SYM_RATIOS[k]));
+        smooth(res[n].frequency, ctx, f);
+        // Decay falls with pitch, and the higher modes decay faster than the
+        // fundamental — both true of a real film, and both audible.
+        const tau = (0.35 + P.decay * 2.6) / SYM_RATIOS[k] * (240 / Math.max(60, bb.f));
+        res[n].Q.value = Math.max(SYM_QMIN, Math.min(600, Math.PI * f * tau));
+        const modeLvl = k === 0 ? 1 : P.bright * (k === 1 ? 0.7 : 0.45);
+        smooth(gat[n].gain, ctx, P.damp === i ? 0.02 : modeLvl * 0.5);
+      }
+    }
+  };
+  apply();
+  return {
+    inlet: () => inG,
+    outlet: (port) => (port === 'pitch' ? pitchOut : port === 'out' ? outG : null),
+    setParam: (id, v) => {
+      if (id === 'decay') P.decay = num(v, 0.6);
+      else if (id === 'bright') P.bright = num(v, 0.5);
+      else if (id === 'damp') P.damp = Math.round(num(v, -1));
+      else if (id === 'bank') P.bank = parseBank(str(v));
+      else return;
+      apply();
+    },
+    tick: () => {
+      // Loudest ringing film wins the PITCH out. Control-rate, which is all a
+      // pitch that only changes when a different bubble takes over needs.
+      let best = -1;
+      let bestE = 1e-4;
+      for (let i = 0; i < SYM_MAX; i++) {
+        if (!P.bank[i]) continue;
+        ana[i].getFloatTimeDomainData(probe);
+        let e = 0;
+        for (let j = 0; j < probe.length; j++) e += probe[j] * probe[j];
+        if (e > bestE) {
+          bestE = e;
+          best = i;
+        }
+      }
+      if (best >= 0) {
+        smooth(pitchOut.offset, ctx, Math.log2(P.bank[best].f / 261.626), 0.05);
+      }
+    },
+    dispose: () => {
+      pitchOut.stop();
+      inG.disconnect();
+      outG.disconnect();
+      pitchOut.disconnect();
+      res.forEach((n) => n.disconnect());
+      gat.forEach((n) => n.disconnect());
+      pan.forEach((n) => n.disconnect());
+      ana.forEach((n) => n.disconnect());
+    },
+  };
+});
 /**
  * Feedback — mirrors the `feedback` kernel in `engine/src/dsp.ts`.
  *

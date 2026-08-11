@@ -14,6 +14,7 @@ import { initCassettes, onCassettesChange } from './core/cassettes';
 import { onPrefsChange } from './core/prefs';
 import { installRollHistory, syncRolls } from './core/rolls';
 import { installTakeHistory } from './core/takehistory';
+import { stepLiving } from './core/living';
 import { showBanner } from './ui/menus';
 import { applyUiScale, onUiScaleChange } from './ui/uiscale';
 import { setImageLoadCallback } from './ui/images';
@@ -26,6 +27,10 @@ import './ui/adveq';
 import './ui/advpath';
 import './ui/advmatrix';
 import './ui/rigview';
+// MINIONS (src/ui/minions) — the "Minions" dock tab registers itself on import,
+// same as the other tabs. The workspace layer is imported by render.ts.
+import './ui/minions/tab';
+import { minionDebug } from './ui/minions/layer';
 import { DOCK_PANEL_ID, dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
 import { initWidgetDock } from './ui/widgetdock';
 import { initMainDockLink, mirrorDock, sendParamToDock, setDockRevealHandler, valueFramePump } from './ui/docklink';
@@ -288,16 +293,36 @@ function boot(): void {
    */
   const frameStats: { on: boolean; samples: number[] } = { on: false, samples: [] };
 
-  (window as any).__lp = { doc, renderer, editor, runtime, frameStats };
+  (window as any).__lp = { doc, renderer, editor, runtime, frameStats, minions: minionDebug };
 
   // Render on demand: always while audio runs (live meters/visuals), otherwise
   // only when something changed. Keeps idle CPU near zero.
   // A draw error must never kill the rAF chain — that would freeze the canvas
   // for the rest of the session while the rest of the UI keeps working.
   let lastDrawErr = '';
+  // LIVING BLOCKS (src/core/living.ts) — Sympathy's films thin, burst and are
+  // replaced in the DOCUMENT, so the picture and the sound are one simulation.
+  // Stepped from this loop rather than from a timer of its own (docs/10: the
+  // app has exactly one animation loop), and
+  // internally throttled about how often it talks to the engine and to the
+  // document. `lastLive` is wall-clock so the step survives a frame the
+  // renderer skipped.
+  let lastLive = performance.now();
   const tick = (): void => {
     const t0 = frameStats.on ? performance.now() : 0;
+    {
+      const n = performance.now();
+      const dt = (n - lastLive) / 1000;
+      lastLive = n;
+      stepLiving(dt, (nodeId, paramId, v) => runtime.sendParam(nodeId, paramId, v));
+    }
     if (renderer.dirty || runtime.audioOn) {
+      // Cleared BEFORE the draw, not after: a draw that discovers it needs
+      // another frame — a live visual still animating, an image that finished
+      // decoding — says so by setting `dirty` again, and clearing afterwards
+      // threw that away. Anything that dirties the document during a draw is
+      // likewise honoured on the next frame instead of being swallowed.
+      renderer.dirty = false;
       try {
         runtime.poll();
         renderer.draw(editor.overlay);
@@ -308,7 +333,6 @@ function boot(): void {
           console.error('render error:', err);
         }
       }
-      renderer.dirty = false;
     }
     // The Dock's canvases ride this one loop — they must never start their own
     // rAF (docs/10-performance.md). A closed Dock costs one lookup per frame.
