@@ -1,7 +1,7 @@
 {
   "name": "livepatch",
   "productName": "LivePatch",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Block-and-wire audio patching environment: Windows audio / ASIO / VST pipelines with a fully customizable node editor.",
   "author": "LivePatch",
   "//repository": "Single source of truth for the update feed: electron-builder derives the GitHub owner/repo for both `--publish` and the app's baked-in app-update.yml from this field. Set it before the first release.",
