@@ -159,6 +159,18 @@ export function compileScene(root: Graph, rig?: Rig): CompiledGraph {
 export const RIG_PARAM = '__rig';
 
 /**
+ * Param id carrying `Block.bypass`. Same convention as `RIG_PARAM`.
+ *
+ * **Always emitted, 0 or 1 — never omitted when off.** The engines' reconcile
+ * diffs iterate the *new* params (`for (const [k, v] of Object.entries(...))`),
+ * so a key that disappears is never applied: a node bypassed, then un-bypassed,
+ * then recompiled for some unrelated reason would come back still bypassed,
+ * with a document that says it isn't. Emitting the zero costs one number per
+ * node and removes the whole class.
+ */
+export const BYPASS_PARAM = '__bypass';
+
+/**
  * Unify channel width across portals.
  *
  * A portal compiles to a `pass` node that is a sink on the parent's net and a
@@ -220,6 +232,7 @@ function walk(g: Graph, prefix: string, out: CompiledGraph, rigJson?: string): v
         ...withDefaultDevice(b, omitDialogActions(b)),
         // Spatial blocks read the layout from here, never from their own state.
         ...(def.needsRig && rigJson ? { [RIG_PARAM]: rigJson } : {}),
+        [BYPASS_PARAM]: b.bypass ? 1 : 0,
       },
       ...(midi ? { midi } : {}),
     });

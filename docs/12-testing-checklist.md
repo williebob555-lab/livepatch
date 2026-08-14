@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-08-10._
+_Last verified: 2026-08-13._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -29,6 +29,113 @@ here and now doesn't, that's the bug.
 - [ ] Grab a bundled cable's end and pull: it leaves the ribbon **while you
       drag**, not on release.
 
+## The rewiring verbs — bypass, splice/extract, drag-to-modulate
+
+See [`07-ui.md`](07-ui.md). The failure mode for all three is the same shape:
+they still *work*, they just do it when you did not ask.
+
+- [ ] `node scripts/bypass-exec-test.cjs` passes (needs `npm run build:engine`
+      first). Compiler + executor: the flag on every node including the zero,
+      the dry pass-through, the ramp rather than a step, un-bypass restoring the
+      wet path, invented channels going silent, and a bypassed kernel holding a
+      NaN **not** leaking it downstream.
+- [ ] Bypass a hosted `vst` and un-bypass it. The plugin must **not** reload —
+      if its editor blinks or its state resets, something has made the toggle a
+      `'structure'` change again.
+- [ ] Bypass with audio running, on a loud signal. No click either way.
+- [ ] **The splice refusals.** Each of these must do exactly what it does today,
+      with no rewire: drag a **group** across a cable; drag a block that is
+      **already wired**; drop a block **near but not on** a cable; drop a block
+      on a **branch**; drop a MIDI-only block on an audio cable.
+- [ ] …and the acceptance: drop an unwired block squarely on a cable. Before
+      releasing, the cable thickens, a dashed detour shows, and a break mark
+      sits **across** the cable. Only then does the drop rewire.
+- [ ] `Pull out of chain` appears only on a block with exactly one wire in and
+      one out. The block stays put and unwired; the cables join.
+- [ ] Drag a cable onto a knob: the knob rings *before* you let go, the CV port
+      is created, and the widget then shows a live modulation marker (rule 17 —
+      if the knob does not move visibly, the `cvParam` plumbing is wrong, not
+      this).
+- [ ] Aiming at a real **port** still wins over the widget under it.
+- [ ] After each of the three, a run travels the changed route and the canvas
+      goes **idle** afterwards — `__lp.renderer.dirty` settles to false with
+      audio off. A run that never expires is a permanent rAF burn.
+
+## Value widgets — fine drag, reset, group edit
+
+- [ ] **Measure the fine ratio, don't eyeball it.** Same pixel travel with and
+      without Shift, from the same starting value: the coarse change must be
+      **8×** the fine one. Getting the multiplier upside-down makes Shift
+      *coarser* and still looks like a working feature — that is exactly how it
+      was written the first time.
+- [ ] Press and release Shift **mid-drag**. The value must not jump at the
+      moment the modifier changes (it re-baselines).
+- [ ] Double-click a knob → back to its default. Double-click a `button`, a
+      `keys` and a `toggle` → nothing resets (they commit on the press).
+- [ ] Select several blocks of the same type, drag one knob: all move, and the
+      **spread between them is unchanged**. Then push one peer to its rail and
+      keep dragging — the others must keep moving rather than being dragged to
+      theirs.
+- [ ] Grab a knob on a block that is **not** selected: only that block moves.
+
+## Quick add (`Ctrl+K`, a cable dropped in space, a loose end clicked)
+
+All three gestures arm the **Library** — there is no separate picker,
+deliberately (docs/07-ui.md). So these all test the Library doing the serving.
+
+- [ ] `Ctrl+K` reveals the Library, focuses its search, and shows the banner.
+      With exactly one block selected the placement is wired from it; with two
+      selected, nothing is wired.
+- [ ] The block lands **at the pointer**, not at the view centre.
+- [ ] Drag a cable into empty space: the banner names the cable, a dashed ring
+      marks the waiting end — and the Library still lists **everything**. An
+      armed placement must never hide entries.
+- [ ] **The cable end stays put no matter what you place.** Drop a block far
+      from the ring: it arrives unwired and the end has not moved a pixel. This
+      is the one that regressed — connecting regardless of where the block
+      landed makes a wire end impossible to position, because the next block
+      placed anywhere drags it away.
+- [ ] Drop a block **on** the ring: it plugs in, and the ring goes solid while
+      the tile is inside it (preview and result agree — `snapsToEnd`).
+- [ ] Click a loose end → the offer comes back. Then check the undo stack depth
+      is **unchanged** by that click: selecting an end edits nothing, and a
+      no-op undo entry is a Ctrl+Z that appears to do nothing.
+- [ ] **Move a loose end again, twice.** Press it, drag it, drop it somewhere
+      else. It must go exactly where it was put, every time.
+- [ ] Any press on the canvas cancels an armed placement — and the ring goes
+      with it. Click a loose end and immediately click empty canvas: nothing may
+      re-arm a moment later (the arming is synchronous; only the panel reveal is
+      deferred).
+- [ ] **Every** placement route completes the intent, not just Enter: try a
+      tile double-click, the tile's right-click ▸ Add to workspace, and dragging
+      a tile onto the canvas.
+- [ ] Escape in the search box cancels the **placement** first and only clears
+      the query on a second press. The ✕ on the banner does the same.
+- [ ] After cancelling: the cable is still floating where it was dropped, no
+      wire added or removed, and Escape did **not** also leave the subpatch.
+
+## Rewiring by gesture — splice, extract, modulate
+
+- [ ] Drag a tile **out of the Library onto a wire**: the splice proposal draws
+      while it is in the air and the drop inserts it. Then the same on touch
+      (hold-to-lift, drag) — both paths share `dropLibraryKey`, and the mouse
+      path is the only one Chromium's HTML5 drag-and-drop serves.
+- [ ] **Alt+drag** a block that sits in-line: it leaves the chain, the cables
+      heal, and it follows the pointer. One `Ctrl+Z` restores both the wiring
+      and its old position.
+- [ ] Alt+drag a block with two inputs, or one on a branch: nothing special
+      happens, it just moves. Alt+drag starting **on a knob**: still extracts,
+      does not turn the knob.
+- [ ] The block menu lists `Pull out of chain` with `Alt+drag` beside it.
+- [ ] Drag a cable over a **knob**: the dashed ring sits on the dial, sized to
+      it — not centred in the layout item (which is lower) and not a fixed 15 px.
+      Swap that control to a fader in Appearance and repeat: the mark becomes a
+      rounded rect around the track. Check one block that prints a panel mark,
+      where the item carries an extra strip.
+- [ ] Grab a cable end with `Appearance ▸ Wires ▸ Arrow size` at 5 and at 18:
+      the grab radius follows the arrow, and at 18 a press near the end still
+      cannot spawn a branch instead.
+
 ## Adding/changing a block
 
 - [ ] Parity: `registerUnit` list == `registerKernel` list (the grep in
@@ -44,6 +151,30 @@ here and now doesn't, that's the bug.
       this proves the declaration points at the right knob and the law moves it
       the right way.
 - [ ] A trigger input (clock/gate/trig/sync/reset) flashes its **port** when fed.
+- [ ] **Unplug a clock and the block goes back to its own Rate knob** — on the
+      **web engine**, which is where this failed. Patch a clock into an arp, a
+      step sequencer or a MIDI echo, let it run, then delete the cable: it must
+      free-run from Rate, not stop dead. Units are reused across rebuilds, so a
+      `connected` flag latched from the SIGNAL never clears and the block is
+      frozen for the rest of the session (`Unit.setFed`, docs/04). The native
+      engine cannot fail this — `ins['clock']` just stops existing — which is
+      exactly why it went unnoticed.
+- [ ] `node scripts/midi-panic-test.mjs` passes. Mandatory whenever a block
+      touches notes: anything that holds note state handles `ev.type ===
+      'panic'`, forwards it if it has a MIDI out, and **clears the state that
+      tracks the note as well as releasing it** — a `gateHi` left true releases
+      the note and then swallows the next one, which is a different bug wearing
+      the same clothes.
+- [ ] **Pull the wire mid-note, on both engines.** Hold a key (or a `seq`
+      running into it), delete the cable between the source and the synth, and
+      it must go quiet. Then the harder half: hold a note and make an
+      *unrelated* structural edit — rename a block, move a different wire — and
+      it must **keep sounding**. A failsafe that fires on every recompile means
+      you cannot edit a patch while playing it, which is most of what playing
+      one is. Both halves, or the diff in `applyGraph` is not being exercised.
+- [ ] **Escape stops everything.** With a chord held, or a one-shot sampler
+      looping, or a hosted instrument sustaining. Then check it did not also
+      stop the transport: panic means "let go", not "stop".
 - [ ] **It is in the Library without searching for it.** Open its category chip
       *and* the `All` tab and find the tile. Search finding it proves nothing —
       a block missing from its own category tab is still registered, still
@@ -352,6 +483,29 @@ deadzone that is discarded rather than subtracted shows up as a snap, and did �
 5.4%), that a horizontal pinch never engages the pitch axis, and the whole
 trackpad-vs-mouse classification table. Run it for any change to `input.ts`.
 
+Its sibling covers the quick-add snap rule:
+
+```
+node scripts/placement-snap-test.mjs
+```
+
+Same trick, on `src/ui/placement.ts`: whether a block placed near a loose cable
+end takes the cable is pure geometry, it is invisible when wrong (too wide reads
+as "it grabs cables at random", too tight as "the snap doesn't work"), and it is
+the rule whose absence made a wire end impossible to position. It also asserts
+that arming is synchronous and that cancelling notifies — the overlay ring is
+cleared from that notification, and the canvas cancels inside `pointerDown`.
+
+It drives `performance.now()` from a fake clock, because half the wheel
+classification *is* the timing — the same deltas are a trackpad flick at 12 ms
+apart and mouse notches at 300 ms — and the wall clock cannot express either
+case. Three of its cases are the 2026-08-12 trackpad report: a 1.3 s fast
+vertical flick that must stay a pan for every one of its 102 events (the old
+code zoomed 47 of them, in three separate stretches), a mouse that must win the
+verdict back within two notches, and an integer view axis that must still move
+under a stream of quarter-step deltas. It also drives `__lp.wheel` itself, so
+the diagnostic works the first time somebody needs it.
+
 Then the manual pass below. Every line is a bug that shipped.
 
 **Two-finger pan-first (touch), on the workspace, waveform, Roll, and Widgets
@@ -374,13 +528,28 @@ tab:**
 
 - [ ] Two-finger scroll **pans**. It must not zoom. Diagonal scrolls move both
       axes.
+- [ ] **A long, fast scroll pans for its whole length.** Flick hard and keep
+      going for a good two seconds, on the workspace *and* on the Clip tab. The
+      view must not zoom at any point in the middle and then go back to panning.
+      A short, slow test passes this even when it is broken — speed and length
+      are the test (see "the verdict never expires" in 14-input.md).
+- [ ] **Scroll the Roll's pitch axis slowly.** Small deltas must still walk the
+      keyboard. An integer axis that rounds every event away is *dead*, not
+      inaccurate, and it looks like the axis is locked while time pans fine.
 - [ ] Ctrl/⌘ + scroll zooms; on the Roll it zooms **time**.
 - [ ] Shift + scroll zooms **pitch** on the Roll (a deliberate departure from
       the browser's horizontal-scroll convention — see 14-input.md).
 - [ ] A real **mouse wheel** still zooms on a plain scroll. Test both devices;
-      the heuristic that separates them is the fragile part.
+      the heuristic that separates them is the fragile part. Switching from the
+      pad to the wheel costs **one** notch of pan before zoom returns — that is
+      the documented price of never flipping mid-gesture, not a bug.
 - [ ] Value wheels (EQ Q, trajectory height) move by the same amount for the
       same physical gesture on a trackpad as on a mouse — not ~10× further.
+
+If any of the above misbehaves, **record it before theorising**:
+`__lp.wheel.watch()` in the renderer console, make the gesture, then
+`__lp.wheel.report()`. It prints one line per gesture with the verdict, any
+mid-gesture flips, and how many events carried both axes.
 
 **Dock chrome (the "resizing the dock is finicky" class):**
 
@@ -601,6 +770,52 @@ dropout, start audio, and then:
       `Space` held, and a stale entry in `editor.pointers` (press read as a
       second finger). See docs/07-ui.md.
 
+## The virus (`src/core/virus.ts`)
+
+Deletable by design, so nothing here is load-bearing for correctness — but the
+two failures below both looked like tuning and were not. See
+[`16-virus.md`](16-virus.md).
+
+- [ ] **A non-amplitude modulation survives.** Seed onto an oscillator's `freq`
+      (`__lp.virus.seed('b1')` on the demo scene) and watch `__lp.virus.list()`
+      for a minute. Health must recover, not decline. This is the regression for
+      "fitness is signal variance", which starved every sweep, pan and filter
+      strain because none of them moves rms — it selected for tremolo only.
+- [ ] **A slow strain survives as well as a fast one.** Movement is measured as
+      a decaying RANGE, not a slew rate; measuring slew silently starves slow
+      deep breaths, which are the ones worth having.
+- [ ] `node scripts/virus-sim-test.mjs` passes. It covers the manual gesture end
+      to end — infect one named widget, cure it, both on the open graph and
+      inside a subpatch — and it exists because those three failures were all
+      invisible from the outside.
+- [ ] **It spreads downstream, not sideways** — and **through a BRANCH**. Split
+      a cable and check the outbreak crosses the fork; a branch has no `a.port`,
+      so every fan-out used to be invisible to it.
+- [ ] **Infect a widget lands on something you can SEE.** Right-click a block ▸
+      *Infect a widget* ten times on different blocks: every one must produce a
+      moving widget. It picks at random and 175 of 369 otherwise-eligible params
+      have no face widget, so this used to do nothing about half the time.
+- [ ] **The widget menu names its refusal.** On a toggle, an enum, and a knob
+      with a CV cable on it, *Infect* is disabled and says which of the three it
+      is — never silently succeeding.
+- [ ] **Infect inside a subpatch works, and survives leaving it.** Node ids are
+      scene-absolute; walking the open graph instead killed both.
+- [ ] **Curing clears the particles.** After *Cure everything*, no mote or spore
+      may be left sitting on the canvas — and none may freeze in place.
+- [ ] **Curing restores the knob exactly**, including after you turned that knob
+      while it was infected — the base is re-read, never remembered.
+- [ ] **Turning an infected knob evicts the infection** and the widget stays
+      clear for ~25 s (`virusSpare`, hooked in `Editor.setParamLive`).
+- [ ] **The marker is BROKEN and a patched CV marker is still solid.** Check a
+      fader and an XY pad too, not just a knob — the fader markers are fills and
+      take a different code path (`markBar`).
+- [ ] **No dotted block outlines anywhere on the canvas.** That is a leaked
+      `setLineDash` from a marker stroke, and it appears on shapes drawn far
+      away from the widget that leaked it.
+- [ ] **Nothing is written to the document.** The scene must not go unsaved, and
+      undo must have nothing in it, no matter how long an outbreak runs.
+- [ ] Stop audio: the outbreak must recede and die out rather than freeze.
+
 ## Minions (`src/ui/minions/`)
 
 Deletable by design, so nothing here is load-bearing for correctness — but every
@@ -625,6 +840,33 @@ by a number or a picture. See [`15-minions.md`](15-minions.md).
       give it a block and **wire something to the block while it is held** —
       that must work, and it works only because a carried thing is genuinely at
       the gripper rather than drawn there.
+- [ ] **Gus comes into a subpatch, and he comes in through something.** Hire
+      him, enter a subpatch: he must turn up. On a roomy block he comes **up
+      through a service panel** which then swings shut; on a cramped one, or
+      onto a cable, he is **lowered in on the gondola**. Never both props at
+      once, and never simply standing there on the first frame.
+- [ ] **A port under a minion still takes the cable.** Park a minion over a
+      block's input, drag a cable so the port highlights, and let go: it must
+      land on the **port**. The hover preview already promised the port
+      (`overlay.hoverPort`); the drop used to hand it to the robot, whose catch
+      radius is 48 units against the port's ~14.
+- [ ] **The hand-over, approached SLOWLY.** Pick a block up and walk it at the
+      machine a couple of units per frame — not a lunge. Its distance to your
+      pointer must never increase and the drop must land. This is the one that
+      has failed three times in three different places (the keep-out cone, the
+      offer gate, and the `FERRY_KEEPOUT` clamp at the *end* of the target
+      chain), and the fast approach passes while the slow one fails, so a lunge
+      proves nothing. Drive it: chase the machine's live position with real
+      `pointermove` events and sum every frame where the gap grew. Last
+      measured, carrying a block from 100 units out, total retreat **2.6 units**
+      and it took the block; empty-handed the same chase leaves it **143 units**
+      off, which is the station-keeping still working.
+- [ ] **Press the machine itself, don't move, let go.** Nothing may happen — no
+      widget grabbed, no cable unplugged, and it is still holding what it held.
+      A follower flies over your patch, so a press on it lands on somebody's
+      block; the body press returns rather than falling through to the hit
+      order. Then press the body and *drag*: what it was holding comes into your
+      drag rather than being set down where the machine was hovering.
 - [ ] Double-click it while it is carrying: straight back where it came from.
       A block dragged out of the Library goes **back to the Library**, not down
       on the canvas — it has never been anywhere, so there is no "there".
@@ -766,6 +1008,13 @@ node -e "const s=require('fs').readFileSync('electron/main.cjs','utf8'),m=requir
 - [ ] Delete the source block → its clones vanish. **Undo → they come back.**
 - [ ] Arrange mode: move/resize/multi-select, snap guides appear only for snaps
       that applied, geometry survives save/reload.
+- [ ] **Drag the Dock down to a sliver with the Widgets tab EMPTY.** The
+      empty-state hint must sit still. It shook, because the canvas took an
+      80×60 floor from `clientWidth`/`clientHeight` — bigger than a slim pane —
+      so it overflowed, `overflow: auto` put a scrollbar up, the scrollbar took
+      the width back off `clientWidth`, and the next frame resized from the
+      smaller number. Any per-frame `canvas.style.width = f(clientWidth)` in a
+      scrolling box can do this.
 - [ ] **Every widget docks on its own**, visuals included: right-click a
       Matrix's grid, an EQ curve, a scope, a meter and a Speaker Monitor and
       confirm each offers **Add to Dock**. Docking used to be offered only for

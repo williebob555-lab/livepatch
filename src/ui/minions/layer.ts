@@ -35,6 +35,7 @@ import type { WirePaths } from '../geometry';
 // a character, the framework has broken.
 import './gus';
 import './orderly';
+import './pathogen';
 
 interface Live {
   id: string;
@@ -62,6 +63,9 @@ function syncAgents(): void {
     if (agents.has(id)) continue;
     const def = minionDef(id);
     if (!def) continue;
+    // A `noAgent` hire has a card and switches but nothing on the canvas —
+    // spawning one would walk an invisible body round the patch for ever.
+    if (def.noAgent) continue;
     agents.set(id, { id, agent: new Agent(id, def.makeBody()), pose: null, claimed: null });
   }
 }
@@ -115,7 +119,25 @@ let lastUi: UiState = { pointer: null, view: { x: 0, y: 0, w: 1, h: 1 }, heldWir
 function crossLevel(from: string, to: string): void {
   for (const l of agents.values()) {
     if (l.agent.level !== from) continue;
-    if (minionDef(l.id)?.follows !== true) continue;
+    if (minionDef(l.id)?.follows !== true) {
+      // **A walker relocates to the graph you have opened.**
+      //
+      // He used to stay behind, on the reasoning that his jobs are in the graph
+      // he is standing in. That reasoning is sound and its conclusion was not:
+      // a subpatch is a real graph with real mess in it, and a hire who is
+      // simply *absent* down there means a whole half of the app has no
+      // tidying and no way to ask for any. Reported as "gus isn't appearing in
+      // subblocks", which is what it looks like from outside.
+      //
+      // He is un-placed rather than moved, so the per-frame placement pass
+      // below gives him a perch in the NEW graph — and with it the arrival:
+      // up through a service panel in whatever block he lands on, or lowered
+      // in on the gondola when there is no panel to come up through
+      // (`Agent.spawnVia`). Anything he was part-way through is abandoned
+      // properly, because the job belongs to the graph he has left.
+      l.agent.relocate(to);
+      continue;
+    }
     if (!l.agent.crossTo(to)) continue;
     // **The cargo moves when the machine ARRIVES, not when it leaves.** It is
     // nowhere for most of a second (see `Agent.crossTo`), and moving the block
@@ -129,6 +151,26 @@ function crossLevel(from: string, to: string): void {
 
 /** Blocks travelling with a minion between levels. See `crossLevel`. */
 const pendingCargo: Array<{ id: string; blockId: string; from: string; to: string }> = [];
+
+/**
+ * Every block currently in somebody's gripper.
+ *
+ * **A carried block is really at the gripper** (`payload.ts`), which is what
+ * keeps the rest of the app from needing to know about carrying at all — and it
+ * means the minions' own sensing cannot tell a block being flown across the
+ * patch from a block somebody left in a silly place. So the one piece of code
+ * that does know says so, and both consumers ask it: the walkable world (you do
+ * not stand on a moving block) and the chore scan (`heldBlockIds` — you do not
+ * tidy one either).
+ */
+function carriedBlockIds(): string[] {
+  const out: string[] = [];
+  for (const l of agents.values()) {
+    const load = l.agent.carrying;
+    if (load?.kind === 'block') out.push(load.blockId);
+  }
+  return out;
+}
 
 /** Land a block that was in transit, cutting the cables it cannot bring. */
 function landCargo(agentId: string): void {
@@ -297,9 +339,14 @@ export function drawMinions(
     lastLevel = level;
   }
 
+  // Everything in a gripper this frame — the blocks nobody may treat as part of
+  // the scenery. Computed once and used twice: the walkable world and the chore
+  // scan (`heldBlockIds`).
+  const heldBlocks = carriedBlockIds();
+
   let world: WalkWorld;
   try {
-    world = walkWorld(doc.graph, paths);
+    world = walkWorld(doc.graph, paths, heldBlocks);
   } catch (e) {
     if (String(e) !== bootErr) {
       bootErr = String(e);
@@ -325,7 +372,7 @@ export function drawMinions(
   // per agent and costs a null check.
   const near = { x: view.x + view.w / 2, y: view.y + view.h / 2 };
   for (const l of agents.values())
-    if (!l.agent.placed) l.agent.place(world, graph, near, (x, y) => otherAt(l.agent, x, y) !== null);
+    if (!l.agent.placed) l.agent.place(world, graph, near, (x, y) => otherAt(l.agent, x, y) !== null, theme);
 
   // ---- one chore scan for everyone ----
   const sel = graph.blocks.find((b) => b.selected);
@@ -353,6 +400,7 @@ export function drawMinions(
     patienceS,
     tolerance: tolerance || undefined,
     heldWireId: ui?.heldWireId ?? null,
+    heldBlockIds: heldBlocks,
   });
   for (const l of agents.values()) l.claimed = null;
 
@@ -550,6 +598,15 @@ function drawAgent(g: CanvasRenderingContext2D, l: Live, theme: Theme, view: { y
   // its own work — an alpha set inside would be discarded, and one set here
   // survives, which is the same asymmetry the form/outline passes rely on.
   g.save();
+  // **Climbing out of a panel: clip away everything below its opening.** The
+  // clip is set here, in WORLD space, before the translate — a canvas clip is
+  // resolved into device space when it is set, so it survives `paintBody`
+  // switching to its own transform, exactly as the alpha below does.
+  if (pose.emerging && pose.hatch) {
+    g.beginPath();
+    g.rect(-1e6, -1e6, 2e6, 1e6 + pose.hatch.y + pose.hatch.h);
+    g.clip();
+  }
   g.globalAlpha = l.agent.presence;
   g.translate(pose.world.x, pose.world.y);
   l.agent.paintBody(g, view.scale);

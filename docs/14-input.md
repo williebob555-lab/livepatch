@@ -1,6 +1,6 @@
 # 14 — Input Standard: Touch, Trackpad, Mouse and Pen
 
-_Last verified: 2026-08-03. Files: `src/ui/input.ts` (the implementation), `electron/keys.cjs`, `src/ui/keylearn.ts`,
+_Last verified: 2026-08-12. Files: `src/ui/input.ts` (the implementation), `electron/keys.cjs`, `src/ui/keylearn.ts`,
 every `src/ui/*.ts` that owns a canvas or a drag handle, `src/styles.css`._
 
 > **This document is normative.** Any new interactive surface — a canvas, a deep
@@ -36,8 +36,10 @@ them.
 
 | gesture | meaning |
 |---|---|
+| **double-click / double-tap a knob, fader or hfader** | reset it to its default |
 | one finger on empty space | the surface's primary drag (marquee, scrub, pan — surface's choice) |
 | one finger on an object | move/operate that object |
+| **click/tap a loose cable end** | select it: ask the Library for a block to finish it (`ui/placement.ts`) |
 | one finger **held, then dragged** | drag an item out of a scrolling list (the Library) |
 | **two fingers** | **pan the view** — always, on every surface that has a view |
 | two fingers, spread past the deadzone | *additionally* zoom |
@@ -54,6 +56,8 @@ them.
 | Ctrl+Shift + scroll | zoom both axes | zoom both axes |
 | middle-drag, or Space+drag | pan | pan |
 | right-click | context menu | context menu |
+| **Shift + value drag** | fine (×8 travel for the same change) | same |
+| **Alt + drag a block** | pull it out of its chain and carry it, cables healing behind (`doExtract`) | same |
 
 ---
 
@@ -115,6 +119,71 @@ Two deliberate departures, both documented here so nobody "fixes" them:
   Library with two fingers and then moving to the Roll re-taught the Roll from
   scratch. Evidence and stickiness live in `noteWheel`/`isTrackpad`.
 
+### The verdict never expires, and never changes mid-gesture
+
+The classification is the fragile part of this whole document, and it failed in
+the most confusing way available: *"the two-finger pan switches between zoom and
+pan every so often"* (2026-08-12), plus *"the Clip tab zooms when I two-finger
+pan"*, which was the same bug wearing a different hat.
+
+The old rule held a trackpad verdict for 600 ms and re-armed it only from
+**fresh** evidence: a fractional delta, a non-zero `deltaX`, or three *small*
+deltas in a row. Now look at what a fast vertical two-finger scroll actually
+sends on Windows: whole pixels (precision touchpads round), no `deltaX` at all,
+and deltas far over the "small" threshold — which also **reset** the run
+counter. So the gesture produced no evidence of anything, the hold expired *in
+the middle of the flick*, and the surface began zooming under the user's
+fingers; the momentum tail was slow enough to re-arm the verdict and it flipped
+back to panning. Replayed against the old code, one 1.3 s flick contains
+**three** verdict changes and 47 zoomed events. The longer and faster the
+gesture the worse it got, which is why the Clip tab — where you flick across a
+whole file — was the surface people complained about.
+
+Two rules come out of that, and they are the same rule:
+
+1. **The device verdict persists until something contradicts it.** Silence is
+   not evidence of a mouse. There is no timeout.
+2. **A wheel gesture is classified once, by its first event.** A gesture is a
+   contiguous run of events less than `GESTURE_GAP` (250 ms) apart. It may be
+   *promoted* to trackpad if evidence turns up mid-stroke — that is how the
+   first scroll of a session recovers — but it is never demoted, except by
+   `deltaMode !== 0`, which is definitive. **A gesture that changes its mind
+   halfway is never what the user meant.**
+
+What one event is worth:
+
+| signal | verdict | why |
+|---|---|---|
+| `deltaMode !== 0` (lines/pages) | **mouse**, definitive | trackpads always report pixels |
+| non-zero `deltaX` | **trackpad** | a wheel has one axis to spare, a pad has two |
+| fractional `deltaY` | trackpad | a notch is a whole number of px |
+| `abs(deltaY)` under 40 | trackpad | a notch is a big discrete step |
+| two **equal** whole notches, 40 ms+ apart | mouse | a wheel repeats itself exactly and is never a dense stream |
+| anything else | *nothing* — keep the standing verdict | ambiguity must not flip a live gesture |
+
+That last row is the one the old code got wrong: it read "no evidence" as
+evidence of a mouse. The equal-magnitude test in the mouse row matters for the
+same reason — a hard trackpad flick clears 40 px easily, but its deltas arrive
+as a dense stream and no two of them are the same number.
+
+The cost, stated so nobody treats it as a new bug: switching from the trackpad
+to a mouse wheel spends **one notch** panning before the second notch wins the
+verdict back. That is the price of never flipping mid-gesture, and it was
+chosen deliberately.
+
+### When a scroll complaint arrives, measure it
+
+`__lp.wheel.watch()` → make the gesture → `__lp.wheel.report()`, in the
+renderer console. It records every wheel event with its deltas, its modifiers
+and the verdict it produced, and groups them into gestures.
+
+Do this *first*. "It zoomed when I meant to pan" has at least three causes —
+the verdict flipped, the surface declared `noPan`, or the OS never sent the
+axis — they are indistinguishable from the outside, and which one it is depends
+on delta values nobody can see without asking. A `FLIP` in the report is ours.
+`both-axes 0` across a deliberately diagonal scroll is not: it means the axis
+lock is in the Windows precision-touchpad driver, above the browser.
+
 ### The sign of a pan: scrolls and drags are opposites
 
 **A scroll moves the viewport. A drag moves the content.** They therefore take
@@ -138,6 +207,27 @@ walked the view *up* the keyboard.
 So when you add a pan: write down which of the two you are implementing, check
 **both** axes against it, and remember that an inverted axis flips the sign
 without flipping the intent.
+
+### An axis that is an integer needs `StepPan`
+
+**A view value that must stay a whole number cannot be panned by rounding each
+event on its own.** A trackpad and a two-finger drag both deliver a *stream of
+small deltas* — 3-6 px per event — where a mouse delivers one big one. If a step
+of that axis is 12-20 px, every event rounds to the value it already had and the
+axis does not move **at all, ever**, however long the user scrolls.
+
+That is a dead axis, not a rounding inaccuracy, and it is the second half of
+*"when you start going in one axis the other axis is locked until you stop"*
+(2026-08-12). The piano roll's `view.lo` is a whole note number and its `view.t0`
+is a float, so one diagonal gesture panned smoothly in time and stood perfectly
+still in pitch. It came alive only on a fast flick — whose deltas finally
+cleared half a row each — which is exactly why it read as *locked until you
+stop*: the second, deliberate gesture is the faster one.
+
+`StepPan` in `input.ts` carries the remainder between events. The remainder is
+what **rounding** dropped, never what the **clamp** dropped: keeping
+`want - clamped` looks equivalent and instead parks half a step at the end of
+the axis, so the first step back off the top of the keyboard goes nowhere.
 
 ### Value wheels are not navigation
 
@@ -188,6 +278,20 @@ listed — a mouse user loses nothing from a 14 px splitter.
 Related: `dragThreshold(e)` — 3 px for a mouse, 10 px for touch, because a
 fingertip rolls a few px during any deliberate press and a 3 px threshold turns
 every tap into a micro-drag.
+
+### …and a target that the user can resize scales with **it**, too
+
+`Editor.endGrab` — the radius that counts as "on the end of that cable" — is
+`BASE_END_GRAB + theme.arrowSize * 0.9`, screen-sized (so divided by the zoom)
+and then widened for touch by `grabSlop` like everything else. The thing being
+aimed at is the arrowhead, and the arrowhead is a **theme setting** the user can
+run from 5 px to 18 px in Appearance ▸ Wires; a constant radius is correct for
+exactly one value of it and too small for every larger one. Turning the arrows up
+is, in part, a request for a bigger target.
+
+It is capped just under `BRANCH_DEADZONE`, because the end-grab and the
+branch-spawn live on the same cable a few px apart and the deadzone is the only
+thing keeping them separable.
 
 ## Rule 4 — `setPointerCapture` always goes through `capture()`
 
@@ -377,6 +481,10 @@ actually shipped.
       not resume it.
 - [ ] `wheelIntent()` for navigation, `wheelDelta()` for value wheels — and
       `deltaX` is not ignored.
+- [ ] Any view axis that is an **integer** pans through `StepPan`, so a stream
+      of sub-step deltas still moves it. Test by scrolling that axis *slowly*.
+- [ ] A **long, fast** two-finger scroll pans for its whole length — not just a
+      short one. Verdict flapping only shows up past ~600 ms of speed.
 - [ ] Every value wheel has a touch equivalent.
 - [ ] Hit tolerances go through `grabSlop()`.
 - [ ] Long-press context menu, suppressed **only** over widgets whose press is
@@ -390,6 +498,12 @@ actually shipped.
 - [ ] No `movementX`/`movementY`.
 - [ ] Tested at UI scale 1.0 **and** ≠ 1.0 — see the UI-scale rule in
       [`07-ui.md`](07-ui.md).
+- [ ] **A drop that rewires shows its proposal first.** Anything that re-plumbs
+      the patch on release (splice, drag-to-modulate) draws what it will do
+      while the gesture is still live — and paints it *above* the block pass,
+      because the mark is on the thing in the user's hand and painting it with
+      the wires means drawing it perfectly and then covering it up. See the
+      rewiring-verbs section of [`07-ui.md`](07-ui.md).
 - [ ] Added to the manual pass in
       [`12-testing-checklist.md`](12-testing-checklist.md).
 
@@ -397,7 +511,7 @@ actually shipped.
 
 | surface | one finger | two fingers | wheel |
 |---|---|---|---|
-| Workspace canvas (`editor.ts`) | drag/marquee/wire | pan + pinch, tap = menu | pan or uniform zoom |
+| Workspace canvas (`editor.ts`) | drag/marquee/wire; **block onto a wire = splice**, **cable onto a widget = modulate** | pan + pinch, tap = menu | pan or uniform zoom |
 | Clip tab — waveform (`clipview.ts`) | scrub / select / pan | pan + pinch (time) | pan or zoom time |
 | Clip tab — Roll (`clipview.ts`, `pianoroll.ts`) | notes / bars | pan + per-axis pinch | pan; Ctrl = time, Shift = pitch |
 | Widgets tab (`widgetdock.ts`) | operate / arrange | scroll the field | native scroll |
@@ -418,9 +532,35 @@ Written down rather than left to be rediscovered:
 - **Inertial scrolling** is not implemented anywhere. A trackpad's momentum
   phase arrives as ordinary wheel events, so it works by accident on pan; a
   touch flick simply stops when the finger lifts.
+- **Diagonal trackpad scrolling on Windows is suspected to be locked to one axis
+  above us, and this is not yet measured.** Reported 2026-08-12 as "when you
+  start going in one axis the other axis is locked until you stop". One cause
+  was ours and is fixed (`StepPan`, above). The other candidate is the Windows
+  precision-touchpad gesture recogniser, which picks a dominant direction at the
+  start of a two-finger scroll and sends only `WM_MOUSEWHEEL` *or* only
+  `WM_MOUSEHWHEEL` until the fingers lift — in which case the second axis never
+  reaches the renderer and nothing in this app can recover it. **Settle it with
+  `__lp.wheel.report()` before writing any code**: `both-axes 0` over a
+  deliberately diagonal scroll means the events genuinely carry one axis.
 - **Rotation** is not a gesture we use. If a surface ever wants it, it belongs in
   `TwoPointerGesture` beside the zoom, with its own deadzone for the same reason
   zoom has one.
+- **There is no fine value drag on touch** (2026-08-12). Shift gives one to
+  every pointer type that has a keyboard, and a touchscreen has none — so on a
+  tablet a log-curve frequency knob is still only reachable to ~1/140 of its
+  range. Neither obvious gesture is free: two fingers pan and *supersede* the
+  one-finger interaction (rule 8), and long-press is the context menu, which
+  this document explicitly protects on knobs and faders. The likely answer is
+  the phone-slider convention — precision increasing with distance from the
+  widget — which works for every pointer type and needs no modifier, but it
+  overlaps Shift confusingly and was not worth inventing under time pressure.
+  Written down rather than left as an accidental omission.
+- **There is no touch gesture for pulling a block out of a chain** (2026-08-13).
+  `Alt+drag` needs a keyboard. The right-click item (`Pull out of chain`, which
+  a long-press reaches) does the same edit and leaves the block where it stands,
+  so nothing is unreachable on a tablet — only the carry half of the motion is
+  missing. Not solved by inventing a gesture for the same reason as the entry
+  above: every free one on a block is already spoken for.
 
 ---
 

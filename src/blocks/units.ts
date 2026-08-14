@@ -1396,6 +1396,14 @@ registerUnit('midi-trigger', (params, _env) => {
         }
       }
     },
+    // FAILSAFE: the CV gate that would have lifted this note may have been
+    // unplugged while it was high — that is `panicOrphans`'s other half.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (lastOn >= 0) out?.({ type: 'off', note: lastOn, velocity: 0, channel: 0 });
+      lastOn = -1;
+      out?.(ev);
+    },
     setMidiOut: (cb) => (out = cb),
     dispose: () => {},
   };
@@ -1428,21 +1436,48 @@ function quantizeW(note: number, scale: number[], root: number): number {
   return note - pc + best;
 }
 /** Analyser-backed CV clock inlet (rising-edge detect in tick). */
-function clockInlet(env: UnitEnv): { node: GainNode; rose(): boolean; connected: boolean } {
+/**
+ * A clock inlet: rising-edge detection, plus whether a cable is on it at all.
+ *
+ * `connected` comes from the GRAPH (`Unit.setFed`), never from the signal.
+ * It used to latch true the first time a non-zero sample arrived and never
+ * cleared — and since units are reused across rebuilds, an arp or sequencer
+ * that had ever been clocked would never free-run from its own Rate knob
+ * again: unplug the clock and it simply stopped, for the rest of the session.
+ *
+ * Sniffing cannot work here whichever way round you write it. A square clock
+ * sits at zero for most of its cycle, so "silent for a while" is
+ * indistinguishable from "unplugged" at any threshold slow enough for a 0.2 Hz
+ * clock — which is exactly why the app answers this question from the graph
+ * everywhere else (`sh`'s explicit Source switch, and the native engine, where
+ * `ins['clock']` just stops existing).
+ */
+function clockInlet(
+  env: UnitEnv,
+  port = 'clock',
+): { node: GainNode; rose(): boolean; connected: boolean; setFed(ports: ReadonlySet<string>): void } {
   const g = env.ctx.createGain();
   const an = env.ctx.createAnalyser();
   an.fftSize = 32;
   g.connect(an);
   const buf = new Float32Array(32);
   let prev = 0;
-  let ever = false;
+  let fed = false;
   return {
     node: g,
-    get connected() { return ever; },
+    get connected() { return fed; },
+    setFed(ports) {
+      const now = ports.has(port);
+      // Re-arm the edge detector when a cable arrives or leaves, so the first
+      // sample of a newly patched clock is not compared against whatever the
+      // old line happened to be sitting at.
+      if (now !== fed) prev = 0;
+      fed = now;
+    },
     rose() {
+      if (!fed) return false;
       an.getFloatTimeDomainData(buf);
       const v = buf[buf.length - 1];
-      if (Math.abs(v) > 1e-4) ever = true;
       const r = prev <= 0.5 && v > 0.5;
       prev = v;
       return r;
@@ -1482,6 +1517,7 @@ registerUnit('arp', (params, env) => {
   };
   return {
     inlet: (p) => (p === 'clock' ? clk.node : null),
+    setFed: (ports) => clk.setFed(ports),
     outlet: () => null,
     setParam: (id, v) => {
       if (id === 'mode') mode = str(v, 'up');
@@ -1491,6 +1527,17 @@ registerUnit('arp', (params, env) => {
       else if (id === 'prob') prob = num(v, 1);
     },
     midiIn: (ev) => {
+      if (ev.type === 'panic') {
+        // Drop the whole keyboard AND the note currently being arpeggiated —
+        // the pattern is regenerated from `held`, so leaving one behind would
+        // have it keep playing off a chord nobody is holding.
+        held.length = 0;
+        if (cur >= 0) out?.({ type: 'off', note: cur, velocity: 0, channel: 0 });
+        cur = -1;
+        gateT = 0;
+        out?.(ev);
+        return;
+      }
       if (ev.type === 'on') { if (!held.includes(ev.note)) held.push(ev.note); }
       else if (ev.type === 'off') {
         const i = held.indexOf(ev.note);
@@ -1517,6 +1564,14 @@ registerUnit('chord', (params, _env) => {
     outlet: () => null,
     setParam: (id, v) => { if (id === 'quality') quality = str(v, 'maj'); },
     midiIn: (ev) => {
+      if (ev.type === 'panic') {
+        // Every note of every chord it built, not just the keys that made them.
+        for (const notes of held.values())
+          for (const n of notes) out?.({ type: 'off', note: n, velocity: 0, channel: 0 });
+        held.clear();
+        out?.(ev);
+        return;
+      }
       if (ev.type === 'on') {
         const notes = (CHORD_IV[quality] ?? [0]).map((d) => ev.note + d);
         held.set(ev.note, notes);
@@ -1557,6 +1612,14 @@ registerUnit('transpose', (params, _env) => {
       }
     },
     midiIn: (ev) => {
+      if (ev.type === 'panic') {
+        // The TRANSPOSED notes: what went out is what has to come back off, and
+        // `semis` may well have moved since.
+        for (const nn of held.values()) out?.({ type: 'off', note: nn, velocity: 0, channel: 0 });
+        held.clear();
+        out?.(ev);
+        return;
+      }
       if (ev.type === 'on') { const nn = map(ev.note); held.set(ev.note, nn); out?.({ type: 'on', note: nn, velocity: ev.velocity, channel: 0 }); }
       else if (ev.type === 'off') { const nn = held.get(ev.note); held.delete(ev.note); out?.({ type: 'off', note: nn ?? map(ev.note), velocity: 0, channel: 0 }); }
       else out?.(ev);
@@ -1584,6 +1647,7 @@ registerUnit('seq', (params, env) => {
   };
   return {
     inlet: (p) => (p === 'clock' ? clk.node : null),
+    setFed: (ports) => clk.setFed(ports),
     outlet: () => null,
     seqStep: () => playing,
     setParam: (id, v) => {
@@ -1591,6 +1655,18 @@ registerUnit('seq', (params, env) => {
       else if (id === 'rate') rate = num(v, 8);
       else if (id === 'length') length = Math.round(num(v, 8));
       else if (id === 'gate') gate = num(v, 0.5);
+    },
+    // FAILSAFE: a sequencer is a SOURCE, so nothing routes a panic into it —
+    // but it takes one so the user-reachable panic (which goes to everybody)
+    // can lift the step it is currently holding. It keeps running: panic means
+    // "let go of what you are holding", not "stop", and stopping is what the
+    // transport is for.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (cur >= 0) out?.({ type: 'off', note: cur, velocity: 0, channel: 0 });
+      cur = -1;
+      gateT = 0;
+      out?.(ev);
     },
     setMidiOut: (cb) => (out = cb),
     tick: (dt) => {
@@ -1648,6 +1724,7 @@ registerUnit('midi-echo', (params, env) => {
   };
   return {
     inlet: (p) => (p === 'clock' ? clk.node : null),
+    setFed: (ports) => clk.setFed(ports),
     outlet: () => null,
     setParam: (id, v) => {
       if (id === 'time') time = num(v, 0.25);
@@ -1656,6 +1733,16 @@ registerUnit('midi-echo', (params, env) => {
     },
     midiIn: (ev) => {
       out?.(ev);
+      if (ev.type === 'panic') {
+        // Kill the queue. A repeat is a note-on this block has PROMISED to make
+        // later; a panic that only silenced what is sounding now would be
+        // followed, half a second later, by the echo it forgot to cancel.
+        for (const e of pool) {
+          if (e.active) out?.({ type: 'off', note: e.note, velocity: 0, channel: 0 });
+          e.active = false;
+        }
+        return;
+      }
       if (ev.type !== 'on' || repeats < 1 || feedback <= 0) return;
       const e = pool.find((x) => !x.active);
       if (e) { e.note = ev.note; e.vel = ev.velocity * feedback; e.left = time; e.rep = 0; e.active = true; }
@@ -1673,6 +1760,36 @@ registerUnit('midi-echo', (params, env) => {
   };
 });
 
+/**
+ * FAILSAFE: what a hardware MIDI output must send to guarantee silence.
+ *
+ * **This is the case with the highest stakes in the whole failsafe**, and the
+ * only one where the thing left sounding is not ours: a note stranded on an
+ * external synth cannot be stopped by anything in this app — not by deleting
+ * the block, not by closing LivePatch — short of power-cycling the instrument.
+ *
+ * Belt and braces, because the two braces each fail on real hardware:
+ *
+ *   * **CC 123 (All Notes Off) and CC 120 (All Sound Off)** are the correct
+ *     messages, and plenty of instruments ignore one or both — they are
+ *     "recommended" in the spec, which in practice means optional.
+ *   * **An explicit note-off for all 128 notes** is what every instrument in
+ *     existence understands. 128 three-byte messages is a rounding error on a
+ *     31.25 kbaud link (about 12 ms) and this runs once, on a failure.
+ *
+ * On **every channel**, not just the block's own: the panic exists precisely
+ * for the case where the app's model of what is sounding is already wrong, so
+ * trusting that model to narrow the fix would be trusting the thing that broke.
+ */
+function hardwarePanic(sendTo: (bytes: number[]) => void): void {
+  for (let ch = 0; ch < 16; ch++) {
+    sendTo([0xb0 | ch, 123, 0]); // All Notes Off
+    sendTo([0xb0 | ch, 120, 0]); // All Sound Off
+    sendTo([0xb0 | ch, 64, 0]); // sustain pedal up — a held pedal outlives both
+    for (let n = 0; n < 128; n++) sendTo([0x80 | ch, n, 0]);
+  }
+}
+
 registerUnit('midi-out', (params, _env) => {
   let device = str(params.device);
   let channel = Math.max(1, Math.round(num(params.channel, 1))) - 1;
@@ -1686,7 +1803,8 @@ registerUnit('midi-out', (params, _env) => {
     },
     midiIn: (ev) => {
       const ch = channel & 0x0f;
-      if (ev.type === 'on') send([0x90 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
+      if (ev.type === 'panic') hardwarePanic(send);
+      else if (ev.type === 'on') send([0x90 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
       else if (ev.type === 'off') send([0x80 | ch, ev.note & 0x7f, 0]);
       else if (ev.type === 'cc') send([0xb0 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
       else if (ev.type === 'bend') {
@@ -1695,7 +1813,11 @@ registerUnit('midi-out', (params, _env) => {
       } else if (ev.type === 'pressure') send([0xd0 | ch, Math.round(ev.velocity * 127) & 0x7f]);
       else if (ev.type === 'polyat') send([0xa0 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
     },
-    dispose: () => {},
+    // FAILSAFE: **deleting the block cannot be how a note gets stranded.**
+    // Every other unit's voices die with it; this one's are in somebody else's
+    // instrument, and removing the only block that could address them is the
+    // single most direct route to a note nothing can stop.
+    dispose: () => hardwarePanic(send),
   };
 });
 
@@ -1740,6 +1862,15 @@ registerUnit('midi-cv', (params, env) => {
       if (id === 'ccnum') ccnum = Math.round(num(v, 1));
     },
     midiIn: (ev) => {
+      if (ev.type === 'panic') {
+        // The gate is the note here: a `gate` line stuck at 1 holds an envelope
+        // open on everything downstream of it, which is a stuck note wearing a
+        // different hat. Pitch holds its last value, exactly as a real release
+        // does — dropping it to zero would be an audible glide to middle C.
+        held.length = 0;
+        set('gate', 0, true);
+        return;
+      }
       if (ev.type === 'on') {
         held.push(ev.note);
         set('pitch', (ev.note - 60) / 12);
@@ -1840,6 +1971,11 @@ registerUnit('note-space', (params, env) => {
       } else if (ev.type === 'off') {
         const i = held.lastIndexOf(ev.note);
         if (i >= 0) held.splice(i, 1);
+      } else if (ev.type === 'panic') {
+        // The position is sample-and-hold and stays where it was — a panic is
+        // about notes, and moving the source would be an audible sweep from a
+        // failsafe. Only the record of what is down is dropped.
+        held.length = 0;
       }
       out?.(ev);
     },
@@ -1895,6 +2031,18 @@ registerUnit('cv-midi', (params, env) => {
     outlet: () => null,
     setParam: (id, v) => {
       if (id === 'velocity') vel = num(v, 0.9);
+    },
+    // FAILSAFE: it emits the note off a CV gate, so its stuck case is a gate
+    // line that went away high — and `gateHi` stays true for ever, because the
+    // falling edge that would clear it needs a cable that no longer exists.
+    // Cleared here rather than only sending an off, or the next rise would not
+    // be an edge and the block would go silent instead of stuck.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (gateHi && lastNote >= 0) out?.({ type: 'off', note: lastNote, velocity: 0, channel: 0 });
+      gateHi = false;
+      lastNote = -1;
+      out?.(ev);
     },
     setMidiOut: (cb) => (out = cb),
     dispose: () => {
@@ -2004,6 +2152,13 @@ registerUnit('synth', (params, env) => {
       if (id === 'gain') smooth(master.gain, env.ctx, num(v));
     },
     midiIn: (ev) => {
+      // FAILSAFE: release every sounding voice. Through `noteOff`, so they take
+      // their normal release rather than being cut — a panic is a rescue, and a
+      // rescue that ends in a click on every voice at once is its own event.
+      if (ev.type === 'panic') {
+        for (const n of [...voices.keys()]) noteOff(n);
+        return;
+      }
       if (ev.type === 'on') noteOn(ev.note, ev.velocity);
       else if (ev.type === 'off') noteOff(ev.note);
       else if (ev.type === 'bend') {
@@ -2268,6 +2423,14 @@ registerUnit('sampler', (params, env) => {
         const t = env.ctx.currentTime;
         const R = Math.max(0.005, num(p.release, 0.05));
         for (const v of gated) release(v, t, R);
+      } else if (ev.type === 'panic') {
+        // FAILSAFE: **including the one-shots.** They ignore note-off on
+        // purpose — that is what makes a hit a hit — but "ignore note-off" and
+        // "cannot be stopped" are not the same promise, and a one-shot on a
+        // twenty-minute recording with Loop on is exactly the thing you reach
+        // for a panic to end. `cutVoices` already takes the short release the
+        // eject path uses.
+        cutVoices();
       }
     },
     dispose: () => {
@@ -3527,6 +3690,16 @@ registerUnit('midi-recorder', (params, env) => {
         if (h && recording) land(ev.note, h, env.ctx.currentTime);
         held.delete(ev.note);
         lines.push(`off ${ev.note}`);
+      } else if (ev.type === 'panic') {
+        // FAILSAFE: land every note that was still open, at the moment the
+        // panic arrived. **Not discarded** — the performance up to here is real
+        // and the user is going to want it. What broke was the route, not the
+        // take, and a recorder that threw away a minute of playing because a
+        // cable came out would be a second, worse failure.
+        const now = env.ctx.currentTime;
+        for (const [n, h] of held) if (recording) land(n, h, now);
+        held.clear();
+        lines.push('panic');
       }
       if (lines.length > 8) lines.shift();
     },
@@ -3643,6 +3816,15 @@ registerUnit('midi-player', (params, env) => {
         playing = false;
         allOff();
       }
+    },
+    // FAILSAFE: a player is a source, so it only ever sees the user-reachable
+    // panic. It keeps playing — panic releases, it does not stop the transport
+    // — but the scheduler's own note-offs would then be for notes it no longer
+    // thinks are sounding, which is why `allOff` clears the map as well.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      allOff();
+      out?.(ev);
     },
     setMidiOut: (cb) => {
       out = cb;
@@ -3801,6 +3983,172 @@ registerUnit('gate', (params, env) => {
       inG.disconnect();
       vca.disconnect();
       an.disconnect();
+    },
+  };
+});
+
+// ---------- Decorrelate ----------
+/**
+ * Web mirror of the `decorrelate` kernel — the first Spatial block to stop
+ * being `stubbed`.
+ *
+ * **Why this one first.** Android has no native engine (docs/05), so every
+ * native-only kernel is a block that silently does nothing on that whole
+ * platform — which is what "most of the factory scenes on Android have Native
+ * blocks that just don't work" is, and `scripts/web-parity-test.mjs` is the
+ * standing count of it. Of the blocks the shipped presets use this is by some
+ * way the most common, and it is the one that ports honestly: four Schroeder
+ * allpasses a side, no channel geometry, no HRTF, nothing that needs a speaker
+ * layout the browser cannot be told about.
+ *
+ * ---------------------------------------------------------------------------
+ * **It is a worklet because a node graph gets this measurably wrong**
+ * ---------------------------------------------------------------------------
+ *
+ * The obvious build is nodes — Delay + two Gains per stage, which is exactly
+ *
+ *   v[n] = x[n] + g·y[n]        y[n] = −g·x[n] + v[n−d]
+ *
+ * and which is a textbook allpass: `H(z) = (z⁻ᵈ − g)/(1 − g·z⁻ᵈ)`, pole and
+ * zero mirrored, magnitude flat at every frequency. It was built that way, and
+ * it is **+12 dB**. Measured, not suspected: white noise through four stages
+ * came out 4.06× the input.
+ *
+ * The reason is that **Web Audio adds a render quantum of latency to any
+ * feedback cycle**, and it lands on the feedback branch only — so the response
+ * is really `(z⁻ᵈ − g)/(1 − g·z⁻⁽ᵈ⁺ᑫ⁾)`. The zero is still at `d`, the pole has
+ * moved to `d+q`, and an allpass whose pole and zero no longer mirror is not an
+ * allpass; it is a comb filter with a peak of `1.6/0.4 = 4`, which is +12.04 dB
+ * — the number that came off the meter, to two decimal places.
+ *
+ * That is not a bug to work around, it is a property of node-level feedback,
+ * and it applies to **every delay-feedback structure anybody builds here next**
+ * (the reverbs, the ladder, anything with a comb in it). If the loop's phase
+ * relationships matter, the loop does not go in the node graph.
+ *
+ * So the sample loop is lifted verbatim from `engine/src/dsp.ts` and run in an
+ * AudioWorklet, the same arrangement `logicUnit` above uses — including its
+ * bargain that the pass gains take wires immediately and the module splices
+ * itself in when it lands, so a freshly dropped block is a clean pass-through
+ * rather than a silence.
+ */
+const DECORR_WORKLET = `
+class LpDecorr extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [
+      { name: 'amount', defaultValue: 0.7, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      { name: 'size', defaultValue: 0.5, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+    ];
+  }
+  constructor() {
+    super();
+    this.MAXD = 4096;
+    // Lengths in FRAMES, straight from the kernel. Long and disjoint: short
+    // delays barely rotate phase at low frequencies and decorrelate weakly,
+    // where these span ~10-45 ms and wrap the phase many times across the
+    // spectrum, which is what makes the result diffuse rather than just wide.
+    const mk = (len) => ({ b: new Float32Array(this.MAXD), w: 0, len: len, g: 0.6 });
+    this.apL = [mk(487), mk(937), mk(1523), mk(2111)];
+    this.apR = [mk(631), mk(1187), mk(1789), mk(2371)];
+  }
+  ap(a, x, size) {
+    const M = this.MAXD;
+    const d = Math.max(1, Math.min(M - 1, Math.round(a.len * (0.3 + 0.7 * size))));
+    const ri = (a.w - d + M) % M;
+    const y = -a.g * x + a.b[ri];
+    a.b[a.w] = x + a.g * y;
+    a.w = (a.w + 1) % M;
+    return y;
+  }
+  process(inputs, outputs, params) {
+    const inp = inputs[0];
+    const out = outputs[0];
+    const oL = out[0];
+    const oR = out[1] || out[0];
+    if (!oL) return true;
+    const amt = params.amount[0];
+    const size = params.size[0];
+    const inL = inp && inp[0];
+    // A mono source feeds both chains from its one channel — the same thing
+    // the kernel does with 'src.length > 1 ? src[1] : src[0]'. Without it the
+    // right chain would decorrelate silence and the block would lose 6 dB.
+    const inR = (inp && (inp[1] || inp[0])) || null;
+    for (let i = 0; i < oL.length; i++) {
+      const l = inL ? inL[i] : 0;
+      const r = inR ? inR[i] : 0;
+      let dl = l;
+      let dr = r;
+      for (let k = 0; k < 4; k++) dl = this.ap(this.apL[k], dl, size);
+      for (let k = 0; k < 4; k++) dr = this.ap(this.apR[k], dr, size);
+      oL[i] = l * (1 - amt) + dl * amt;
+      oR[i] = r * (1 - amt) + dr * amt;
+    }
+    return true;
+  }
+}
+registerProcessor('lp-decorr', LpDecorr);
+`;
+const decorrWorkletReady = new WeakMap<AudioContext, Promise<boolean>>();
+const ensureDecorrWorklet = (ctx: AudioContext): Promise<boolean> => {
+  let p = decorrWorkletReady.get(ctx);
+  if (!p) {
+    p = (async () => {
+      const url = URL.createObjectURL(new Blob([DECORR_WORKLET], { type: 'application/javascript' }));
+      try {
+        await ctx.audioWorklet.addModule(url);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    })();
+    decorrWorkletReady.set(ctx, p);
+  }
+  return p;
+};
+
+registerUnit('decorrelate', (params, env) => {
+  const inG = env.ctx.createGain();
+  const out = env.ctx.createGain();
+  // Until the module lands the block passes audio straight through. A block
+  // that is briefly *dry* is a block that is briefly not decorrelating; a block
+  // that is briefly silent is one the user reports as broken.
+  inG.connect(out);
+  let node: AudioWorkletNode | null = null;
+  let disposed = false;
+  let amount = num(params.amount, 0.7);
+  let size = num(params.size, 0.5);
+  void ensureDecorrWorklet(env.ctx).then((ok) => {
+    if (disposed || !ok) return;
+    node = new AudioWorkletNode(env.ctx, 'lp-decorr', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+    });
+    node.parameters.get('amount')!.value = amount;
+    node.parameters.get('size')!.value = size;
+    inG.disconnect(out);
+    inG.connect(node);
+    node.connect(out);
+  });
+  return {
+    inlet: () => inG,
+    outlet: () => out,
+    setParam: (id, v) => {
+      if (id === 'amount') {
+        amount = num(v, 0.7);
+        if (node) smooth(node.parameters.get('amount')!, env.ctx, amount);
+      } else if (id === 'size') {
+        size = num(v, 0.5);
+        if (node) smooth(node.parameters.get('size')!, env.ctx, size);
+      }
+    },
+    dispose: () => {
+      disposed = true;
+      node?.disconnect();
+      inG.disconnect();
+      out.disconnect();
     },
   };
 });
@@ -4258,6 +4606,17 @@ registerUnit('keyboard', (params, _env) => {
         held.delete(rel);
         out?.({ type: 'off', note: abs ?? rel + oct * 12, velocity: 0, channel: 0 });
       }
+    },
+    // FAILSAFE: an on-screen key is held by a POINTER, and a pointer can be
+    // taken away mid-press — the window loses focus, a touch is cancelled — so
+    // the key-up that would have released the note never arrives. The panic
+    // clears the map as well as sending the offs, or the key would still read
+    // as down and its next press would emit no note at all.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      for (const abs of held.values()) out?.({ type: 'off', note: abs, velocity: 0, channel: 0 });
+      held.clear();
+      out?.(ev);
     },
     setMidiOut: (cb) => (out = cb),
     dispose: () => {},

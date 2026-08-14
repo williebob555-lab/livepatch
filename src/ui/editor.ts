@@ -7,7 +7,22 @@
 // any block edge.
 // ============================================================================
 import { BlockClip, doc } from '../core/graph';
+import {
+  blockAllowed,
+  clearVirus,
+  clearVirusOn,
+  infectRefusal,
+  infectableParams,
+  seedVirus,
+  virusCount,
+  virusInfections,
+  virusOn,
+  virusSpare,
+  clearVirusParam,
+  seedVirusOn,
+} from '../core/virus';
 import { ParamSpec, WidgetKind, getDef, paramSpec } from '../core/registry';
+import { BYPASS_PARAM } from '../core/compile';
 import { Block, ControlStyle, FaceItem, Port, PortDir, SignalKind, Theme, Vec2, Wire } from '../core/types';
 import { ENT_MAX, isTerminal, replanEntangle, stepEntangle } from '../core/entangle';
 import { fieldFractionAt, inEntangleField } from './entangleface';
@@ -24,12 +39,15 @@ import { pickImage } from './imagepicker';
 import { pickVstPlugin } from '../core/vstplugins';
 import { getCustomBlock, isFactoryBlock, saveCustomBlock, updateCustomBlock } from '../core/customblocks';
 import { resolveAssetFor } from './tape';
+// REWIRE (src/ui/rewire.ts) — the run played after an automatic rewire.
+import { noteRewire, ringForBlock, ringForMark } from './rewire';
 import {
   ResizeEdges,
   blockAt,
   closestOnPath,
   pointInBlock,
   pathIntersectsRect,
+  pointAtRatio,
   portAt,
   portPos,
   pointToEdgeT,
@@ -55,6 +73,7 @@ import {
   syncBlockSize,
   widgetSize,
 } from './layout';
+import { widgetBox } from './facepaint';
 import { MenuItem, colorModal, showContextMenu, promptModal, promptTextModal, closeMenus, hideBanner, showBanner } from './menus';
 import { addWidgetToDock, isWidgetDocked, removeWidgetFromDock } from './widgetdock';
 import { showDockTab } from './dockpanel';
@@ -71,10 +90,12 @@ import {
   eqXToFreq,
   eqYToGain,
   keyAt,
+  MarkShape,
   matrixCellAt,
   matrixFaceRect,
   matrixGeom,
   norm2val,
+  widgetMarkShape,
   parseSteps,
   parseWaveStr,
   pressedKeys,
@@ -87,6 +108,12 @@ import {
 import { toggleSpeakerMute } from '../core/rig';
 import { crossIndex, matrixPorts, parseMatrix, setCrosspoint, toggledCrosspoint } from '../core/matrix';
 import { LONGPRESS_NUDGE, LONGPRESS_SLOP, TwoPointerGesture, capture, dragThreshold, grabSlop, wheelIntent } from './input';
+// QUICK ADD: the pending-placement state is its own module precisely so this
+// file can reach it **synchronously** — a click on the canvas cancels a pending
+// placement inside `pointerDown`, and arming one must not lag behind the
+// gesture that did it, neither of which can await a dynamic import. Only
+// revealing the panel goes through `panels.ts`, which is allowed to be late.
+import { END_SNAP, PlacementIntent, armPlacement, onPlacementChange, pendingPlacementIntent, snapsToEnd } from './placement';
 // MINIONS (src/ui/minions) — the carry seam, and the only reach this file has
 // into that folder. Deleting the feature is: delete the folder, delete this
 // import and the four blocks below marked `MINIONS`. See `minions/layer.ts`.
@@ -128,7 +155,22 @@ const WIRE_HIT_TOL = 6;
  * branch a new one" report, and it got worse the further out you were zoomed —
  * which is exactly when cables look bunched.
  */
-const BASE_END_GRAB = 11;
+const BASE_END_GRAB = 14;
+/**
+ * How much of `theme.arrowSize` is added to the grab radius.
+ *
+ * **The thing you aim at is the arrowhead, and the arrowhead is a theme
+ * setting** (Appearance ▸ Wires, 5–18 px) — so a fixed radius is right for
+ * exactly one setting of it and too small for every larger one. At the default
+ * 9 px arrow the grab is ~22 screen px; turn the arrows up to 18 and it grows
+ * with them, which is what "make the arrows bigger" was asking for in the first
+ * place.
+ *
+ * Capped just under `BRANCH_DEADZONE` so the end can never swallow the stretch
+ * of cable that spawns a branch: the two gestures live on the same wire a few
+ * px apart, and the deadzone is what keeps them apart.
+ */
+const END_GRAB_PER_ARROW = 0.9;
 
 /**
  * Widget kinds for which a press is already the interaction, so a touch
@@ -148,6 +190,21 @@ const HOLD_WIDGETS: ReadonlySet<string> = new Set([
 
 /** Block visuals that act on press (`widgetDown` has a branch for each). */
 const PRESS_VISUALS: ReadonlySet<string> = new Set(['eq', 'matrix', 'speakers']);
+
+/**
+ * FINE DRAG: how much further you must travel, with Shift held, for the same
+ * change in value.
+ *
+ * Named as a **span multiplier** rather than a "sensitivity factor" because the
+ * other reading is genuinely ambiguous and I got it backwards first time:
+ * written as `span = 140 * (1/8)` it makes the drag eight times *coarser*,
+ * which still looks like a working fine-drag until you measure it. The span is
+ * pixels-per-full-range, so finer means BIGGER.
+ *
+ * 8 puts a full sweep at 1120 px — more than a screen, which is the point: fine
+ * mode is for the last few percent, not for travelling.
+ */
+const FINE_DRAG_SPAN = 8;
 
 type DragState =
   | { kind: 'none' }
@@ -172,7 +229,23 @@ type DragState =
       /** Last size whose layout still fit, to fall back on. */
       good: { pos: Vec2; size: { w: number; h: number }; layout: FaceItem[] };
     }
-  | { kind: 'wireEnd'; wire: Wire; end: 'a' | 'b'; created: boolean }
+  | {
+      kind: 'wireEnd';
+      wire: Wire;
+      end: 'a' | 'b';
+      created: boolean;
+      /**
+       * SELECT AN END: set only when the press landed on an end that was
+       * **already loose**, which is the one case where the gesture can still
+       * turn out to be a click rather than a drag. Carries the press point so
+       * the release can tell the two apart, and `hist` records whether this
+       * drag has pushed its undo entry yet — deferred until something actually
+       * moves, because selecting an end changes nothing and must not fill the
+       * undo stack with entries that undo to the same picture.
+       */
+      pick?: { at: Vec2; slop: number };
+      hist?: boolean;
+    }
   | { kind: 'branchRoot'; wire: Wire }
   | { kind: 'maybeBranch'; wire: Wire; t: number; start: Vec2 }
   | {
@@ -185,6 +258,22 @@ type DragState =
       startY: number;
       rect: { x: number; y: number; w: number; h: number };
       pushed: boolean;
+      /**
+       * FINE DRAG: the modifier state the current baseline was taken under.
+       *
+       * Stored rather than read fresh each move because changing the gearing
+       * mid-drag has to **re-baseline**, not jump: the same rule
+       * `TwoPointerGesture` follows when a third finger lands (docs/14 rule 1).
+       * Without it, pressing Shift half way through a turn snaps the value to
+       * wherever the coarse-to-fine ratio happens to put it.
+       */
+      fine: boolean;
+      /**
+       * GROUP EDIT: the other selected blocks moving with this one, each with
+       * its **own** baseline so the spread between them is preserved rather
+       * than collapsed onto the value of whichever one you grabbed.
+       */
+      group?: Array<{ block: Block; spec: ParamSpec; startNorm: number }>;
     }
   | {
       kind: 'editItem';
@@ -209,6 +298,21 @@ type DragState =
   | { kind: 'sampleview'; block: Block; child: Block | null; handle: SampleHandle; rect: Rect };
 
 type Rect = { x: number; y: number; w: number; h: number };
+
+/** SPLICE: a resolved "this block would go into this wire" proposal. */
+type SpliceTarget = {
+  wire: Wire;
+  /** The wire's source end (`dir === 'out'`), whichever of a/b that is. */
+  src: { block: Block; port: Port };
+  /** …and its sink end, which the new second wire will terminate on. */
+  dst: { block: Block; port: Port };
+  inPort: Port;
+  outPort: Port;
+  /** Where on the cable the block landed — the cut point, in canvas coords. */
+  cut: Vec2;
+  /** Unit tangent of the cable at `cut`, so the break mark sits across it. */
+  dir: Vec2;
+};
 
 /** One face-snap candidate line: position on the snap axis + the source's
  *  extent on the cross axis (content-box coords). */
@@ -280,6 +384,30 @@ const VARIANTS: Record<string, string[]> = {
  * re-ids on the way in.
  */
 let blockClipboard: BlockClip | null = null;
+
+/**
+ * BYPASS: can this block be bypassed at all?
+ *
+ * Bypass means "pass the audio through untouched", so it needs somewhere for
+ * the audio to come in and somewhere for it to go out. A source (no audio in),
+ * a sink (no audio out) and a MIDI-only block have no such path, and offering
+ * a menu item that would silence them instead is worse than not offering one —
+ * this is the `cvable` gate's reasoning applied to a different verb.
+ *
+ * Ports, not the def: a variable-port block (Matrix, Merge/Split) is judged on
+ * what it actually has right now.
+ */
+export function canBypass(b: Block): boolean {
+  let hasIn = false;
+  let hasOut = false;
+  for (const p of b.ports) {
+    if (p.kind !== 'audio' || p.role === 'cv') continue;
+    if (p.dir === 'in') hasIn = true;
+    else hasOut = true;
+    if (hasIn && hasOut) return true;
+  }
+  return false;
+}
 
 /** Face refs that can be mirrored into the Dock — i.e. everything that is
  *  actually a widget. The title, texts and images have nothing to drive. */
@@ -420,6 +548,16 @@ export class Editor {
     c.addEventListener('pointerleave', () => {
       this.overlay.pointer = null;
       this.renderer.invalidate();
+    });
+    // QUICK ADD: the ring on the waiting cable end is owned by the intent, not
+    // by whatever armed it — one subscription clears it for every way out
+    // (picked, cancelled with Escape, the banner's ✕, a click on the canvas),
+    // so no exit route can leave a mark sitting on a cable nobody is finishing.
+    onPlacementChange(() => {
+      if (!pendingPlacementIntent() && this.overlay.awaitingEnd) {
+        this.overlay.awaitingEnd = null;
+        this.renderer.invalidate();
+      }
     });
     c.addEventListener('dblclick', (e) => this.doubleClick(e));
     c.addEventListener('wheel', (e) => this.wheel(e), { passive: false });
@@ -694,6 +832,12 @@ export class Editor {
     noteUserParam(target.id, spec.id);
     target.params[spec.id] = v;
     const nodeId = child ? runtime.nodeId(block.id, child.id) : runtime.nodeId(block.id);
+    // THE VIRUS: a widget you have your hand on is not available to be taken,
+    // and stays unavailable for a while afterwards. Here for the same reason
+    // `noteUserParam` is — this is the one funnel every parameter write in the
+    // app passes through, and a flag set at the individual drag sites is a
+    // flag that will be missed at one of them.
+    virusSpare(nodeId, spec.id);
     runtime.sendParam(nodeId, spec.id, v);
     // A dynamic block DERIVES the numbers its kernel actually runs on from the
     // ones you can turn: Mycelium's Growth/Spread/Seed decide which four
@@ -956,6 +1100,11 @@ export class Editor {
     this.overlay.marquee = null;
     this.overlay.draggingWireEnd = false;
     this.overlay.snapWire = null;
+    // SPLICE / MODULATE: both proposals are drag-scoped — they must never
+    // outlive the gesture that made them, or a stale highlight would sit on a
+    // wire or a knob that nothing is over.
+    this.overlay.spliceWire = null;
+    this.overlay.modWidget = null;
     this.overlay.latchField = null;
     this.overlay.hotWidget = null;
     this.overlay.eqBand = null;
@@ -1002,9 +1151,29 @@ export class Editor {
     this.longPressAt = null;
   }
 
+  /**
+   * The pointer was taken away from us mid-press — the OS claimed it, the
+   * touch stack gave up on the contact, a pen left range.
+   *
+   * **This has to abort the drag, not just tidy the gesture bookkeeping.** It
+   * used to do neither, and the state it left behind was `pendingSnatch`: a
+   * press that lands on a minion arms the snatch and fires it on the first real
+   * *movement*, so a press that is cancelled instead of released leaves the arm
+   * set with no press behind it. The very next **hover** past the drag
+   * threshold then took the block out of the robot's gripper and opened a
+   * `blocks` drag on it — with no button down, so nothing would end it until
+   * you clicked. What you see is a block flying around glued to the cursor
+   * while the drone, which genuinely has let go, goes back to work: "it thinks
+   * my cursor is the drone".
+   *
+   * `abortDrag` is the right answer rather than clearing the one flag, because
+   * a cancel means the same thing for every gesture — nothing was committed —
+   * and it also puts back a block drag that had already moved.
+   */
   private pointerCancel(e: PointerEvent): void {
     this.gesture.remove(e.pointerId);
     this.clearLongPress();
+    this.abortDrag();
   }
 
   // ---------- pointer down ----------
@@ -1111,6 +1280,17 @@ export class Editor {
     }
     if (e.button !== 0) return;
 
+    // QUICK ADD: **touching the canvas cancels a pending placement.** An armed
+    // intent changes what the next block you place does, and anything you do on
+    // the canvas instead of picking one is you doing something else. This is
+    // why the state lives in `ui/placement.ts`: it has to be cancellable here,
+    // synchronously, before the press is interpreted — not one dynamic import
+    // later, by which time the gesture it should have preceded has run.
+    //
+    // Clicking a loose end re-arms it a moment later, from `pointerUp`, so the
+    // one gesture that means "ask again" survives its own cancel.
+    armPlacement(null);
+
     if (this.overlay.mode === 'edit') {
       this.editModeDown(p, e.shiftKey);
       return;
@@ -1169,6 +1349,18 @@ export class Editor {
     this.pendingSnatch = onBody;
     this.pendingSnatchPull = !onLoad && !!onBody;
     this.pendingSnatchAt = { ...p };
+    // **And on the body it RETURNS**, where on the payload it falls through.
+    //
+    // "There is nothing under your cursor to pick up" was only true of an empty
+    // canvas. The machine flies over your patch, so the hit order underneath it
+    // is usually somebody's block — and falling through meant a press on the
+    // aircraft grabbed whatever was behind it. Measured on the stock scene: a
+    // press on its midriff started a `widget` drag on the block below, and one
+    // on the point it hovers over **unplugged a cable**, because the port branch
+    // detaches on the press itself. Reaching for a robot must not edit the patch
+    // behind it. The payload keeps falling through: there the thing under your
+    // cursor genuinely IS what you are reaching for.
+    if (this.pendingSnatchPull) return;
 
     // 1. Ports: grab existing wire end (single-link unbind) or start a new wire.
     const ph = portAt(doc.graph, p, (theme.portRadius + 6) * grab);
@@ -1197,6 +1389,34 @@ export class Editor {
     const wh = this.renderer.paths.hit(p, this.wireTol(theme, grab));
     const b = blockAt(doc.graph, p);
     if (b && !this.wireBeatsBlock(b, wh)) {
+      // EXTRACT BY DRAG: **Alt+drag pulls a block out of its chain**, healing
+      // the cables behind it, and hands you the block to put wherever you were
+      // taking it. The menu item does the same edit but leaves the block where
+      // it stood, which is half of what "take this out of the chain" means —
+      // you almost always then move it.
+      //
+      // It needs a modifier and it cannot be a plain drag: dragging a wired
+      // block already means "move it, keep it wired", and that gesture is what
+      // every existing patch was arranged with. Alt is free on the canvas
+      // (Shift is add-to-selection and fine-drag, Ctrl is the app's command
+      // modifier), and it is checked HERE — ahead of the face widgets and the
+      // dynamic-block artwork — because a press with Alt down is a statement
+      // about the whole gesture: holding it and landing on a knob does not mean
+      // turn the knob.
+      //
+      // `chainHealFor` is the same unambiguity test the menu item asks (one
+      // wire in, one out, same kind, no branches), so Alt over a block that is
+      // not simply in-line does nothing special and drags as usual.
+      if (e.altKey && this.chainHealFor(b)) {
+        doc.clearSelection();
+        b.selected = true;
+        // Pushes its own history entry *before* the heal, so one undo puts the
+        // block back in the chain AND back where it was standing.
+        this.doExtract(b);
+        doc.bringToFront(b.id);
+        this.drag = { kind: 'blocks', start: p, orig: new Map([[b.id, { ...b.pos }]]), moved: false };
+        return;
+      }
       // Ripple Pool's buoys are the block's whole interaction, so they are
       // tested before face widgets and before the body-drag that would
       // otherwise just move the block out from under the pointer.
@@ -1246,7 +1466,7 @@ export class Editor {
     }
 
     // 3. Wires: endpoint grab / branch root / branch spawn / select.
-    const END_GRAB = (BASE_END_GRAB / this.renderer.view.scale) * grab;
+    const END_GRAB = this.endGrab(theme, grab);
     // **Which wire an endpoint grab belongs to is decided by the ENDPOINTS, not
     // by whichever cable body happens to pass nearest the pointer.**
     //
@@ -1257,6 +1477,8 @@ export class Editor {
     // back, its own ends were far away, every endpoint test failed, and the
     // press fell through to `maybeBranch`. Which is the report: reaching for a
     // cable end in a bunch spawns a branch instead.
+    // Click-versus-drag for a loose end, in canvas px like everything else here.
+    const pickSlop = dragThreshold(e) / this.renderer.view.scale;
     const endHit = this.nearestWireEnd(p, END_GRAB);
     if (endHit || wh) {
       const wire = doc.wire(endHit ? endHit.wireId : wh!.wireId)!;
@@ -1264,8 +1486,10 @@ export class Editor {
       const dStart = vDist(p, path.pts[0]);
       const dEnd = vDist(p, path.pts[path.pts.length - 1]);
       if (dEnd < END_GRAB && !wire.b.port) {
-        doc.pushHistory();
-        this.drag = { kind: 'wireEnd', wire, end: 'b', created: false };
+        // Already loose, so this press may still be a *selection* — see `pick`
+        // on the drag state, and `selectWireEnd` for what a selected end is
+        // for. History waits until it moves.
+        this.drag = { kind: 'wireEnd', wire, end: 'b', created: false, pick: { at: p, slop: pickSlop } };
         this.overlay.draggingWireEnd = true;
         return;
       }
@@ -1275,8 +1499,7 @@ export class Editor {
         return;
       }
       if (dStart < END_GRAB && !wire.a.port && !wire.parentId) {
-        doc.pushHistory();
-        this.drag = { kind: 'wireEnd', wire, end: 'a', created: false };
+        this.drag = { kind: 'wireEnd', wire, end: 'a', created: false, pick: { at: p, slop: pickSlop } };
         this.overlay.draggingWireEnd = true;
         return;
       }
@@ -1312,6 +1535,18 @@ export class Editor {
 
     // 4. Empty canvas: marquee.
     this.startMarquee(p, e.shiftKey);
+  }
+
+  /**
+   * The radius that counts as "on the end of that cable", in world units.
+   *
+   * Screen-pixel sized (hence `/ scale`), widened for touch by `grab`, and
+   * grown with the arrowhead the user is actually aiming at — see
+   * `END_GRAB_PER_ARROW`.
+   */
+  private endGrab(theme: Theme, grab: number): number {
+    const r = Math.min(BASE_END_GRAB + theme.arrowSize * END_GRAB_PER_ARROW, BRANCH_DEADZONE - 2);
+    return (r / this.renderer.view.scale) * grab;
   }
 
   /**
@@ -1364,6 +1599,211 @@ export class Editor {
       w: Math.abs(p.x - start.x),
       h: Math.abs(p.y - start.y),
     };
+  }
+
+  /**
+   * QUICK ADD: offer the blocks a loose cable end could plug into.
+   *
+   * Two gestures land here — dropping a cable in empty space, and clicking an
+   * end that is already loose — and they get the same offer, because they are
+   * the same question.
+   *
+   * The list is filtered to blocks that genuinely have a **free port of the
+   * right kind and the opposite direction**, which is the same test
+   * `canConnect` applies to a real port — offering a block that cannot take the
+   * cable would make the picker a list of things that might not work.
+   *
+   * **Offering is not connecting.** The block goes wherever it is put, and the
+   * cable follows only if it lands on the end (`snapsToEnd`). See `END_SNAP`
+   * for what went wrong when it always followed.
+   *
+   * A cable whose far end is floating says nothing about which direction it
+   * runs, so there is nothing to filter by and nothing sensible to connect: it
+   * is left alone, exactly as before. Same reasoning as `fieldLatchAt`.
+   */
+  private offerBlockForWire(wire: Wire, end: 'a' | 'b'): void {
+    const other = end === 'a' ? wire.b : wire.a;
+    let kind: SignalKind | null = null;
+    let otherDir: PortDir | null = null;
+    if (other.port) {
+      const f = doc.port(other.port.blockId, other.port.portId);
+      if (!f) return;
+      kind = f.port.kind;
+      otherDir = f.port.dir;
+    } else if (wire.parentId && end === 'b') {
+      // A branch inherits its trunk's net (docs/02): the net's sources decide.
+      const net = doc.netOfWire(wire.id);
+      if (!net) return;
+      kind = net.kind;
+      otherDir = net.sources.length ? 'out' : null;
+    }
+    if (!kind && !otherDir) return;
+    const want: PortDir = otherDir === 'out' ? 'in' : 'out';
+    // Where the end actually is — the block placed by Enter or a double-click
+    // lands here, which is the one case that always connects, because "put it
+    // on the end" is exactly what those two mean.
+    const at = { ...((end === 'a' ? wire.a.float : wire.b.float) ?? this.overlay.pointer ?? { x: 0, y: 0 }) };
+    this.overlay.awaitingEnd = { at, r: END_SNAP };
+    this.quickAdd(at, {
+      // Phrased to dodge the article: "a audio cable" / "an midi cable" is the
+      // sort of thing that has to be special-cased per signal kind forever.
+      hint: `Pick a block for this ${kind} cable`,
+      snap: { at, wireId: wire.id },
+      onPlaced: (made) => {
+        const port = made.ports.find(
+          (q) => q.dir === want && q.kind === kind && q.role !== 'cv' && !doc.wireAtPort(made.id, q.id),
+        );
+        // The block is placed either way — dismissing the *port* search is not
+        // a reason to throw away the block the user just chose. It simply
+        // arrives unwired, which is the state they would have got by dragging
+        // it out of the Library.
+        if (!port) return;
+        // SNAP: and it is placed unwired just the same if it did not land on
+        // the cable. The end stays exactly where it was put.
+        if (!snapsToEnd(made, at)) return;
+        const w = doc.wire(wire.id);
+        if (!w) return;
+        const wEnd = end === 'a' ? w.a : w.b;
+        wEnd.port = { blockId: made.id, portId: port.id };
+        wEnd.float = undefined;
+        doc.syncRigPorts();
+        doc.touch('structure');
+        noteRewire('splice', [w.id], [{ shape: ringForBlock(made), t: 1 }]);
+      },
+    });
+  }
+
+  /**
+   * SELECT AN END: clicking a loose cable end asks the same question the drop
+   * asked, which is how you get the offer back after dismissing it.
+   *
+   * Without this the picker is a one-shot: miss it, or change your mind, and
+   * the only route to "finish this cable" is to drag the end somewhere and drop
+   * it again to re-trigger the offer — i.e. to disturb a cable you had already
+   * placed exactly where you wanted it.
+   */
+  private selectWireEnd(wire: Wire, end: 'a' | 'b'): void {
+    this.offerBlockForWire(wire, end);
+  }
+
+  /**
+   * QUICK ADD: point the Library at a placement, and run `onPlaced` when it
+   * produces one.
+   *
+   * `at` is where the block goes (canvas px) when the placement has no place of
+   * its own — Enter, or a double-click on a tile. A tile *dragged* to a spot
+   * keeps that spot, which is the whole reason a placement can end up somewhere
+   * other than `at`, and therefore the reason `snapsToEnd` exists.
+   */
+  quickAdd(at: Vec2, opts: { snap?: PlacementIntent['snap']; hint: string; onPlaced?: (b: Block) => void }): void {
+    // **Armed synchronously, revealed asynchronously**, and the order matters.
+    // This used to arm inside the dynamic import's `.then`, which left a window
+    // — one microtask, but a real one — in which the intent did not exist yet.
+    // A cancel arriving in that window hit `armPlacement(null)` with nothing
+    // pending, so it did nothing at all, and the intent armed itself
+    // afterwards: a mode the user had already dismissed, switching itself on.
+    // Only the *panel* needs `panels.ts` (and its `dock`); the state does not,
+    // which is what `ui/placement.ts` is for.
+    armPlacement({
+      at,
+      snap: opts.snap,
+      hint: opts.hint,
+      onPlaced: (b) => opts.onPlaced?.(b),
+    });
+    void import('./panels').then(({ revealLibraryForPlacement }) => revealLibraryForPlacement());
+  }
+
+  /**
+   * QUICK ADD: wire a freshly-placed block to the current selection, when that
+   * is unambiguous.
+   *
+   * Only from **exactly one** previously-selected block, and only when it has a
+   * free output that matches a free input on the new one. Two selected blocks
+   * have no single answer to "which one feeds it", and a guess would wire a
+   * patch behind the user's back — the same standard the splice refusals hold.
+   */
+  private autoWireFrom(src: Block, made: Block): void {
+    const free = (b: Block, dir: PortDir): Port | undefined =>
+      b.ports.find((p) => p.dir === dir && p.role !== 'cv' && !doc.wireAtPort(b.id, p.id));
+    const out = free(src, 'out');
+    if (!out) return;
+    const inp = made.ports.find(
+      (p) => p.dir === 'in' && p.kind === out.kind && p.role !== 'cv' && !doc.wireAtPort(made.id, p.id),
+    );
+    if (!inp) return;
+    const w = doc.addWire(
+      { port: { blockId: src.id, portId: out.id } },
+      { port: { blockId: made.id, portId: inp.id } },
+    );
+    doc.syncRigPorts();
+    doc.touch('structure');
+    noteRewire('splice', [w.id], [{ shape: ringForBlock(made), t: 1 }]);
+  }
+
+  /**
+   * GROUP EDIT: the other selected blocks whose same-named parameter should
+   * move with this one.
+   *
+   * This exists because of what LivePatch actually is. A surround patch is full
+   * of **parallel** things — eight speaker gains, a bank of delays, a row of
+   * decorrelators — and until now the only way to move them together was one at
+   * a time, which is both slow and impossible to do evenly.
+   *
+   * Three decisions, each one an accident it prevents:
+   *
+   *  * **Only when the block you grabbed is itself part of a multi-selection.**
+   *    Grab a knob on an unselected block and the behaviour is byte-identical to
+   *    before. Nothing about an ordinary single edit changes.
+   *  * **Matched by param id, applied in NORMALIZED space.** Two blocks can
+   *    give the same id different ranges (a −60…+12 dB gain and a 0..1 level),
+   *    so a raw delta would mean something different on each. A normalized
+   *    delta means "move each by the same fraction of its own range", which is
+   *    the only reading that stays sane across types — and it is the space the
+   *    drag already works in.
+   *  * **Mirrored child widgets are excluded** (`child`). A `link:` widget on a
+   *    custom block points at a param inside another graph; resolving what
+   *    "the same parameter" means on five other blocks' children is a guess,
+   *    and a guess here silently edits things you cannot see.
+   */
+  private groupPeersFor(
+    b: Block,
+    spec: ParamSpec,
+    child: Block | null,
+  ): Array<{ block: Block; spec: ParamSpec; startNorm: number }> | undefined {
+    if (child || !b.selected) return undefined;
+    if (spec.type !== 'float' && spec.type !== 'int') return undefined;
+    const sel = doc.selectedBlocks();
+    if (sel.length < 2) return undefined;
+    const out: Array<{ block: Block; spec: ParamSpec; startNorm: number }> = [];
+    for (const other of sel) {
+      if (other.id === b.id) continue;
+      const os = paramSpec(other, spec.id);
+      if (!os || (os.type !== 'float' && os.type !== 'int')) continue;
+      out.push({ block: other, spec: os, startNorm: val2norm(os, Number(other.params[spec.id] ?? os.def)) });
+    }
+    return out.length ? out : undefined;
+  }
+
+  /**
+   * RESET: put a value widget back to the definition's default.
+   *
+   * There was no way to do this at all — not a gesture, not a menu item — so a
+   * knob you had nudged off its default could only be returned by remembering
+   * the number and typing it back in. Double-click is the gesture every other
+   * audio tool uses for it, and it was free here: `doubleClick` already returns
+   * early over a widget (so a fast tap on a note button cannot open the rename
+   * dialog), which means the event was being deliberately discarded.
+   *
+   * Follows the group rule above, so resetting one of a selected bank resets
+   * the bank.
+   */
+  resetWidgetValue(b: Block, spec: ParamSpec, child: Block | null): void {
+    if (spec.def === undefined) return;
+    doc.pushHistory();
+    this.setParamLive(b, spec, spec.def, child);
+    for (const peer of this.groupPeersFor(b, spec, child) ?? []) {
+      if (peer.spec.def !== undefined) this.setParamLive(peer.block, peer.spec, peer.spec.def, null);
+    }
   }
 
   private widgetDown(b: Block, item: FaceItem, p: Vec2, shift = false): boolean {
@@ -1494,7 +1934,9 @@ export class Editor {
         runtime.sendParam(nodeId, spec.id, 1);
         target.params[spec.id] = 1;
         // Momentary: released in pointerUp.
-        this.drag = { kind: 'widget', block: b, child, spec, ref: item.ref, startNorm: 0, startY: 0, rect, pushed: true };
+        // A momentary button has no gearing and no peers — it is not a value
+        // drag at all, it just borrows this state to be released in pointerUp.
+        this.drag = { kind: 'widget', block: b, child, spec, ref: item.ref, startNorm: 0, startY: 0, rect, pushed: true, fine: false };
         doc.touch('param');
         return true;
       }
@@ -1522,7 +1964,10 @@ export class Editor {
     }
     if (spec.widget === 'xy') {
       doc.pushHistory();
-      this.drag = { kind: 'widget', block: b, child, spec, ref: item.ref, startNorm: 0, startY: 0, rect, pushed: true };
+      // An XY pad is an ABSOLUTE control — the dot goes where you put it — so
+      // neither the fine gearing nor the group delta applies to it. Both are
+      // defined in terms of travel from a baseline, and this widget has none.
+      this.drag = { kind: 'widget', block: b, child, spec, ref: item.ref, startNorm: 0, startY: 0, rect, pushed: true, fine: false };
       this.applyXY(this.drag as any, p);
       return true;
     }
@@ -1577,6 +2022,8 @@ export class Editor {
       startY: spec.widget === 'hfader' ? p.x : p.y,
       rect,
       pushed: true,
+      fine: shift,
+      group: this.groupPeersFor(b, spec, child),
     };
     return true;
   }
@@ -2014,6 +2461,15 @@ export class Editor {
 
     // MINIONS: the snatch fires here, once the press has become a drag. See the
     // `MINIONS` block in `pointerDown`.
+    //
+    // **`e.buttons` is the second lock, and it is the one that cannot be
+    // forgotten.** The arm is cleared on pointerup and on abort, which covers
+    // every path anybody thought of — and a press that ends in neither (see
+    // `pointerCancel`) left it set, so a later hover snatched a block and glued
+    // it to the cursor. A drag that begins from a pointer with nothing pressed
+    // is a bug by definition, whatever cleared or failed to clear a flag, so it
+    // is asked directly rather than inferred from bookkeeping.
+    if (!e.buttons) this.pendingSnatch = null;
     if (this.pendingSnatch && Math.hypot(p.x - this.pendingSnatchAt.x, p.y - this.pendingSnatchAt.y) > dragThreshold(e)) {
       const id = this.pendingSnatch;
       const pull = this.pendingSnatchPull;
@@ -2081,6 +2537,21 @@ export class Editor {
         const b = doc.block(id);
         if (b) b.pos = { x: snap(orig.x + (p.x - d.start.x)), y: snap(orig.y + (p.y - d.start.y)) };
       }
+      // SPLICE: resolve the proposal every move, so the picture is live and the
+      // drop is never a surprise. `spliceTargetFor` bails on the first cheap
+      // test for the overwhelmingly common case (a group, or a block that is
+      // already wired), so an ordinary arrange-the-canvas drag costs a size
+      // check per event.
+      const only = d.orig.size === 1 ? doc.block([...d.orig.keys()][0]) : null;
+      const t = only ? this.spliceTargetFor(only, d.orig.size) : null;
+      this.overlay.spliceWire = t
+        ? {
+            wireId: t.wire.id,
+            cut: t.cut,
+            dir: t.dir,
+            into: [portPos(only!, t.inPort), portPos(only!, t.outPort)],
+          }
+        : null;
       doc.touch('selection');
       return;
     }
@@ -2156,6 +2627,14 @@ export class Editor {
 
     if (d.kind === 'wireEnd') {
       const end = d.end === 'a' ? d.wire.a : d.wire.b;
+      // SELECT AN END: a grab that started on a loose end deferred its undo
+      // entry, because it might have been a click. It has moved, so it wasn't —
+      // snapshot now, BEFORE the mutation below, so undo returns the end to
+      // where it was picked up.
+      if (d.pick && !d.hist) {
+        d.hist = true;
+        doc.pushHistory();
+      }
       end.float = { ...p };
       end.port = undefined;
       // Pulled clear of every bundle-mate → out of the ribbon now, so the cable
@@ -2164,6 +2643,14 @@ export class Editor {
       if (this.breakBundleIfPulledAway(d.wire, p)) doc.touch('layout');
       const ph = portAt(doc.graph, p, theme.portRadius + 8);
       this.overlay.hoverPort = ph && this.canConnect(d.wire, d.end, ph.block, ph.port) ? { blockId: ph.block.id, portId: ph.port.id } : null;
+      // MODULATE: ring the widget this cable would land on. Resolved by the
+      // same function the drop uses, so the preview and the result cannot
+      // disagree — and skipped while a real port is under the pointer, because
+      // that is what the drop would take.
+      {
+        const mt = ph ? null : this.modulateTargetAt(d.wire, d.end, p);
+        this.overlay.modWidget = mt ? this.widgetShapeOf(mt.block, mt.ref, mt.spec) : null;
+      }
       // Entanglement Field: the plate lights while a drop here would latch, so
       // the pull is visible before you let go rather than only after.
       this.overlay.latchField = ph ? null : this.fieldLatchAt(d.wire, d.end, p)?.block.id ?? null;
@@ -2183,9 +2670,32 @@ export class Editor {
       }
       if (d.spec.widget === 'button') return;
       const horiz = d.spec.widget === 'hfader';
+      // FINE DRAG. 140 px covers a parameter's whole range, which on a log
+      // frequency knob is the entire audible spectrum — landing on a specific
+      // value with a mouse was not possible. Shift gears that down by 8.
+      //
+      // Changing gear RE-BASELINES rather than jumping: without this, pressing
+      // Shift part-way through a turn instantly re-scales the accumulated
+      // travel and the value leaps. Same rule as a third finger landing in
+      // `TwoPointerGesture` (docs/14 rule 1) — re-baseline, never jump.
+      if (e.shiftKey !== d.fine) {
+        const target = d.child ?? d.block;
+        d.startNorm = val2norm(d.spec, Number(target.params[d.spec.id] ?? d.spec.def));
+        d.startY = horiz ? p.x : p.y;
+        d.fine = e.shiftKey;
+        for (const peer of d.group ?? [])
+          peer.startNorm = val2norm(peer.spec, Number(peer.block.params[d.spec.id] ?? peer.spec.def));
+      }
+      const span = d.fine ? 140 * FINE_DRAG_SPAN : 140;
       const delta = horiz ? p.x - d.startY : d.startY - p.y;
-      const norm = d.startNorm + delta / 140;
-      this.setParamLive(d.block, d.spec, norm2val(d.spec, norm), d.child);
+      const dn = delta / span;
+      this.setParamLive(d.block, d.spec, norm2val(d.spec, d.startNorm + dn), d.child);
+      // GROUP EDIT: every peer moves by the SAME normalized delta from its own
+      // baseline, so the shape of the bank is preserved and only its level
+      // moves. Clamping happens per block inside `norm2val`, so one peer
+      // hitting its rail does not drag the others to theirs.
+      for (const peer of d.group ?? [])
+        this.setParamLive(peer.block, peer.spec, norm2val(peer.spec, peer.startNorm + dn), null);
       return;
     }
 
@@ -2449,6 +2959,11 @@ export class Editor {
     this.drag = { kind: 'none' };
     this.overlay.draggingWireEnd = false;
     this.overlay.snapWire = null;
+    // SPLICE / MODULATE: both proposals are drag-scoped — they must never
+    // outlive the gesture that made them, or a stale highlight would sit on a
+    // wire or a knob that nothing is over.
+    this.overlay.spliceWire = null;
+    this.overlay.modWidget = null;
     this.overlay.latchField = null;
     this.overlay.hotWidget = null;
     this.overlay.eqBand = null;
@@ -2508,7 +3023,11 @@ export class Editor {
       const hand = d.orig.size === 1 ? minionBodyAt(p) : null;
       if (hand) {
         const [id, orig] = [...d.orig][0];
-        if (giveToMinion(hand, { kind: 'block', blockId: id, origin: { kind: 'at', pos: { ...orig } } })) {
+        // The level travels with the position — see `Origin`. A block is the
+        // one payload that can cross a subpatch boundary, so its "back" is a
+        // place in a particular graph, not a bare coordinate.
+        const from = { kind: 'at' as const, pos: { ...orig }, level: doc.path.join('/') };
+        if (giveToMinion(hand, { kind: 'block', blockId: id, origin: from })) {
           doc.touch('structure');
           return;
         }
@@ -2525,10 +3044,15 @@ export class Editor {
         }
         doc.deleteSelected();
       } else {
-        // Dropping a lone cassette onto a block with a tape input inserts it.
-        const sel = doc.selectedBlocks();
-        if (sel.length === 1 && sel[0].type === 'cassette') this.tryCassetteInsert(sel[0]);
-        doc.touch('structure');
+        // One block dropped: settle it into whatever it landed on — the splice
+        // and the tape insertion, in that order. Shared with the Library drop
+        // route so the two cannot answer the same gesture differently; see
+        // `spliceDroppedBlock`. Dragging a GROUP is arranging, not inserting,
+        // and has no single block to settle.
+        // A plain move still has to be committed — both settle paths touch for
+        // themselves, so this covers only the "it landed on nothing" case.
+        const only = d.orig.size === 1 ? doc.block([...d.orig.keys()][0]) : null;
+        if (!only || !this.spliceDroppedBlock(only)) doc.touch('structure');
       }
     }
 
@@ -2550,10 +3074,43 @@ export class Editor {
 
     if (d.kind === 'wireEnd') {
       const end = d.end === 'a' ? d.wire.a : d.wire.b;
+      // SELECT AN END: the press never moved, so this was a click on a loose
+      // cable end, not a drag of one. Nothing was picked up and nothing is
+      // being dropped — every drop target below (a port under the pointer, the
+      // field plate, a bundle-mate) would be claiming a gesture that never
+      // went anywhere — so this returns before all of them.
+      if (d.pick && vDist(p, d.pick.at) <= d.pick.slop) {
+        this.selectWireEnd(d.wire, d.end);
+        return;
+      }
+      // **A port under the pointer outranks a minion standing over it.**
+      //
+      // This was the other way round, on the reasoning that a minion hovering
+      // over a port would otherwise lose the gesture to it. That reads well and
+      // is wrong in the hand, because the two targets are not the same size: a
+      // port is a `portRadius + 8` disc you have to actually hit, and
+      // `minionBodyAt` is a **48-unit radius** round the middle of the figure —
+      // a soft catchment more than three times wider. So a robot merely walking
+      // past a socket ate every cable aimed at it, and the precise gesture lost
+      // to the vague one. Aim beats proximity: hit the port and you meant the
+      // port; miss it and the robot standing right there is exactly what you
+      // meant instead.
+      //
+      // The drag PREVIEW already said so: `overlay.hoverPort` lights whenever a
+      // connectable port is under the pointer, and every other preview
+      // (modulate, latch, bundle) is suppressed while it is. So the port lit
+      // up, you let go, and the cable went into a gripper — the drop
+      // contradicting the promise the hover had just made.
+      const ph = portAt(doc.graph, p, theme.portRadius + 8);
+      if (ph && this.canConnect(d.wire, d.end, ph.block, ph.port)) {
+        end.port = { blockId: ph.block.id, portId: ph.port.id };
+        end.float = undefined;
+        doc.syncRigPorts();
+        doc.touch('structure');
+        return;
+      }
       // MINIONS: **give.** Dropped on a minion, the cable end goes into its
-      // gripper instead of onto the canvas. Checked before the port hit because
-      // a minion hovering over a port would otherwise lose the gesture to it —
-      // and you aimed at the robot.
+      // gripper instead of onto the canvas.
       const hand = minionBodyAt(p);
       if (hand) {
         const origin: Origin = end.port
@@ -2563,14 +3120,6 @@ export class Editor {
           doc.touch('structure');
           return;
         }
-      }
-      const ph = portAt(doc.graph, p, theme.portRadius + 8);
-      if (ph && this.canConnect(d.wire, d.end, ph.block, ph.port)) {
-        end.port = { blockId: ph.block.id, portId: ph.port.id };
-        end.float = undefined;
-        doc.syncRigPorts();
-        doc.touch('structure');
-        return;
       }
       // Entanglement Field: a wire end released anywhere inside the field
       // latches where it landed, and the terminal is created there. There is no
@@ -2591,6 +3140,12 @@ export class Editor {
         doc.touch('structure');
         return;
       }
+      // MODULATE: dropped on a widget → wire it to that param, creating the CV
+      // port on the way. After the port hit above (aiming at a real port still
+      // wins) and after the field latch (the plate is its own designed drop),
+      // so this only claims drops that would otherwise have left the cable
+      // hanging in the air over a knob.
+      if (this.tryModulateDrop(d.wire, d.end, p)) return;
       // Branch dropped back onto its own trunk tree → remove the branch.
       if (d.wire.parentId) {
         const trunkIds = new Set<string>();
@@ -2624,7 +3179,22 @@ export class Editor {
         const bundleId = other.bundle ?? `bd${Date.now().toString(36)}`;
         other.bundle = bundleId;
         d.wire.bundle = bundleId;
-      } else this.leaveBundle(d.wire);
+      } else {
+        this.leaveBundle(d.wire);
+        // QUICK ADD: a cable released on empty canvas offers to finish itself,
+        // by pointing the Library at this end. Checked LAST, after every
+        // existing drop target (a port, the field's plate, a bundle-mate, a
+        // branch returning to its trunk), so it can only ever follow a drop
+        // that left the cable in mid-air.
+        //
+        // **Offering is all it does.** The cable stays exactly where it was
+        // dropped whatever happens next — dismiss the Library, place the block
+        // somewhere else, place ten of them: nothing moves this end unless a
+        // block lands ON it (`snapsToEnd`). The version that connected
+        // regardless is what made a wire end impossible to simply *put
+        // somewhere*, because the next block placed anywhere dragged it away.
+        this.offerBlockForWire(d.wire, d.end);
+      }
       // Otherwise: stays free-floating exactly where dropped.
       if (d.created && d.wire.parentId == null && !d.wire.a.port && !d.wire.b.port) {
         // A wire dragged from nothing to nothing was an accident — remove.
@@ -2644,32 +3214,459 @@ export class Editor {
   }
 
   /**
-   * Physical tape insertion: a cassette dropped overlapping a block that has a
-   * tape input gets wired into it (replacing whatever tape was in the deck)
-   * and snaps to sit beside the target.
+   * MODULATE: the outline of a control on a face, in canvas coords — the ring
+   * that says which control a dropped modulator would land on.
+   *
+   * **It traces the control, not the item.** It used to be a fixed 15 px circle
+   * at the centre of the layout item, which is wrong twice over: the item is a
+   * box with a label strip (and sometimes a silkscreen strip) under the control,
+   * so its centre is below the knob; and a 15 px circle is the right size for
+   * nothing in particular — a big knob wore a ring inside it and a fader wore a
+   * small circle in its middle. The mark now follows the widget's real geometry
+   * *and* the control style it was swapped to, so a param shown as a fader is
+   * ringed as a fader.
    */
-  private tryCassetteInsert(cassette: Block): boolean {
-    for (const b of doc.graph.blocks) {
-      if (b.id === cassette.id) continue;
-      const overlap =
-        cassette.pos.x < b.pos.x + b.size.w &&
-        cassette.pos.x + cassette.size.w > b.pos.x &&
-        cassette.pos.y < b.pos.y + b.size.h &&
-        cassette.pos.y + cassette.size.h > b.pos.y;
-      if (!overlap) continue;
-      const port = b.ports.find((pt) => pt.kind === 'tape' && pt.dir === 'in');
+  private widgetShapeOf(b: Block, ref: string, spec: ParamSpec): MarkShape | null {
+    const theme = doc.scene.theme;
+    const o = contentOrigin(b, theme);
+    for (const it of faceItems(b, theme)) {
+      if (it.ref !== ref) continue;
+      const cs = b.controls?.[ref];
+      const box = widgetBox({ x: o.x + it.x, y: o.y + it.y, w: it.w, h: it.h }, spec, cs);
+      return widgetMarkShape(box, controlOf(b, ref, spec).kind);
+    }
+    return null;
+  }
+
+  /**
+   * MODULATE: is this param one a CV cable may drive?
+   *
+   * The single gate, shared with the `Add CV input` menu item — modulation
+   * eligibility must have exactly one answer in this app, the same way
+   * "can this parameter be modulated" does for the virus's habitat and for the
+   * Dock's *Add CV input* (docs/README rule 17, `core/virus.ts`). A second copy
+   * of this list is how a knob becomes modulatable by one route and not the
+   * other.
+   */
+  private cvableWidget(w: { spec: ParamSpec } | null): boolean {
+    if (!w) return false;
+    const s = w.spec;
+    const numeric = (s.type === 'float' || s.type === 'int') && s.widget !== 'button';
+    return (
+      !s.dialogAction &&
+      s.widget !== 'keys' &&
+      s.widget !== 'wavedraw' &&
+      (numeric || s.type === 'bool' || s.type === 'action')
+    );
+  }
+
+  /**
+   * MODULATE: a CV cable dropped straight onto a widget.
+   *
+   * Reaching a knob with a modulator was the slowest common action in the app:
+   * right-click the widget, *Add CV input*, find the port that just appeared on
+   * the bottom edge, then drag the cable to it — three gestures across two
+   * surfaces to express one idea. CV is the centre of gravity here (golden rule
+   * 17 exists entirely to make modulation legible), so the gesture for it
+   * should be the direct one.
+   *
+   * It **creates the port it needs**, which is what makes this one drag rather
+   * than two: the port is an implementation detail of "this knob takes CV", and
+   * you should not have to conjure it first. A widget that already has one is
+   * simply plugged into.
+   *
+   * Returns true when it consumed the drop.
+   */
+  private modulateTargetAt(
+    wire: Wire,
+    end: 'a' | 'b',
+    p: Vec2,
+  ): { block: Block; ref: string; spec: ParamSpec; portId: string; childId?: string } | null {
+    // Only the SINK end of a cable whose far end is a source. Dropping the
+    // source end of a cable onto a knob would mean "this knob emits", which is
+    // not a thing — and a cable with nothing on its far end says nothing about
+    // which way it runs (the same test `fieldLatchAt` makes).
+    //
+    // **A branch has no far end of its own.** Its `a` end roots on the trunk
+    // rather than on a port (docs/02), so reading the source straight off the
+    // wire found nothing and this returned null — dropping a branched cable on
+    // a knob silently did nothing at all, while dropping it on a port worked
+    // fine. `canConnect` and `fieldLatchAt` already ask the NET instead; this
+    // is the third drop target and it was the one never taught the same trick.
+    const other = end === 'a' ? wire.b : wire.a;
+    let src = other.port ?? null;
+    if (!src && wire.parentId && end === 'b') src = doc.netOfWire(wire.id)?.sources[0] ?? null;
+    if (!src) return null;
+    const far = doc.port(src.blockId, src.portId);
+    if (!far || far.port.dir !== 'out' || far.port.kind !== 'audio') return null;
+    const b = blockAt(doc.graph, p);
+    if (!b) return null;
+    // Never onto the block the cable already comes from: that is a self-patch
+    // made by a slip of the hand, not an intention.
+    if (b.id === src.blockId) return null;
+    const w = this.widgetAt(b, p);
+    if (!this.cvableWidget(w)) return null;
+    // A mirrored widget on a custom block targets the CHILD's param, exactly as
+    // the menu item does (`cv:<child>:<param>`).
+    const child = w!.child && w!.ref.startsWith('link:') && b.graph ? w!.child : undefined;
+    if (w!.child && !child) return null;
+    return {
+      block: b,
+      ref: w!.ref,
+      spec: w!.spec,
+      portId: child ? `cv:${child.id}:${w!.spec.id}` : 'cv:' + w!.spec.id,
+      childId: child?.id,
+    };
+  }
+
+  private tryModulateDrop(wire: Wire, end: 'a' | 'b', p: Vec2): boolean {
+    const t = this.modulateTargetAt(wire, end, p);
+    if (!t) return false;
+    const { block: b, portId } = t;
+    doc.pushHistory();
+    if (!b.ports.some((pt) => pt.id === portId)) {
+      doc.addCvPort(b, t.spec.id, t.spec.name, t.childId);
+    } else {
+      // Already wired to something: ports are single-link, so the old cable has
+      // to go rather than being silently dropped by the compiler (docs/02
+      // "one wire tree per input").
+      const occupied = doc.wireAtPort(b.id, portId);
+      if (occupied) doc.deleteWires([occupied.wire.id]);
+    }
+    const e = end === 'a' ? wire.a : wire.b;
+    e.port = { blockId: b.id, portId };
+    e.float = undefined;
+    doc.touch('structure');
+    // The run ends on the widget it now moves, so the answer to "what did that
+    // just do" is drawn at the knob rather than at the port on the edge.
+    const ws = this.widgetShapeOf(b, t.ref, t.spec);
+    noteRewire('modulate', [wire.id], ws ? [{ shape: ringForMark(ws), t: 1 }] : []);
+    return true;
+  }
+
+  /**
+   * EXTRACT: can this block be lifted out of a chain, leaving the cables joined?
+   *
+   * The inverse of a splice, and it has to be just as certain about what it is
+   * doing. It is offered only when the answer is unambiguous — **exactly one
+   * wire in and one wire out, of the same kind** — because "bridge the gap"
+   * has no single meaning on a block with two inputs, and a guess here silently
+   * re-plumbs a patch.
+   *
+   * Branches are refused on both sides. A branch is not an independent cable
+   * (its `a` end roots on its trunk, docs/02), and deleting a trunk cascades
+   * to every branch hanging off it — so a heal that happened to pick the wrong
+   * wire would take a whole sub-tree with it. That is far more than "pull this
+   * one block out", so it is not offered rather than being done quietly.
+   *
+   * **A plain drag is never this.** Dragging a block out of a chain already
+   * means "move it, keep it wired", and re-teaching that gesture would break
+   * the thing every existing patch was built with. So the two ways in both say
+   * so explicitly: the right-click item, and **Alt+drag** (`pointerDown`),
+   * which extracts and then carries — the modifier is what makes it a
+   * different gesture rather than a redefinition of the ordinary one.
+   */
+  private chainHealFor(b: Block): { keep: Wire; drop: Wire; dst: { blockId: string; portId: string } } | null {
+    const ins: Wire[] = [];
+    const outs: Wire[] = [];
+    for (const w of doc.graph.wires) {
+      for (const end of [w.a, w.b]) {
+        if (end.port?.blockId !== b.id) continue;
+        const p = b.ports.find((x) => x.id === end.port!.portId);
+        if (!p || p.role === 'cv') continue;
+        (p.dir === 'in' ? ins : outs).push(w);
+      }
+    }
+    if (ins.length !== 1 || outs.length !== 1) return null;
+    const keep = ins[0];
+    const drop = outs[0];
+    if (keep.id === drop.id) return null;
+    if (keep.parentId || drop.parentId) return null;
+    // A trunk with branches cannot be the one deleted — `deleteWires` cascades.
+    if (doc.graph.wires.some((w) => w.parentId === drop.id)) return null;
+    // Where the outgoing wire went: the end that is not on this block.
+    const far = drop.a.port?.blockId === b.id ? drop.b : drop.a;
+    if (!far.port) return null;
+    const src = keep.a.port?.blockId === b.id ? keep.b : keep.a;
+    if (!src.port) return null;
+    const sp = doc.port(src.port.blockId, src.port.portId);
+    const dp = doc.port(far.port.blockId, far.port.portId);
+    if (!sp || !dp || sp.port.kind !== dp.port.kind) return null;
+    return { keep, drop, dst: { ...far.port } };
+  }
+
+  /**
+   * EXTRACT: carry it out. `A → block → B` becomes `A → B`, one undo entry.
+   *
+   * The block stays exactly where it is, merely unwired. It is not moved and
+   * not deleted: this is the inverse of *inserting an existing block*, so the
+   * inverse leaves you holding that block. Moving it aside would be the app
+   * rearranging a canvas nobody asked it to rearrange, and deleting it would
+   * be a destructive edit hiding inside a routing one.
+   */
+  private doExtract(b: Block): void {
+    const h = this.chainHealFor(b);
+    if (!h) return;
+    doc.pushHistory();
+    // Re-point the surviving wire rather than making a third one: it keeps its
+    // id, its bundle and its branches, and the rewire run already knows it.
+    const end = h.keep.a.port?.blockId === b.id ? h.keep.a : h.keep.b;
+    end.port = { ...h.dst };
+    end.float = undefined;
+    doc.deleteWires([h.drop.id]);
+    doc.syncRigPorts();
+    doc.touch('structure');
+    // The run goes down the healed cable, so the eye is taken along the join
+    // rather than to the block that just stopped being in the way.
+    noteRewire('heal', [h.keep.id], [{ shape: ringForBlock(b), t: 0.35 }]);
+  }
+
+  /**
+   * SPLICE: the wire a block would be inserted into if dropped where it is.
+   *
+   * The whole design of this test is **"never when you only meant to move
+   * something"**, because that is the gesture it shares a shape with. A patch
+   * is full of wires and blocks get dragged across them constantly; an insert
+   * that fires on a near miss would be a rewire you did not ask for, in a place
+   * you were not looking, and undoing it means noticing it first.
+   *
+   * So five things all have to hold, and each one rules out a class of
+   * accident:
+   *
+   *  1. **Exactly one block is moving.** Dragging a group is arranging, not
+   *     inserting, and there would be no answer to *which* one goes in.
+   *  2. **The block has a FREE in and a FREE out of that wire's kind.** An
+   *     already-wired block is part of the patch somewhere else; silently
+   *     re-plumbing it is the worst version of this feature. This is also what
+   *     keeps a splice from stealing a port that a cable is already using —
+   *     ports are single-link (docs/03).
+   *  3. **The wire passes through the block's middle.** Not "overlaps the
+   *     rect": you have to *put the block on the cable*, which is a deliberate
+   *     act and reads as one. `tryTapeInsert` can be looser because a lone
+   *     cassette dropped on a deck has no other plausible meaning; a gain
+   *     dropped near a wire absolutely does.
+   *  4. **The wire is not already attached to this block**, or the splice
+   *     would fold a block into its own cable.
+   *  5. **The wire is a plain wire, not a branch.** A branch's `a` end is its
+   *     trunk rather than a port (docs/02), so there is nothing to re-point;
+   *     splicing one would have to restructure the tree, and quietly is not
+   *     the way to do that.
+   */
+  private spliceTargetFor(b: Block, dragging: number): SpliceTarget | null {
+    if (dragging !== 1) return null;
+    const mid = { x: b.pos.x + b.size.w / 2, y: b.pos.y + b.size.h / 2 };
+    // The band: the wire has to run through the block's middle, not merely
+    // near its edge. Half the block's short side, capped so a very large block
+    // does not turn into a wire magnet spanning the canvas.
+    const band = Math.min(Math.min(b.size.w, b.size.h) / 2, 90);
+    const own = new Set<string>();
+    for (const w of doc.graph.wires) {
+      if (w.a.port?.blockId === b.id || w.b.port?.blockId === b.id) own.add(w.id);
+    }
+    const hit = this.renderer.paths.hit(mid, band, own);
+    if (!hit) return null;
+    const w = doc.wire(hit.wireId);
+    if (!w || w.parentId) return null;
+    // Both ends must be real ports — a half-connected cable has no "through".
+    if (!w.a.port || !w.b.port) return null;
+    const from = doc.port(w.a.port.blockId, w.a.port.portId);
+    const to = doc.port(w.b.port.blockId, w.b.port.portId);
+    if (!from || !to) return null;
+    // Orient: `a` is not guaranteed to be the source end.
+    const src = from.port.dir === 'out' ? from : to;
+    const dst = from.port.dir === 'out' ? to : from;
+    if (src.port.dir !== 'out' || dst.port.dir !== 'in') return null;
+    const kind = src.port.kind;
+    const free = (dir: PortDir): Port | undefined =>
+      b.ports.find((p) => p.kind === kind && p.dir === dir && p.role !== 'cv' && !doc.wireAtPort(b.id, p.id));
+    const inPort = free('in');
+    const outPort = free('out');
+    if (!inPort || !outPort) return null;
+    // The cable's direction at the cut, for the break mark the proposal draws.
+    // Sampled either side of the hit rather than taken from the two ports: a
+    // wire is a curve, and near a block it is rarely running the way the
+    // straight line between its endpoints does.
+    const path = this.renderer.paths.paths.get(w.id);
+    let dir = { x: 1, y: 0 };
+    if (path) {
+      const a = pointAtRatio(path, Math.max(0, hit.t - 0.02));
+      const c = pointAtRatio(path, Math.min(1, hit.t + 0.02));
+      const len = Math.hypot(c.x - a.x, c.y - a.y);
+      if (len > 1e-6) dir = { x: (c.x - a.x) / len, y: (c.y - a.y) / len };
+    }
+    return { wire: w, src, dst, inPort, outPort, cut: hit.pt, dir };
+  }
+
+  /**
+   * SPLICE FROM THE LIBRARY: preview, while a tile is over the canvas.
+   *
+   * A block dragged out of the Library is the *same gesture* as a block dragged
+   * across the canvas, so it gets the same result and the same proposal. The
+   * only thing missing is a block — until the drop there is nothing with a
+   * position, a size or ports — so it is tested against a correctly-sized ghost
+   * (`libraryGhostBlock`) and the answer is therefore the answer the drop will
+   * get. A preview built on a nominal size would light up over wires the drop
+   * then refused, which is worse than not previewing at all.
+   *
+   * `clientX/clientY` because both drag paths speak viewport coordinates: HTML5
+   * `dragover` and the touch ghost.
+   */
+  previewLibrarySplice(key: string | null, clientX: number, clientY: number, ghost: Block | null): void {
+    /** QUICK ADD: light the waiting end while a tile is dragged inside it. */
+    const armEnd = (hot: boolean): void => {
+      const a = this.overlay.awaitingEnd;
+      if (!a || !!a.hot === hot) return;
+      a.hot = hot;
+      this.renderer.invalidate();
+    };
+    if (!key || !ghost) {
+      armEnd(false);
+      if (this.overlay.spliceWire) {
+        this.overlay.spliceWire = null;
+        this.renderer.invalidate();
+      }
+      return;
+    }
+    const p = this.renderer.toCanvas({
+      x: clientX - this.renderer.canvas.getBoundingClientRect().left,
+      y: clientY - this.renderer.canvas.getBoundingClientRect().top,
+    });
+    ghost.pos = { x: p.x - ghost.size.w / 2, y: p.y - ghost.size.h / 2 };
+    const snap = pendingPlacementIntent()?.snap;
+    armEnd(!!snap && snapsToEnd(ghost, snap.at));
+    const t = this.spliceTargetFor(ghost, 1);
+    const next = t
+      ? {
+          wireId: t.wire.id,
+          cut: t.cut,
+          dir: t.dir,
+          into: [portPos(ghost, t.inPort), portPos(ghost, t.outPort)] as [Vec2, Vec2],
+        }
+      : null;
+    const cur = this.overlay.spliceWire;
+    if (cur?.wireId !== next?.wireId || (next && cur && (cur.cut.x !== next.cut.x || cur.cut.y !== next.cut.y))) {
+      this.overlay.spliceWire = next;
+      this.renderer.invalidate();
+    }
+  }
+
+  /**
+   * SPLICE FROM THE LIBRARY: commit, on the drop.
+   *
+   * Called with the block the Library has just placed. Runs the same
+   * `spliceTargetFor` the preview ran, against the real block this time — so a
+   * drop that was promised a splice gets one, and a drop that was not, does not.
+   */
+  /**
+   * A single block has just been dropped — settle it into whatever it landed
+   * on. **Both drop routes call this**, the drag across the canvas and the drag
+   * out of the Library, which is the point of it being one method.
+   *
+   * They used to be two: the canvas route tried a splice and then a cassette
+   * insertion, and the Library route tried only the splice. So dropping a tape
+   * onto a deck wired it up when the tape was already on the canvas and did
+   * nothing at all when it came out of the Library — the same gesture, the same
+   * two blocks, two answers, decided by where the tape had been a second
+   * earlier. Which is not a distinction the user is making.
+   *
+   * Order matters and is the same as it was: **splice first**, because a
+   * cassette dropped squarely on a tape cable means "into this line", not "into
+   * whichever deck happens to be under it".
+   */
+  spliceDroppedBlock(b: Block): boolean {
+    this.overlay.spliceWire = null;
+    const t = this.spliceTargetFor(b, 1);
+    if (t) {
+      this.doSplice(b, t);
+      return true;
+    }
+    return this.tryTapeInsert(b);
+  }
+
+  /**
+   * SPLICE: carry it out. `A → B` becomes `A → block → B`, as one undo entry.
+   *
+   * The existing wire is **re-pointed rather than deleted and recreated**, so
+   * everything hanging off its identity survives: its bundle membership, its
+   * branches, its selection, and any rewire run already riding it. Deleting it
+   * would silently drop every branch off that trunk (`deleteWires` cascades),
+   * which is a much bigger edit than the one the user asked for.
+   */
+  private doSplice(b: Block, t: SpliceTarget): void {
+    doc.pushHistory();
+    t.wire.b.port = { blockId: b.id, portId: t.inPort.id };
+    t.wire.b.float = undefined;
+    const w2 = doc.addWire(
+      { port: { blockId: b.id, portId: t.outPort.id } },
+      { port: { blockId: t.dst.block.id, portId: t.dst.port.id } },
+    );
+    doc.syncRigPorts();
+    doc.touch('structure');
+    // The run goes through in signal order, ringing the block it now passes
+    // through — see `ui/rewire.ts` for why this is a route and not a flash.
+    noteRewire('splice', [t.wire.id, w2.id], [{ shape: ringForBlock(b), t: 0.5 }]);
+  }
+
+  /** Do these two rects meet at all? The looseness is deliberate — see
+   *  `tryTapeInsert`. */
+  private static overlaps(a: Block, b: Block): boolean {
+    return (
+      a.pos.x < b.pos.x + b.size.w &&
+      a.pos.x + a.size.w > b.pos.x &&
+      a.pos.y < b.pos.y + b.size.h &&
+      a.pos.y + a.size.h > b.pos.y
+    );
+  }
+
+  /**
+   * Physical tape insertion, **whichever of the two you dropped**.
+   *
+   * Putting a cassette on a deck and putting a deck on a cassette are one
+   * gesture with one meaning — that tape goes in that machine — and only the
+   * first of them worked. The second is not an exotic case: it is what you do
+   * every time you drag a Sampler out of the Library onto the tape you already
+   * have on the canvas, and it silently produced two unconnected blocks
+   * touching each other.
+   *
+   * **The cassette is what moves, in both directions.** It is the part that is
+   * *loaded into* something, so it is the part that ends up parked beside the
+   * deck — and it means the block you just placed by hand stays exactly where
+   * you put it, which is the rule everywhere else in the editor.
+   *
+   * Looser than the splice test on purpose: a lone cassette overlapping a deck
+   * has no other plausible reading, where a gain dropped near a wire absolutely
+   * does (see `spliceTargetFor`).
+   */
+  private tryTapeInsert(dropped: Block): boolean {
+    const deckPort = (b: Block): Port | undefined =>
+      b.ports.find((pt) => pt.kind === 'tape' && pt.dir === 'in');
+    for (const other of doc.graph.blocks) {
+      if (other.id === dropped.id) continue;
+      if (!Editor.overlaps(dropped, other)) continue;
+      // Which of the pair is the tape, and which is the machine it goes into.
+      const cassette = dropped.type === 'cassette' ? dropped : other.type === 'cassette' ? other : null;
+      if (!cassette) continue;
+      const deck = cassette === dropped ? other : dropped;
+      const port = deckPort(deck);
       if (!port) continue;
       doc.pushHistory();
-      const occupied = doc.wireAtPort(b.id, port.id);
+      // Single-link both ends: whatever was in the deck comes out, and a tape
+      // cannot be in two decks at once (docs/02, one wire tree per input).
+      const occupied = doc.wireAtPort(deck.id, port.id);
       if (occupied) doc.deleteWires([occupied.wire.id]);
       const own = doc.wireAtPort(cassette.id, 'tape');
       if (own) doc.deleteWires([own.wire.id]);
-      doc.addWire(
+      const w = doc.addWire(
         { port: { blockId: cassette.id, portId: 'tape' } },
-        { port: { blockId: b.id, portId: port.id } },
+        { port: { blockId: deck.id, portId: port.id } },
       );
-      cassette.pos = { x: b.pos.x - cassette.size.w - 42, y: b.pos.y };
+      cassette.pos = { x: deck.pos.x - cassette.size.w - 42, y: deck.pos.y };
+      doc.syncRigPorts();
       doc.touch('structure');
+      // The same run every other automatic rewire plays, ending on the machine
+      // the tape now feeds — this edit moves a block *and* makes a cable, which
+      // is exactly the kind that happens without announcing itself.
+      noteRewire('splice', [w.id], [{ shape: ringForBlock(deck), t: 1 }]);
       return true;
     }
     return false;
@@ -2715,9 +3712,21 @@ export class Editor {
         });
         return;
       }
-      // Double-clicking a widget operates the widget — never rename/enter.
-      // (Fixes fast note-button taps spuriously opening the rename dialog.)
-      if (item && item.ref !== 'title') return;
+      // RESET: double-click a value widget puts it back to its default. The
+      // gesture every other audio tool uses, and it was free — the early return
+      // below already discards this event over a widget.
+      //
+      // Only the **relative-drag** widgets. A `button` or a `keys` is momentary
+      // and a `toggle`/`select` commits on the press itself, so "the value it
+      // had by default" is not a thing you were reaching for by tapping twice.
+      if (item && item.ref !== 'title') {
+        const w = this.widgetAt(b, p);
+        const wk = w ? controlOf(b, w.ref, w.spec).kind : '';
+        if (w && (wk === 'knob' || wk === 'fader' || wk === 'hfader')) {
+          this.resetWidgetValue(b, w.spec, w.child);
+        }
+        return;
+      }
       const def = getDef(b.type);
       if (item?.ref !== 'title' && def.isSubgraph) {
         this.enterSubgraph(b.id);
@@ -2757,6 +3766,16 @@ export class Editor {
           key: 'Ctrl+V',
           disabled: !blockClipboard,
           action: () => this.pasteClipboard(p),
+        },
+        { sep: true },
+        // QUICK ADD: the first item, because it is how the picker gets found.
+        // The pinned/recent list below is faster when what you want is on it;
+        // this is faster when it is not, and nothing else on the canvas
+        // advertises that Ctrl+K exists.
+        {
+          label: 'Search blocks…',
+          key: 'Ctrl+K',
+          action: () => this.quickAdd(p, { hint: 'Placing here' }),
         },
         { sep: true },
       ];
@@ -3082,6 +4101,30 @@ export class Editor {
         if (fi) items.push({ label: 'Appearance ▸', action: () => sub(appearanceItems()) });
         if (hasXyRange) items.push({ label: 'Range ▸', action: () => sub(rangeItems()) });
         items.push({ sep: true });
+        // THE VIRUS, by hand. The card's switches govern where the simulation
+        // may wander; this is you naming one widget, so it overrules the
+        // category ban and the spare list — a switch that quietly refuses an
+        // explicit instruction is worse than not having the switch.
+        //
+        // What it does NOT overrule is whether the widget can show an
+        // infection at all: a toggle, an enum or a knob with a CV cable
+        // already on it accepted the gesture and then visibly did nothing.
+        // The refusal is named in the label, for the same reason the block
+        // menu names its own — a disabled item that does not say why sends you
+        // looking for the wrong problem.
+        if (w && !w.child) {
+          const vNode = runtime.nodeId(b.id);
+          const infected = !!virusOn(vNode, w.spec.id);
+          const no = infected ? null : infectRefusal(b, w.spec.id, doc.graph);
+          items.push({
+            label: infected ? `Cure ${wName}` : no ? `Infect ${wName} (${no})` : `Infect ${wName}`,
+            disabled: !!no,
+            action: () =>
+              infected
+                ? clearVirusParam(vNode, w!.spec.id, (n, p, v) => runtime.sendParam(n, p, v))
+                : void seedVirusOn(vNode, b, w!.spec.id, undefined, doc.graph),
+          });
+        }
         // CV: on the block itself, or (mirrored widget on a custom block) a
         // port that drives the child's param.
         if (cvable && !w!.child)
@@ -3394,6 +4437,41 @@ export class Editor {
       // ---- Block ▸ ---------------------------------------------------------
       const blockMenu = (): MenuItem[] => {
         const items: MenuItem[] = [{ label: 'Rename…', action: () => this.doubleClickRename(b) }];
+        // THE VIRUS (src/core/virus.ts). Seeding is deliberately a deliberate
+        // act — nothing starts an outbreak on its own, because a patch that
+        // begins modulating itself unbidden is a fault report, not a feature.
+        // Once seeded it spreads downstream on its own.
+        {
+          const nodeId = runtime.nodeId(b.id);
+          const infected = virusInfections().some((i) => i.nodeId === nodeId);
+          const allowed = blockAllowed(b);
+          const habitable = allowed && infectableParams(b, doc.graph).length > 0;
+          if (infected)
+            items.push({
+              label: 'Cure this block',
+              action: () => clearVirusOn(nodeId, (n, p, v) => runtime.sendParam(n, p, v)),
+            });
+          else
+            items.push({
+              // Say WHICH refusal it is. "Nothing takes CV" on a block you have
+              // simply fenced off by category sends you looking for the wrong
+              // problem — and the fence is the one you can actually undo.
+              label: habitable
+                ? 'Infect a widget'
+                : allowed
+                  ? 'Infect a widget (no widget here can hold one)'
+                  : `Infect a widget (${getDef(b.type).category} is off limits)`,
+              disabled: !habitable,
+              action: () => {
+                if (seedVirus(nodeId, b, doc.graph)) doc.touch('selection');
+              },
+            });
+          if (virusCount() > 1)
+            items.push({
+              label: `Cure everything (${virusCount()})`,
+              action: () => clearVirus((n, p, v) => runtime.sendParam(n, p, v)),
+            });
+        }
         if (def.isSubgraph) items.push({ label: 'Enter block', action: () => this.enterSubgraph(b.id) });
         items.push({
           label: b.autoSize ? 'Manual size' : 'Auto size',
@@ -3462,11 +4540,27 @@ export class Editor {
       // correct but startling if the menu doesn't admit it.
       const selCount = doc.selectedBlocks().length;
       const many = selCount > 1 ? ` (${selCount})` : '';
+      // BYPASS: the label follows the selection, not the block under the
+      // cursor — the action does, so the label must, or a mixed selection
+      // offers "Un-bypass" and bypasses six things.
+      const bypCandidates = doc.selectedBlocks().filter(canBypass);
+      const bypassable = bypCandidates.length > 0;
+      const anyLive = bypCandidates.some((x) => !x.bypass);
       showContextMenu(at.x, at.y, live([
         // The widget under the cursor comes first and comes *flat*: setting a
         // value, wiring CV, learning MIDI and docking are patching moves, and
         // burying them one level down cost a click every time.
         numeric ? { label: `Set ${wName}…`, action: () => this.promptWidgetValue(b, w!) } : {},
+        // RESET sits next to `Set …` because they are the same question asked
+        // two ways, and both are patching moves that stay one click deep.
+        numeric && w!.spec.def !== undefined
+          ? {
+              label: `Reset ${wName}${(w!.child ?? b).params[w!.spec.id] === w!.spec.def ? '' : ` (${w!.spec.def})`}`,
+              key: 'dbl-click',
+              disabled: (w!.child ?? b).params[w!.spec.id] === w!.spec.def,
+              action: () => this.resetWidgetValue(b, w!.spec, w!.child),
+            }
+          : {},
         ...(w ? widgetItems() : []),
         ...dockItems,
         dockAllItem,
@@ -3485,6 +4579,28 @@ export class Editor {
         { label: `Group into a block…${many}`, key: 'Ctrl+G', action: () => void this.groupSelection() },
         { label: 'Save selection as Custom Block…', action: () => void this.groupSelection(true) },
         { sep: true },
+        // BYPASS sits at the TOP level, not under `Block ▸`. The rule this menu
+        // is built on is "group what you visit, not what you use", and A/B-ing
+        // whether an effect is earning its place is the most-used verb there
+        // is — burying it a click down is exactly the mistake the CV and MIDI
+        // items were pulled back up out of.
+        bypassable
+          ? {
+              label: anyLive ? `Bypass${many}` : `Un-bypass${many}`,
+              key: 'Ctrl+B',
+              action: () => this.toggleBypass(),
+            }
+          : {},
+        // EXTRACT: shown only when the heal is unambiguous, like `Enter block`
+        // below. An item that is present-but-refusing on most blocks in a patch
+        // is noise; this one simply is not there unless it applies.
+        // The `key` is the gesture, not a keystroke: Alt+drag does this and
+        // carries the block off in one motion, and the menu is where anyone
+        // finds out that it exists. A shortcut nothing announces is a shortcut
+        // for whoever wrote it.
+        this.chainHealFor(b)
+          ? { label: 'Pull out of chain', key: 'Alt+drag', action: () => this.doExtract(b) }
+          : {},
         { label: 'Rename…', action: () => this.doubleClickRename(b) },
         def.isSubgraph ? { label: 'Enter block', action: () => this.enterSubgraph(b.id) } : {},
         { label: 'Delete', key: '⌫', action: () => doc.deleteSelected() },
@@ -3563,6 +4679,34 @@ export class Editor {
     const made = doc.pasteBlocks(blockClipboard, pos);
     for (const b of made) syncBlockSize(b, doc.scene.theme);
     return made;
+  }
+
+  /**
+   * BYPASS: toggle it across the selection.
+   *
+   * One `'param'` change, never `'structure'`: the flag reaches both engines as
+   * the compiler-injected `__bypass` param through `set-param`, so nothing
+   * recompiles and nothing is torn down. A bypass that rebuilt the graph would
+   * reload every hosted plugin on the way through — which would make the fast
+   * A/B this exists to be into the slowest thing in the app.
+   *
+   * The whole selection follows one decision (`on`), taken from whether any
+   * bypassable block in it is still live, so a mixed selection resolves to
+   * "bypass them all" and toggles back cleanly rather than inverting into a
+   * different mixture.
+   */
+  toggleBypass(blocks?: Block[]): void {
+    const sel = (blocks ?? doc.selectedBlocks()).filter(canBypass);
+    if (!sel.length) return;
+    const on = sel.some((b) => !b.bypass);
+    doc.pushHistory();
+    for (const b of sel) {
+      // `undefined` rather than `false`: an off flag has nothing to say, and
+      // leaving it out keeps saved scenes byte-identical to what they were.
+      b.bypass = on || undefined;
+      runtime.sendParam(runtime.nodeId(b.id), BYPASS_PARAM, on ? 1 : 0);
+    }
+    doc.touch('param');
   }
 
   /**
@@ -3733,6 +4877,30 @@ export class Editor {
       if (k === 'g') {
         e.preventDefault();
         void this.groupSelection();
+        return;
+      }
+      // BYPASS: the keyboard half of the menu item. Same verb, same selection.
+      if (k === 'b') {
+        e.preventDefault();
+        this.toggleBypass();
+        return;
+      }
+      // QUICK ADD at the pointer (or the view centre when there is no pointer —
+      // touch and keyboard-only sessions have none, and the picker must still
+      // be reachable there).
+      if (k === 'k') {
+        e.preventDefault();
+        const at = this.overlay.pointer ?? this.viewCenter();
+        // Captured NOW, not in the callback: `addBlockAt` selects what it
+        // places, so by the time the pick happens the old selection is gone.
+        const sel = doc.selectedBlocks();
+        const src = sel.length === 1 ? sel[0] : null;
+        this.quickAdd(at, {
+          hint: src ? `Placing after ${src.name}` : 'Placing at the pointer',
+          onPlaced: (made) => {
+            if (src) this.autoWireFrom(src, made);
+          },
+        });
         return;
       }
     }

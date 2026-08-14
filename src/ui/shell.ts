@@ -732,6 +732,20 @@ export function initShell(editor: Editor): void {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
       e.preventDefault();
       void doNew();
+    } else if (e.key === 'Escape' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      // FAILSAFE: **panic on Escape.** See `MidiEvent`'s `panic` in
+      // `engine/engine.ts` for the failure it exists for.
+      //
+      // Escape and not a chord, because the moment you need it is the moment
+      // something is screaming out of the speakers and you are not going to
+      // look up a shortcut — it is the key every human already reaches for to
+      // make a thing stop. It is otherwise unbound on the canvas (a live drag
+      // is cancelled by the editor's own handler, on the canvas, before this
+      // ever sees it), and it costs nothing when nothing is held.
+      //
+      // Deliberately NOT preventDefault'd: a dialog or a panel that closes on
+      // Escape should still close. Panic is additive.
+      runtime.panic();
     }
   });
 

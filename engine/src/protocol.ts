@@ -69,13 +69,21 @@ export interface CompiledGraph {
 }
 
 /** Mirrors src/engine/engine.ts (see its doc comment for per-type field use):
- *  bend → velocity −1..1; pressure → velocity 0..1; polyat → note+velocity. */
+ *  bend → velocity −1..1; pressure → velocity 0..1; polyat → note+velocity.
+ *
+ *  `panic` is the failsafe — "release everything you are holding, now" — and
+ *  its whole rationale is written out on the renderer-side declaration. Both
+ *  fields are unused. Every kernel that holds note state handles it and passes
+ *  it on; `scripts/midi-panic-test.mjs` fails the build on one that does not. */
 export interface MidiEvent {
-  type: 'on' | 'off' | 'cc' | 'bend' | 'pressure' | 'polyat';
+  type: 'on' | 'off' | 'cc' | 'bend' | 'pressure' | 'polyat' | 'panic';
   note: number;
   velocity: number;
   channel: number;
 }
+
+/** The failsafe event. One shape, one place. */
+export const PANIC: MidiEvent = Object.freeze({ type: 'panic', note: 0, velocity: 0, channel: 0 });
 
 // ---- renderer/main → engine ----
 export interface ConfigMsg {
@@ -97,6 +105,16 @@ export interface MidiEventMsg { op: 'midi-event'; device: string; ev: MidiEvent 
 /** Arm/disarm MIDI-learn forwarding: while armed the engine echoes incoming
  *  cc/note events to the renderer as `midi-seen` (throttled). */
 export interface MidiLearnMsg { op: 'midi-learn'; on: boolean }
+/**
+ * FAILSAFE: release every note in the engine, now.
+ *
+ * A control message rather than a `midi-event` carrying `PANIC`, because the
+ * point of it is that it reaches kernels the *routing* would not: the whole
+ * failure mode is a MIDI net that no longer exists, so delivering the rescue
+ * down a net is delivering it down the thing that broke. The engine fans it out
+ * to every node directly. See `MidiEvent` above.
+ */
+export interface MidiPanicMsg { op: 'midi-panic' }
 export interface WatchVisualsMsg { op: 'watch-visuals'; nodes: string[] }
 export interface AssetReadyMsg { op: 'asset-ready'; id: string }
 /**
@@ -171,7 +189,7 @@ export interface VstUiRectMsg {
 }
 export type InMsg =
   | ConfigMsg | StartMsg | StopMsg | SetGraphMsg | SetParamMsg
-  | MidiEventMsg | MidiLearnMsg | WatchVisualsMsg | AssetReadyMsg | KeyEventMsg | MeasureLatencyMsg
+  | MidiEventMsg | MidiLearnMsg | MidiPanicMsg | WatchVisualsMsg | AssetReadyMsg | KeyEventMsg | MeasureLatencyMsg
   | MeasureSpeakersMsg | VstUiMsg | VstUiRectMsg;
 
 // ---- engine → renderer ----

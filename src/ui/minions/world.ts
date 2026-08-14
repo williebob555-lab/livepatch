@@ -161,19 +161,36 @@ export function surfaceLength(world: WalkWorld, graph: Graph, id: string): numbe
  * and 8 px is far below the step thresholds it feeds, so no reachable route is
  * ever missed because of the rounding.
  */
-function signature(graph: Graph): string {
+function signature(graph: Graph, held: Set<string>): string {
   const q = (n: number): number => Math.round(n / 8);
   const parts: string[] = [];
-  for (const b of graph.blocks) parts.push(`${b.id}:${q(b.pos.x)},${q(b.pos.y)},${q(b.size.w)},${q(b.size.h)}`);
+  for (const b of graph.blocks) {
+    // A held block contributes its *identity* and not its position, so the
+    // world is not rebuilt sixty times a second for the whole of a flight
+    // across the patch — it is not in the world at all while it is up there.
+    if (held.has(b.id)) parts.push(`${b.id}:held`);
+    else parts.push(`${b.id}:${q(b.pos.x)},${q(b.pos.y)},${q(b.size.w)},${q(b.size.h)}`);
+  }
   for (const w of graph.wires) parts.push(`${w.id}:${w.a.port?.portId ?? '~'}${w.b.port?.portId ?? '~'}${w.parentId ?? ''}`);
   return parts.join('|');
 }
 
 let cached: WalkWorld | null = null;
 
-/** Build (or reuse) the walkable world for this frame. */
-export function walkWorld(graph: Graph, paths: WirePaths): WalkWorld {
-  const sig = signature(graph);
+/**
+ * Build (or reuse) the walkable world for this frame.
+ *
+ * `held` is every block currently in a gripper. **They are not part of the
+ * world**: a carried block's position is the gripper's (`payload.ts`), so
+ * leaving it in makes a surface that flies about — Gus steps onto a block that
+ * is then carried off across the patch with him standing on it, and every
+ * neighbour it passes gains and loses a link to it on the way. The rule is the
+ * same one the `behind` layer already states: something you cannot stand on is
+ * not a floor.
+ */
+export function walkWorld(graph: Graph, paths: WirePaths, heldIds: readonly string[] = []): WalkWorld {
+  const held = new Set(heldIds);
+  const sig = signature(graph, held);
   if (cached && cached.sig === sig) {
     cached.paths = paths;
     return cached;
@@ -188,8 +205,9 @@ export function walkWorld(graph: Graph, paths: WirePaths): WalkWorld {
   const runs = new Map<string, { y: number; l: number; r: number }>();
   for (const b of graph.blocks) {
     // A block hidden behind the wires is scenery — walking on a backdrop looks
-    // like walking on nothing.
-    if (b.style.wireLayer === 'behind') continue;
+    // like walking on nothing. A block in a gripper is the opposite problem:
+    // it is a floor that flies away.
+    if (b.style.wireLayer === 'behind' || held.has(b.id)) continue;
     const run = topRun(b);
     if (!run) continue;
     runs.set(b.id, run);

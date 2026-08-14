@@ -118,6 +118,21 @@ export interface MinionDef {
    * means it is there always.
    */
   follows?: boolean;
+  /**
+   * This one has a personnel file but no body on the canvas.
+   *
+   * **Not every hire is a figure that walks about.** The virus is a thing that
+   * happens *to* the patch rather than a character standing on it — it has no
+   * feet, no station and nothing to draw at a world position — but it is still
+   * something you take on, whose behaviour you want switches for, and whose
+   * card belongs in the same drawer as the other two. Without this the roster
+   * would spawn an `Agent` with an invisible body and walk it round the patch
+   * forever, doing nothing, costing a frame.
+   *
+   * A `noAgent` def still supplies `makeBody()`, because the card's portrait
+   * comes from it — that is the only method such a body needs to mean.
+   */
+  noAgent?: boolean;
   card: MinionCard;
   options: MinionOption[];
   /** The chores this character is capable of at all. A duty switch can only

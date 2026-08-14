@@ -8,7 +8,7 @@
 // accumulated sparsely and shipped on a slow timer by main.ts; visuals are
 // computed only for nodes the renderer watches.
 // ============================================================================
-import { CompiledGraph, MidiEvent, NetTapMod, NodeMidiMap, ParamValue, VisualsMsg, send } from './protocol';
+import { CompiledGraph, MidiEvent, NetTapMod, NodeMidiMap, PANIC, ParamValue, VisualsMsg, send } from './protocol';
 import { Buf, Ctx, Ins, Kernel, Services, allocBuf, kernelFactory } from './dsp';
 import { parseRig, rigOutSpan } from './rig';
 import { fftBytes } from './fft';
@@ -45,7 +45,35 @@ interface NodeRec {
   /** Reused per-quantum input map: port → net buffer (shared, read-only). */
   ins: Ins;
   inNets: Array<{ port: string; net: NetRec }>;
+  /**
+   * BYPASS: audio in-port → out-port pairs, resolved at set-graph time (never
+   * in `process` — this allocates). Empty = nothing to pass through, so the
+   * flag is inert and the kernel always runs.
+   */
+  bypassPairs: Array<{ inPort: string; outPort: string }>;
+  /** BYPASS: what the document wants — 1 = bypassed. */
+  bypassWant: number;
+  /** BYPASS: the live crossfade, 0 = fully wet, 1 = fully dry. Not a boolean,
+   *  because a step from wet to dry is a discontinuity and a click (rule 10). */
+  bypassMix: number;
 }
+
+/**
+ * BYPASS: the compiler-injected flag (mirrors `BYPASS_PARAM` in
+ * `src/core/compile.ts`, the same way `dsp.ts` mirrors `__rig`).
+ */
+const BYPASS_PARAM = '__bypass';
+
+/**
+ * BYPASS: crossfade time between the wet and dry paths.
+ *
+ * Toggling bypass is a gain change on a signal, so it ramps rather than steps
+ * — golden rule 10, the same reason `Smooth` exists. 12 ms is short enough to
+ * read as instant while you A/B and long enough that a full-scale switch is
+ * inaudible; stepping it at the quantum boundary is a click, and it is a click
+ * you would hear on *every* comparison, which is the whole use of the feature.
+ */
+const BYPASS_RAMP_S = 0.012;
 
 const modNorm = (m: NetTapMod, v: number): number =>
   m.curve === 'log' && m.min > 0 ? Math.log(v / m.min) / Math.log(m.max / m.min) : (v - m.min) / (m.max - m.min || 1);
@@ -66,6 +94,9 @@ export class GraphExec {
   private order: NodeRec[] = [];
   private nets: NetRec[] = [];
   private modIndex = new Map<string, ModRec>();
+  /** FAILSAFE: `node\0port` for every MIDI sink the LAST graph fed. Diffed on
+   *  each `apply` so a sink whose feed disappeared gets a panic. */
+  private midiFed = new Set<string>();
   /** Flattened learned MIDI bindings (MIDI learn), rebuilt each set-graph. */
   private midiLearn: Array<{ node: string; map: NodeMidiMap }> = [];
   private quantum = 0;
@@ -108,9 +139,16 @@ export class GraphExec {
         keep.add(n.id);
         existing.ins = {};
         existing.inNets = [];
+        existing.bypassPairs = [];
         // Kept kernels never re-read node.params — apply what changed since
         // the last graph (scene loads / doc-side edits reuse node ids).
         for (const [k, v] of Object.entries(n.params)) {
+          // BYPASS is the executor's, not the kernel's: no kernel declares it
+          // and handing it down would be an unknown param on all 104 of them.
+          if (k === BYPASS_PARAM) {
+            existing.bypassWant = Number(v) ? 1 : 0;
+            continue;
+          }
           if (existing.params[k] !== v) existing.kernel.setParam(k, v);
         }
         existing.params = { ...n.params };
@@ -119,6 +157,7 @@ export class GraphExec {
       existing?.kernel.dispose?.();
       const kernel = kernelFactory(n.type)(n.params, this.sv);
       kernel.nodeId = n.id;
+      const want = Number(n.params[BYPASS_PARAM]) ? 1 : 0;
       this.nodes.set(n.id, {
         id: n.id,
         type: n.type,
@@ -126,6 +165,11 @@ export class GraphExec {
         params: { ...n.params },
         ins: {},
         inNets: [],
+        bypassPairs: [],
+        bypassWant: want,
+        // A node built already bypassed starts fully dry rather than fading in
+        // from wet — there is no previous sound to fade from.
+        bypassMix: want,
       });
       keep.add(n.id);
     }
@@ -146,6 +190,9 @@ export class GraphExec {
     // port at a time, so the table cannot be built in a single pass.
     const multiMidi = new Map<Kernel, Map<string, (ev: MidiEvent, offset?: number) => void>>();
     const multiTape = new Map<Kernel, Map<string, (id: string) => void>>();
+    // FAILSAFE: MIDI sinks that have a source in the graph being applied.
+    // Diffed against `this.midiFed` at the end — see the note there.
+    const midiFedNow = new Set<string>();
 
     // ---- nets ----
     const nodeParams = new Map(g.nodes.map((n) => [n.id, n.params]));
@@ -154,6 +201,16 @@ export class GraphExec {
     this.nets = [];
     const edges: Array<[string, string]> = [];
     const tapeConnected = new Set<Kernel>();
+    // BYPASS: connected AUDIO ports per node, gathered while walking the nets.
+    // The compiled graph never lists a node's ports — only the nets name them —
+    // so this is the only place the pairing can be built.
+    const bypIn = new Map<string, Set<string>>();
+    const bypOut = new Map<string, Set<string>>();
+    const noteAudioPort = (m: Map<string, Set<string>>, node: string, port: string): void => {
+      let s = m.get(node);
+      if (!s) m.set(node, (s = new Set()));
+      s.add(port);
+    };
     for (const net of g.nets) {
       if (net.kind === 'midi') {
         // The SINK PORT travels with the sink. Almost every MIDI kernel has one
@@ -161,11 +218,12 @@ export class GraphExec {
         // Entanglement Field) has to know which cable an event came down —
         // and this net already knew, it was simply being dropped here.
         const sinks = net.sinks
-          .map((s) => ({ k: this.nodes.get(s.node)?.kernel, port: s.port }))
-          .filter((s): s is { k: Kernel; port: string } => !!s.k?.midiIn);
+          .map((s) => ({ k: this.nodes.get(s.node)?.kernel, port: s.port, node: s.node }))
+          .filter((s): s is { k: Kernel; port: string; node: string } => !!s.k?.midiIn);
         for (const src of net.sources) {
           const k = this.nodes.get(src.node)?.kernel;
           if (!k) continue;
+          for (const s of sinks) midiFedNow.add(s.node + '\0' + s.port);
           const send = (ev: MidiEvent, offset?: number): void => {
             for (const s of sinks) s.k.midiIn!(ev, offset, s.port);
           };
@@ -221,6 +279,7 @@ export class GraphExec {
         if (!n) continue;
         rec.sources.push({ kernel: n.kernel, port: src.port });
         n.kernel.setWidth?.(src.port, width);
+        noteAudioPort(bypOut, src.node, src.port);
       }
       for (const snk of net.sinks) {
         const n = this.nodes.get(snk.node);
@@ -244,10 +303,27 @@ export class GraphExec {
         }
         n.inNets.push({ port: snk.port, net: rec });
         n.kernel.setWidth?.(snk.port, width);
+        noteAudioPort(bypIn, snk.node, snk.port);
         for (const src of net.sources) edges.push([src.node, snk.node]);
       }
       this.nets.push(rec);
     }
+    // BYPASS: pair each node's connected audio inputs with its outputs, in
+    // sorted port order so the mapping is stable across rebuilds rather than
+    // depending on the order nets happened to be walked in.
+    //
+    // Index-wise pairing is exactly right for the 1-in/1-out effects this
+    // feature is for, and is an arbitrary-but-stable choice for a block with
+    // several of each (a Matrix, an Upmix). It is documented as such rather
+    // than guessed at per block type: the alternative is a table of special
+    // cases that goes stale the first time somebody adds a port.
+    for (const rec of this.nodes.values()) {
+      const ins = [...(bypIn.get(rec.id) ?? [])].sort();
+      const outs = [...(bypOut.get(rec.id) ?? [])].sort();
+      const n = Math.min(ins.length, outs.length);
+      for (let i = 0; i < n; i++) rec.bypassPairs.push({ inPort: ins[i], outPort: outs[i] });
+    }
+
     // Install the per-port event tables. A port with nothing wired to it is
     // simply absent from the map, so sending out of it is a no-op rather than
     // a broadcast to everything.
@@ -269,6 +345,29 @@ export class GraphExec {
         if (rec.gateHi) rec.kernel.setParam(rec.mod.param, 0);
       } else rec.kernel.setParam(rec.mod.param, rec.base);
     }
+    // FAILSAFE: unplugged MIDI lines release. **The same rule as the line
+    // above, for notes instead of knobs** — a gate left high by a pulled CV
+    // cable and a note left on by a pulled MIDI cable are one failure in two
+    // currencies, and only the CV half was ever written.
+    //
+    // The DIFF matters, not a blanket panic per rebuild: a recompile happens on
+    // any structural edit, and killing every held note on all of them would
+    // mean you could not edit a patch while holding a chord — which is most of
+    // what playing one is. Only lines that actually stopped existing panic.
+    for (const key of this.midiFed) {
+      if (midiFedNow.has(key)) continue;
+      const sep = key.indexOf('\0');
+      const k = this.nodes.get(key.slice(0, sep))?.kernel;
+      // A sink that went with its wire needs nothing — `dispose` took its
+      // voices with it.
+      if (!k?.midiIn) continue;
+      try {
+        k.midiIn(PANIC, 0, key.slice(sep + 1));
+      } catch {
+        /* a sink's panic handler must never break the rebuild */
+      }
+    }
+    this.midiFed = midiFedNow;
 
     // ---- topo order (Kahn); cycle leftovers append = one-quantum feedback ----
     const indeg = new Map<string, number>();
@@ -302,6 +401,13 @@ export class GraphExec {
     // Keep the snapshot fresh so the next set-graph diff doesn't re-fire this.
     const node = this.nodes.get(nodeId);
     if (node) node.params[param] = v;
+    // BYPASS: the executor owns this one. Arriving as a `set-param` is the
+    // whole point — the toggle must not rebuild the graph, or every hosted
+    // plugin would reload on the way through (docs/02-core-ir.md).
+    if (param === BYPASS_PARAM) {
+      if (node) node.bypassWant = Number(v) ? 1 : 0;
+      return;
+    }
     const rec = this.modIndex.get(nodeId + ' ' + param);
     if (rec && rec.mod.mode !== 'gate' && typeof v === 'number') {
       rec.base = v;
@@ -374,6 +480,31 @@ export class GraphExec {
     slot.device = device;
     slot.ev = ev;
     slot.tMs = now;
+  }
+
+  /**
+   * FAILSAFE: release every note in the graph, now.
+   *
+   * **Fanned out to every kernel directly, not routed down the MIDI nets.**
+   * That is the whole reason this is a method rather than a `deliverMidi` of
+   * `PANIC`: the failure it rescues is a route that has gone — a cable pulled
+   * while a key was down, a device unplugged mid-chord — so sending the rescue
+   * along the routing would send it everywhere except the one place it is
+   * needed. Every kernel gets it; the ones holding nothing ignore it.
+   *
+   * Called from the control thread, never from `process`. It sends note-offs,
+   * which is exactly what a kernel's own note handling does, so it is no more
+   * a real-time hazard than an incoming MIDI event is — but it is queued
+   * nowhere and takes effect on the next block either way.
+   */
+  panic(): void {
+    for (const rec of this.nodes.values()) {
+      try {
+        rec.kernel.midiIn?.(PANIC, 0);
+      } catch {
+        /* one deaf kernel must not stop the rest being silenced */
+      }
+    }
   }
 
   /**
@@ -515,6 +646,12 @@ export class GraphExec {
         if (slot.net.stamp !== this.quantum) this.computeNet(slot.net, ctx, meter);
         node.ins[slot.port] = slot.net.buf;
       }
+      // BYPASS: only nodes actually involved in one take the branch — an
+      // un-bypassed patch pays a single integer test per node per quantum.
+      if (node.bypassPairs.length && (node.bypassWant || node.bypassMix > 0)) {
+        this.renderBypassed(node, ctx);
+        continue;
+      }
       node.kernel.process?.(node.ins, ctx);
     }
     // Dangling / mod-only nets still need computing (meters + CV application).
@@ -524,6 +661,72 @@ export class GraphExec {
     const load = dt / budget;
     this.loadAvg = this.loadAvg * 0.95 + load * 0.05;
     if (load > this.loadMax) this.loadMax = load;
+  }
+
+  /**
+   * BYPASS: cross-fade this node's audio inputs onto its audio outputs.
+   *
+   * Semantics: **as if the block were not there.** Its kernel stops running
+   * once the fade completes (which is the CPU saving people reach for bypass
+   * to get), and any latency the block contributed goes away with it — the
+   * same thing that happens when you delete it. This app has no automatic
+   * delay compensation anywhere, so a bypass that *kept* the block's latency
+   * would be inventing a behaviour nothing else here has; the honest version
+   * is the one that matches deleting, and `docs/07-ui.md` says so out loud.
+   *
+   * Two traps, both from `docs/10-performance.md`:
+   *
+   *  * **The switch is a gain change, so it ramps** (rule 10). A step from wet
+   *    to dry is a discontinuity, and it would fire on every A/B.
+   *  * **While fully dry the kernel's own output buffer is never written**, so
+   *    it holds whatever it last produced — possibly a latched non-finite
+   *    (rule 13). The dry path therefore *writes* rather than blending against
+   *    it: `0 * NaN` is NaN, and that would make bypass a way to permanently
+   *    poison a net.
+   *
+   * Allocation-free: the pairs are resolved at set-graph time and everything
+   * here is a read or a write into buffers that already exist (rule 1).
+   */
+  private renderBypassed(node: NodeRec, ctx: Ctx): void {
+    const target = node.bypassWant;
+    const start = node.bypassMix;
+    const n = ctx.n;
+    // The wet path is still needed while a fade is running, and all the way
+    // back whenever we are heading for wet.
+    const needWet = start < 1 || target === 0;
+    if (needWet) node.kernel.process?.(node.ins, ctx);
+    const step = 1 / Math.max(1, Math.round(ctx.sr * BYPASS_RAMP_S));
+    const travel = step * n;
+    const end = target > start ? Math.min(target, start + travel) : Math.max(target, start - travel);
+    for (const pair of node.bypassPairs) {
+      const dry = node.ins[pair.inPort];
+      const out = node.kernel.out(pair.outPort);
+      if (!out) continue;
+      const dryCh = dry ? dry.length : 0;
+      for (let c = 0; c < out.length; c++) {
+        const o = out[c];
+        // A block that WIDENS its input (an Upmix on a stereo source) has
+        // output channels with no dry counterpart. Those go to silence, not to
+        // whatever the kernel last left there: "as if it were not here" means
+        // the channels it invented do not exist either (rule 15's width half).
+        const d = c < dryCh ? dry![c] : null;
+        if (!needWet) {
+          // A plain loop, not `o.set(d.subarray(0, n))`: `subarray` allocates a
+          // view object on every quantum, which is the documented cause of the
+          // periodic GC pop in `docs/10-performance.md`.
+          if (d) for (let i = 0; i < n; i++) o[i] = d[i];
+          else o.fill(0, 0, n);
+          continue;
+        }
+        let mix = start;
+        for (let i = 0; i < n; i++) {
+          if (mix < target) mix = mix + step > target ? target : mix + step;
+          else if (mix > target) mix = mix - step < target ? target : mix - step;
+          o[i] = o[i] * (1 - mix) + (d ? d[i] * mix : 0);
+        }
+      }
+    }
+    node.bypassMix = end;
   }
 
   // ---- slow-path reporting (timers in main.ts, off the audio pump) ----

@@ -7,7 +7,7 @@ import { startKeyLearn } from './keylearn';
 import { hasUnit } from '../engine/webaudio';
 import { isAndroidApp } from './androidupdate';
 import { doc } from '../core/graph';
-import { BlockDef, ParamSpec, WidgetKind, allDefs, faceParams, getDef, paramSpec } from '../core/registry';
+import { BlockDef, ParamSpec, WidgetKind, allDefs, defaultParams, defaultPorts, faceParams, getDef, isArtworkFace, paramSpec } from '../core/registry';
 import { Block, ControlStyle, Edge, Port, Theme, Vec2, defaultTheme } from '../core/types';
 import { deleteSceneByName, listScenes } from '../core/persist';
 import { factoryScenes } from '../core/factory';
@@ -65,6 +65,7 @@ import { dock } from './dock';
 import { Editor } from './editor';
 import { MenuItem, confirmModal, promptModal, showContextMenu } from './menus';
 import { blockAt } from './geometry';
+import { armPlacement, onPlacementChange, pendingPlacementIntent } from './placement';
 // MINIONS: one guarded import, for the Library-drop-onto-a-minion case only.
 import { giveToMinion, minionBodyAt } from './minions/layer';
 import { renderBlockThumbnail, renderCassetteThumbnail, renderRollThumbnail } from './thumbnail';
@@ -168,6 +169,116 @@ export function applyPluginToBlock(b: Block, rec: VstPluginRecord): void {
   doc.touch('structure');
 }
 
+/** Set by `buildLibrary` — the panel owns its search box, so reaching it from
+ *  the canvas goes through here rather than through a DOM query that would
+ *  break the moment the panel is detached into its own window. */
+let focusLibrarySearch: () => void = () => {};
+
+/**
+ * QUICK ADD: show the Library and put the cursor in its search box, because
+ * something has armed a placement.
+ *
+ * Revealing the panel is not optional: an intent armed against a hidden Library
+ * is a mode with no visible state at all. It is split from the arming itself
+ * (which is synchronous, in `ui/placement.ts`) because only this half needs
+ * `dock`, and the canvas reaches this file through a dynamic import — see
+ * `Editor.quickAdd` for the race that caused.
+ *
+ * **Checks the intent is still armed.** Between the arming and this call the
+ * user may already have cancelled; showing the panel then would be a leftover
+ * of a mode that no longer exists.
+ */
+export function revealLibraryForPlacement(): void {
+  if (!pendingPlacementIntent()) return;
+  dock.show('library');
+  // After the panel has been placed/rebuilt, or the focus lands on an input
+  // that is about to be replaced.
+  setTimeout(() => {
+    if (pendingPlacementIntent()) focusLibrarySearch();
+  });
+}
+
+/**
+ * SPLICE FROM THE LIBRARY: the tile currently being dragged.
+ *
+ * Held in a module value because Chromium **blocks `dataTransfer.getData`
+ * during `dragover`** — you can read the *types* mid-drag but not the payload,
+ * so the drop is the first moment the key is legible from the event alone. A
+ * preview has to know before then. Set on `dragstart`, cleared on `dragend`,
+ * and set/cleared by the touch drag too so both gestures preview identically.
+ */
+let libDragKey: string | null = null;
+
+/** A throwaway, correctly-sized instance of a Library key — what the preview
+ *  measures against so it tests exactly what the drop will test.
+ *
+ *  Cached for the life of one drag: `syncBlockSize` lays out a whole face, and
+ *  a `dragover` fires many times a second. */
+let libDragGhost: { key: string; block: Block } | null = null;
+
+/**
+ * SPLICE FROM THE LIBRARY: a block-shaped stand-in for a Library key.
+ *
+ * The same size and ports the real block will have, so `spliceTargetFor` gives
+ * the same answer for the ghost as it will for the block that replaces it. A
+ * preview that used a nominal size would light up over wires the drop then
+ * refused — a proposal that lies is worse than no proposal.
+ *
+ * Lives here rather than in `editor.ts` because the `cassette:` / `roll:` /
+ * `vst:` / `custom:` key prefixes are this file's vocabulary, and `addBlockAt`
+ * below is the other place that has to know them.
+ */
+export function libraryGhostBlock(key: string): Block | null {
+  if (libDragGhost?.key === key) return libDragGhost.block;
+  const theme = doc.scene.theme;
+  let block: Block | null = null;
+  if (key.startsWith('custom:')) {
+    const rec = getCustomBlock(key);
+    if (rec?.template) {
+      // The template IS a laid-out instance — it already carries its size,
+      // ports and face, so it is copied rather than rebuilt from a def.
+      block = { ...rec.template, id: 'lib-ghost', pos: { x: 0, y: 0 }, ports: rec.template.ports.map((p) => ({ ...p })) };
+    }
+  } else {
+    const type = key.startsWith('cassette:')
+      ? 'cassette'
+      : key.startsWith('roll:')
+        ? 'midi-roll'
+        : key.startsWith('vst:')
+          ? 'vst'
+          : key;
+    let def;
+    try {
+      def = getDef(type);
+    } catch {
+      return null; // an unregistered key: no ghost, and so no preview
+    }
+    block = {
+      id: 'lib-ghost',
+      type,
+      name: def.title,
+      pos: { x: 0, y: 0 },
+      size: { w: def.minW ?? 120, h: def.minH ?? 60 },
+      autoSize: !isArtworkFace(def),
+      ports: defaultPorts(def),
+      params: defaultParams(def),
+      style: def.style ? { ...def.style } : {},
+      layout: [],
+    };
+    syncBlockSize(block, theme);
+  }
+  if (!block) return null;
+  libDragGhost = { key, block };
+  return block;
+}
+
+/** Called by both drag paths (and on drag end, with `null`). */
+export function setLibraryDrag(key: string | null): void {
+  libDragKey = key;
+  if (!key) libDragGhost = null;
+}
+export const libraryDragKey = (): string | null => libDragKey;
+
 export function addBlockAt(type: string, pos: Vec2): void {
   doc.pushHistory();
   let b;
@@ -223,6 +334,15 @@ export function addBlockAt(type: string, pos: Vec2): void {
   if (hand) giveToMinion(hand, { kind: 'block', blockId: b.id, origin: { kind: 'library' } });
   doc.touch('structure');
   pushRecent(type);
+  // QUICK ADD: a canvas gesture was waiting for this block. Consumed here, at
+  // the one point every placement route funnels through, so Enter, a
+  // double-click, the tile menu and a drag-out all complete the intent — rather
+  // than only whichever one happened to be wired up.
+  const intent = pendingPlacementIntent();
+  if (intent) {
+    armPlacement(null);
+    intent.onPlaced(b);
+  }
 }
 
 /**
@@ -246,7 +366,13 @@ function dropLibraryKey(key: string, clientX: number, clientY: number): boolean 
       }
     }
   }
+  // SPLICE FROM THE LIBRARY: place, then let the editor run the same test its
+  // preview ran and splice if it passes. Both drag paths land here, so mouse
+  // and touch insert identically — the reason this function exists at all.
+  const before = new Set(doc.graph.blocks.map((b) => b.id));
   addBlockAt(key, pos);
+  const made = doc.graph.blocks.find((b) => !before.has(b.id));
+  if (made) ed.spliceDroppedBlock(made);
   return true;
 }
 
@@ -325,6 +451,8 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     tile.classList.remove('lifting');
     ghost?.remove();
     ghost = null;
+    setLibraryDrag(null);
+    ed.previewLibrarySplice(null, 0, 0, null);
     try {
       tile.releasePointerCapture(id);
     } catch {
@@ -368,6 +496,12 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     ghost.className = 'lib-drag-ghost';
     ghost.textContent = entry.title;
     document.body.appendChild(ghost);
+    // SPLICE FROM THE LIBRARY: the touch drag previews exactly like the mouse
+    // one. It has to go through the same module value even though this path
+    // *does* know its own key — `previewLibrarySplice` reads the armed intent
+    // and the ghost through it, and two ways of knowing what is being dragged
+    // is how the two gestures drift apart.
+    setLibraryDrag(entry.key);
     hideHoverCard();
   };
 
@@ -401,6 +535,10 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     const inside =
       ev.clientX >= over.left && ev.clientX <= over.right && ev.clientY >= over.top && ev.clientY <= over.bottom;
     ghost?.classList.toggle('over', inside);
+    // SPLICE FROM THE LIBRARY: the same live proposal the mouse gets. Off the
+    // canvas it is cleared rather than left standing, which is this path's
+    // equivalent of `dragleave`.
+    ed.previewLibrarySplice(inside ? entry.key : null, ev.clientX, ev.clientY, inside ? libraryGhostBlock(entry.key) : null);
   }
 
   function onUp(ev: PointerEvent): void {
@@ -825,6 +963,23 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
   // --- header (built once; results re-render in place so search keeps focus) ---
   const header = document.createElement('div');
   header.className = 'lib-header';
+
+  // QUICK ADD: what the canvas is waiting for, and a way out of it.
+  //
+  // Visible state matters more here than it looks: an armed intent silently
+  // changes what the *next* click does and hides part of the list, and a mode
+  // you cannot see is a mode you cannot leave. It says what it is for, and
+  // Escape or the ✕ cancels.
+  const placeRow = document.createElement('div');
+  placeRow.className = 'lib-placing';
+  const placeText = document.createElement('span');
+  const placeCancel = document.createElement('button');
+  placeCancel.textContent = '✕';
+  placeCancel.title = 'Cancel (Esc)';
+  placeCancel.addEventListener('click', () => armPlacement(null));
+  placeRow.append(placeText, placeCancel);
+  header.appendChild(placeRow);
+
   const searchRow = document.createElement('div');
   searchRow.className = 'lib-search';
   const search = document.createElement('input');
@@ -956,8 +1111,15 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     tile.addEventListener('dragstart', (ev) => {
       ev.dataTransfer!.setData('text/livepatch-block', e.key);
       ev.dataTransfer!.effectAllowed = 'copy';
+      // SPLICE FROM THE LIBRARY: what the canvas previews while this is in the
+      // air, because `dataTransfer` refuses to give it up during `dragover`.
+      setLibraryDrag(e.key);
       hideHoverCard();
     });
+    // Cleared however the drag ends — dropped on the canvas, dropped outside
+    // it, or cancelled with Escape. A key left set here would have the next
+    // `dragover` from anything at all previewing a block nobody is holding.
+    tile.addEventListener('dragend', () => setLibraryDrag(null));
     // HTML5 drag-and-drop is MOUSE ONLY — Chromium never synthesizes dragstart
     // from touch, so on a touchscreen the Library was a dead end: the only way
     // to place a block was double-tap-to-centre. This is the pointer-event
@@ -1199,7 +1361,19 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     for (const k of Object.keys(filterChips))
       filterChips[k].classList.toggle('on', libFilters.has(k as PortKind));
 
+    // QUICK ADD: reflect the armed intent in the header.
+    {
+      const intent = pendingPlacementIntent();
+      placeRow.style.display = intent ? 'flex' : 'none';
+      placeText.textContent = intent?.hint ?? '';
+    }
+
     const matches = (e: LibEntry): boolean => {
+      // QUICK ADD: an armed placement does NOT filter this list. It used to —
+      // a cable being extended hid every block without a port to take it —
+      // and that is the wrong trade: the user's own filters and search are the
+      // only things allowed to remove entries from the Library, because those
+      // are the ones they can see themselves having set. See `PlacementIntent`.
       if (libFilters.size) {
         const k = entryPortKinds(e);
         if (![...libFilters].some((f) => k.has(f))) return false;
@@ -1253,6 +1427,15 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
   }
 
   const addAtCenter = (key: string): void => {
+    // QUICK ADD: an armed intent names the place — the pointer, or the end of
+    // the cable you dropped. Centring the view instead would put the block
+    // somewhere you were not looking and, for a cable, somewhere its wire has
+    // to stretch across the patch to reach.
+    const intent = pendingPlacementIntent();
+    if (intent) {
+      addBlockAt(key, intent.at);
+      return;
+    }
     const c = ed.renderer.canvas;
     addBlockAt(key, ed.renderer.toCanvas({ x: c.clientWidth / 2, y: c.clientHeight / 2 }));
   };
@@ -1307,6 +1490,13 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
     } else if (ev.key === 'Enter' && visible.length) {
       addAtCenter(visible[Math.max(0, highlight)].key);
     } else if (ev.key === 'Escape') {
+      // QUICK ADD: an armed placement is the outer mode, so it is the one
+      // Escape leaves first — clearing the query out from under someone who is
+      // trying to cancel the *placement* is the wrong end of the nesting.
+      if (pendingPlacementIntent()) {
+        armPlacement(null);
+        return;
+      }
       search.value = '';
       libSearch = '';
       renderResults();
@@ -1329,6 +1519,15 @@ function buildLibrary(body: HTMLElement): { refresh: () => void } {
   onCustomBlocksChange(renderResults);
   onCassettesChange(renderResults);
   onVstPluginsChanged(renderResults);
+  // QUICK ADD: arming or cancelling changes both the banner and what the list
+  // is allowed to show, so it repaints on the same stream everything else does.
+  onPlacementChange(renderResults);
+  // …and this is how the canvas reaches the search box, which otherwise lives
+  // entirely inside this closure.
+  focusLibrarySearch = () => {
+    search.focus();
+    search.select();
+  };
   return { refresh: renderResults };
 }
 
@@ -3055,10 +3254,17 @@ export function initPanels(editor: Editor): void {
 
   const canvas = editor.renderer.canvas;
   canvas.addEventListener('dragover', (e) => {
-    if (e.dataTransfer?.types.includes('text/livepatch-block')) e.preventDefault();
+    if (!e.dataTransfer?.types.includes('text/livepatch-block')) return;
+    e.preventDefault();
+    // SPLICE FROM THE LIBRARY: the proposal, live, while the tile is in the
+    // air. `getData` is unreadable here (Chromium), hence `libraryDragKey`.
+    const key = libraryDragKey();
+    editor.previewLibrarySplice(key, e.clientX, e.clientY, key ? libraryGhostBlock(key) : null);
   });
+  canvas.addEventListener('dragleave', () => editor.previewLibrarySplice(null, 0, 0, null));
   canvas.addEventListener('drop', (e) => {
     const type = e.dataTransfer?.getData('text/livepatch-block');
+    editor.previewLibrarySplice(null, 0, 0, null);
     if (!type) return;
     e.preventDefault();
     // A plugin dropped onto an existing VST block loads into that block

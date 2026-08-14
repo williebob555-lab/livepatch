@@ -2,7 +2,7 @@
 // Owns: window lifecycle, native file dialogs (import/export), the local scene
 // registry on disk, in-app updates, and (in the future) supervision of the
 // native audio engine process (see README "Native engine protocol").
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -59,6 +59,40 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // `document.visibilityState`, and a patch has no reason to care whether some
 // other window happens to be in front of this one.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
+// ============================================================================
+// No application menu at all.
+//
+// `autoHideMenuBar` does not remove the menu, it **hides it until Alt** — so
+// Electron's stock File/Edit/View/Window/Help bar was one keystroke away for
+// the whole run, and Alt is not a spare key here: it is a modifier the canvas
+// uses, so reaching for it dropped a menu over the patch. A menu the app never
+// authored and never refers to is not a feature you lose by removing.
+//
+// The only thing worth keeping out of the stock menu is its **developer
+// accelerators**, which are the reason it was tolerated: Ctrl+R, Ctrl+Shift+I
+// and F12 come from the View submenu, not from Chromium. They are re-attached
+// per window below, and only on an unpackaged run — a shipped build has no
+// business reloading itself out from under a live audio graph.
+// ============================================================================
+Menu.setApplicationMenu(null);
+
+/** Dev-run reload / devtools, replacing the stock View submenu's accelerators. */
+function attachDevKeys(win) {
+  if (app.isPackaged) return;
+  win.webContents.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown') return;
+    const key = String(input.key || '').toLowerCase();
+    const ctrl = input.control || input.meta;
+    if (key === 'f12' || (ctrl && input.shift && key === 'i')) {
+      win.webContents.toggleDevTools();
+      e.preventDefault();
+    } else if (ctrl && key === 'r') {
+      win.webContents.reloadIgnoringCache();
+      e.preventDefault();
+    }
+  });
+}
 
 // ============================================================================
 // Runtime diagnostics log — one file per run, meant to be handed to someone.
@@ -600,6 +634,8 @@ function createWindow() {
     // needs it set explicitly, and build/ isn't shipped, so don't look for it
     // there when packaged.
     ...(app.isPackaged ? {} : { icon: path.join(__dirname, '..', 'build', 'icon.ico') }),
+    // There is no menu to hide — see `Menu.setApplicationMenu(null)` above.
+    // Set anyway so a window created before that call could never flash one.
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -639,6 +675,8 @@ function createWindow() {
   // occlusion detection is switched off at the top of this file, which is the
   // point — an occluded window is treated as an ordinary visible one, and none
   // of the events above fire for it either.
+  win.removeMenu();
+  attachDevKeys(win);
   const wc = win.webContents;
   wc.on('render-process-gone', (_e, d) => diagWrite('window', { state: 'renderer-gone', reason: d && d.reason }));
   wc.on('unresponsive', () => diagWrite('window', { state: 'unresponsive' }));
@@ -747,6 +785,8 @@ function createDockWindow() {
     },
   });
   if (saved.fullScreen) dockWin.setFullScreen(true);
+  dockWin.removeMenu();
+  attachDevKeys(dockWin);
   dockWin.webContents.once('did-finish-load', () => pushConsumerCount());
 
   for (const ev of ['minimize', 'restore', 'focus', 'blur', 'hide', 'show']) {

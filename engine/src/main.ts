@@ -109,6 +109,9 @@ function handle(msg: InMsg): void {
     case 'midi-learn':
       midiLearnArmed = msg.on;
       break;
+    case 'midi-panic':
+      graph.panic();
+      break;
     case 'watch-visuals':
       graph.watched = msg.nodes.slice(0, 32);
       break;

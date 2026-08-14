@@ -410,6 +410,22 @@ body.dock-window #topbar { padding: 3px 6px; gap: 4px; }
 .ctx-item .key { margin-left: auto; color: var(--text-dim); font-size: 11px; }
 .ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 
+/* ---- Quick add: the Library's "waiting for a pick" banner ---- */
+/* An armed placement changes what the next click does and hides part of the
+   list, so it has to be visible and it has to have a way out (docs/07-ui.md). */
+.lib-placing {
+  display: none; align-items: center; gap: 8px; margin-bottom: 6px;
+  padding: 4px 6px; border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1px solid var(--accent); color: var(--text); font-size: 11px;
+}
+.lib-placing span { flex: 1; }
+.lib-placing button {
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font: inherit; padding: 0 2px;
+}
+.lib-placing button:hover { color: var(--text); }
+
 /* ---- Custom shape editor ---- */
 .shape-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
 .shape-toolbar button, .shape-toolbar select {
