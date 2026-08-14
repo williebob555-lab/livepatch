@@ -4,6 +4,30 @@ directories:
   output: release
   buildResources: build
 
+# Use the Electron already unpacked in node_modules instead of re-extracting the
+# cached zip. This is a BUILD RELIABILITY fix, not an optimisation.
+#
+# The default path extracts the cached electron-v<ver>-win32-x64.zip into
+# `release/win-unpacked.tmp` and immediately renames it to `release/win-unpacked`.
+# On Windows that rename lands inside Defender's scan window for a freshly
+# unpacked 225 MB electron.exe carrying mark-of-the-web, and fails with
+#   EPERM: operation not permitted, rename '...win-unpacked.tmp' -> '...win-unpacked'
+# The failure is deterministic (it killed the 0.1.6 AND 0.1.7 releases, leaving
+# empty drafts on GitHub), but the lock is transient — probing the same
+# directory minutes later renames fine, which is why retrying the build never
+# helped: each retry re-enters the same window. Raw error is
+# ERROR_SHARING_VIOLATION (32), i.e. another process holds a read handle on the
+# directory, not a permissions problem.
+#
+# Pointing electronDist at an already-unpacked distribution takes a different
+# branch in app-builder-lib (`emptyDir` + `copyDir`, see ElectronFramework.js
+# "using custom unpacked Electron distribution") that never creates a .tmp and
+# never renames, so there is no window to lose. The `electron` devDependency is
+# the same version electron-builder would download, so this cannot drift — if it
+# ever does, electron-builder fails loudly on the version mismatch rather than
+# shipping the wrong runtime. See docs/11-packaging.md.
+electronDist: node_modules/electron/dist
+
 # MUST stay false. The audio engine runs as its own process on a real node.exe
 # (audify's prebuilt binary access-violates inside electron.exe — verified
 # 0xC0000005), and plain Node cannot read inside an asar archive, so packing

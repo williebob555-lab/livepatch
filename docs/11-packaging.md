@@ -1,6 +1,6 @@
 # 11 — Build, Packaging & Updates
 
-_Last verified: 2026-08-05. Files: `package.json`, `electron-builder.yml`, `player/*`, `scripts/android-*`,
+_Last verified: 2026-08-13. Files: `package.json`, `electron-builder.yml`, `player/*`, `scripts/android-*`,
 `scripts/ship.mjs`, `scripts/bundle-node.mjs`, `engine/postbuild.mjs`,
 `vite.config.ts`, `electron/main.cjs`, `src/ui/updates.ts`._
 
@@ -183,6 +183,45 @@ Invoke-RestMethod https://api.github.com/repos/<owner>/<repo>/releases -Headers 
 
 Fix: publish the draft, or delete it and re-run. Deleting a *release* leaves
 its git tag behind, which is where stray tags come from.
+
+### `EPERM … rename 'win-unpacked.tmp' -> 'win-unpacked'`
+
+Killed the 0.1.6 **and** 0.1.7 releases, leaving two empty drafts on GitHub
+while 0.1.5 stayed the newest thing anyone could install.
+
+By default electron-builder extracts the cached Electron zip into
+`release/win-unpacked.tmp` and renames it into place. That rename happens
+milliseconds after 225 MB of `electron.exe` (carrying mark-of-the-web from the
+download) hits the disk — right inside Defender's scan window — and loses.
+
+What the symptoms look like, because they mislead:
+
+- **It is not a permissions problem.** The `.tmp` directory's SDDL is
+  byte-identical to a control directory created beside it, which renames fine.
+  Opening the directory with `CreateFileW(DELETE, share=0)` returns **error 32,
+  `ERROR_SHARING_VIOLATION`** — another process holds a read handle. Node
+  surfaces that as `EPERM`.
+- **Deleting works while renaming fails**, on the same directory seconds apart,
+  so "something has it locked" gets dismissed too early.
+- **The lock is transient but outlives the build.** Probing the same directory
+  minutes later renames fine — which is exactly why retrying `npm run release`
+  never helped. Every retry re-extracts and re-enters the same window. It failed
+  three times in a row this way.
+- **No file inside is locked** (all 75 open exclusively) and the inner `locales`
+  and `resources` directories rename fine. Only the top directory is held.
+- Copying a large `.exe` into a directory and renaming it does **not** reproduce
+  it — a locally copied binary has no mark-of-the-web.
+
+**Fix, in `electron-builder.yml`: `electronDist: node_modules/electron/dist`.**
+With an already-unpacked distribution, app-builder-lib takes a different branch
+(`emptyDir` + `copyDir`, logged as `using custom unpacked Electron
+distribution`) that never creates a `.tmp` and never renames, so there is no
+window to lose. The `electron` devDependency is the same version electron-builder
+would otherwise download, so the two cannot drift.
+
+`ship.mjs` also clears `release/win-unpacked*` before building and retries the
+build once — a failed run leaves debris the next run inherits, so one bad build
+used to poison every build after it.
 
 ### Rebuild these before shipping, or the release quietly loses them
 

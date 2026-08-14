@@ -27,7 +27,7 @@
 //   npm run ship -- --no-typecheck    skip the typecheck gate (don't)
 //   npm run ship -- --no-android      desktop-only; phones will not see it
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -95,6 +95,40 @@ function npmRun(script, what) {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const r = spawnSync(npm, ['run', script], { cwd: root, stdio: 'inherit', shell: true });
   if (r.status !== 0) die(`${what} failed (npm run ${script})`);
+}
+
+/** An npm script that is allowed to fail. Returns the exit status. */
+function npmTry(script) {
+  if (dryRun) {
+    info(`dry-run: npm run ${script}`);
+    return 0;
+  }
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  return spawnSync(npm, ['run', script], { cwd: root, stdio: 'inherit', shell: true }).status;
+}
+
+/** Block the script for `ms`. No deps, and blocking is what we want here. */
+const sleep = (ms) => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** Remove `release/win-unpacked*` before building.
+ *
+ *  electron-builder unpacks Electron into `win-unpacked.tmp` and renames it
+ *  into place. When that rename loses to a virus scanner (see the electronDist
+ *  comment in electron-builder.yml), the debris is left behind and the NEXT
+ *  run inherits a directory it also cannot rename — so one bad build poisons
+ *  every build after it until someone deletes the folder by hand. */
+function clearStaleUnpack() {
+  const rel = path.join(root, 'release');
+  if (!existsSync(rel)) return;
+  for (const name of readdirSync(rel)) {
+    if (!name.startsWith('win-unpacked')) continue;
+    try {
+      rmSync(path.join(rel, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+      info(`cleared stale release/${name}`);
+    } catch (e) {
+      warn(`could not clear release/${name}: ${e.message}`);
+    }
+  }
 }
 
 const readPkg = () => JSON.parse(readFileSync(pkgPath, 'utf8'));
@@ -492,8 +526,31 @@ if (dryRun) {
   console.log(`\n${C.yel}Dry run complete — nothing was committed, tagged, pushed or uploaded.${C.off}\n`);
   process.exit(0);
 }
+// From here on the bump, the tag and the draft release all exist, so a failure
+// must NOT be answered by re-running ship — that would bump again and abandon
+// this version as an empty draft. Every death below says so and prints the
+// resume path instead. (0.1.6 and 0.1.7 both died here and both left an empty
+// draft on GitHub with no instructions; the next `npm run ship` would have
+// skipped straight to 0.1.8.)
+const resumeHint =
+  `The bump, tag ${tag} and draft release already exist — do NOT re-run ship.\n` +
+  `Fix the problem, then finish this same version without redoing the git side:\n` +
+  `  npm run release\n` +
+  (noAndroid || !canAndroid ? '' : `  npm run android:app && npm run android:apk:release\n`) +
+  `  npm run ship:repair`;
+
 const draft = await createDraftRelease({ owner, repo, tag, token });
-npmRun('release', 'build/publish');
+
+// Retry once: the unpack failure this guards against is caused by another
+// process holding the freshly written tree, which clears on its own.
+clearStaleUnpack();
+if (npmTry('release') !== 0) {
+  warn('build/publish failed — clearing the unpack directory and retrying once');
+  clearStaleUnpack();
+  sleep(20_000);
+  if (npmTry('release') !== 0) die('build/publish failed twice (npm run release)', resumeHint);
+  ok('second attempt succeeded');
+}
 ok('electron-builder finished (exit code alone proves nothing — verifying)');
 
 // The APK, now that package.json says `to` — this is the only point in the run
@@ -504,8 +561,8 @@ if (noAndroid) {
   warn('no android/ dir or no signing keystore — shipping desktop-only, phones will not see this release');
 } else {
   step(`Android APK ${to}`);
-  npmRun('android:app', 'Android web payload');
-  npmRun('android:apk:release', 'Android APK');
+  if (npmTry('android:app') !== 0) die('Android web payload failed (npm run android:app)', resumeHint);
+  if (npmTry('android:apk:release') !== 0) die('Android APK failed (npm run android:apk:release)', resumeHint);
   ok(`release/LivePatch-${to}.apk`);
 }
 
