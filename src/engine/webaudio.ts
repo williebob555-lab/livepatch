@@ -8,7 +8,7 @@
 import { CompiledGraph, NetTapMod, NodeMidiMap, ParamValue } from '../core/types';
 import { CvLaw, cvValue } from '../core/cvlaw';
 import { ParamSpec, cvInputsByParam, getDef } from '../core/registry';
-import { EngineAdapter, LevelFrame, MidiEvent, TapeRef, TransportFrame, VisualFeed } from './engine';
+import { EngineAdapter, LevelFrame, MidiEvent, PANIC, TapeRef, TransportFrame, VisualFeed } from './engine';
 import { onMidi } from './midi';
 
 export interface UnitEnv {
@@ -77,8 +77,27 @@ export interface Unit {
    * `watch-visuals` gating.
    */
   setChans?(levels: Float32Array): void;
+  /**
+   * Which of this unit's inlets a cable actually reaches, by port id. Pushed on
+   * every graph rebuild, including the rebuild that unplugs the last one.
+   *
+   * **Only the graph knows this**, and that is the whole reason it exists. A
+   * unit cannot tell an unconnected inlet from a silent one — the same fact
+   * `sh`'s explicit Source switch exists for — so anything that needs the
+   * distinction was sniffing the signal instead: `clockInlet` latched
+   * "connected" the first time a sample came down the line and never cleared
+   * it, and units are REUSED across rebuilds when their id and type are
+   * unchanged, so an arpeggiator or sequencer that had ever seen a clock never
+   * free-ran from its own Rate knob again. The native engine has the answer for
+   * free (`ins['clock']` simply stops existing), which made this a silent
+   * divergence between the two engines rather than an obvious fault.
+   */
+  setFed?(ports: ReadonlySet<string>): void;
   dispose(): void;
 }
+
+/** Shared empty set, so the per-rebuild push allocates nothing. */
+const NO_PORTS: ReadonlySet<string> = new Set<string>();
 
 export type UnitFactory = (params: Record<string, ParamValue>, env: UnitEnv) => Unit;
 
@@ -118,6 +137,33 @@ function passUnit(env: UnitEnv): Unit {
     setMidiOut: (cb) => (midiOut = cb),
     dispose: () => g.disconnect(),
   };
+}
+
+/**
+ * BYPASS: crossfade time, matching the native engine's `BYPASS_RAMP_S`.
+ * Toggling bypass is a gain change and gain changes ramp (docs/10 rule 10).
+ */
+const BYPASS_RAMP_S = 0.012;
+
+/** BYPASS: the compiler-injected flag (`BYPASS_PARAM` in `core/compile.ts`). */
+const BYPASS_PARAM = '__bypass';
+
+/**
+ * BYPASS: one node's dry path, built lazily the first time it is bypassed and
+ * torn down with the nets.
+ *
+ * The wet gain is *inserted* between the unit's outlet and the net hub rather
+ * than existing all the time: an un-bypassed patch pays nothing, which is the
+ * same bargain `chanSplit` makes for per-channel metering.
+ */
+interface BypassRec {
+  pairs: Array<{
+    outlet: AudioNode;
+    hub: GainNode;
+    inHub: GainNode;
+    wet: GainNode;
+    dry: GainNode;
+  }>;
 }
 
 interface NetRec {
@@ -246,6 +292,15 @@ export class WebAudioEngine implements EngineAdapter {
   private nets: NetRec[] = [];
   private netConns: Conn[] = [];
   private midiSources: Unit[] = [];
+  /**
+   * FAILSAFE: which nodes were being FED MIDI by the graph we are replacing.
+   *
+   * `node\0port` for every MIDI sink that had a source. The next `applyGraph`
+   * compares against its own set, and anything that has dropped out of it gets
+   * a `panic` — its feed has gone, so its note-offs are never arriving. See
+   * `panicOrphans`.
+   */
+  private midiFed = new Set<string>();
   private tapeSources: Unit[] = [];
   /** Learned MIDI bindings (MIDI learn), rebuilt each applyGraph. */
   private learnMaps: Array<{ node: string; map: NodeMidiMap }> = [];
@@ -255,6 +310,14 @@ export class WebAudioEngine implements EngineAdapter {
   private modIndex = new Map<string, ModRec>();
   /** node\0param → live value of a built-in CV inlet (see `BuiltinRec`). */
   private builtinIndex = new Map<string, BuiltinRec>();
+  /** BYPASS: what the document wants, per node id. */
+  private bypassWant = new Map<string, boolean>();
+  /** BYPASS: the live dry paths. Keyed by node id; absent = not bypassed. */
+  private bypassRecs = new Map<string, BypassRec>();
+  /** BYPASS: connected audio in-ports per node → the hub feeding them. */
+  private bypIn = new Map<string, Map<string, GainNode>>();
+  /** BYPASS: connected audio out-ports per node → outlet + the hub they feed. */
+  private bypOut = new Map<string, Map<string, { outlet: AudioNode; hub: GainNode }>>();
   private assets = new Map<string, AudioBuffer>();
   private scratch = new Float32Array(256);
   private pendingGraph: CompiledGraph | null = null;
@@ -324,6 +387,24 @@ export class WebAudioEngine implements EngineAdapter {
 
   /** Tear down only net wiring (hubs, connections, midi routes). Units survive. */
   private teardownNets(): void {
+    // BYPASS: drop the dry paths before the hubs they hang off go away. The
+    // *want* survives (it lives in the document); only the routing is rebuilt,
+    // by `restoreBypass` once the new nets exist.
+    for (const rec of this.bypassRecs.values()) {
+      for (const p of rec.pairs) {
+        try {
+          p.outlet.disconnect(p.wet);
+          p.wet.disconnect();
+          p.inHub.disconnect(p.dry);
+          p.dry.disconnect();
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    this.bypassRecs.clear();
+    this.bypIn.clear();
+    this.bypOut.clear();
     for (const c of this.netConns) {
       try {
         (c.from as any).disconnect(c.to as any);
@@ -423,16 +504,22 @@ export class WebAudioEngine implements EngineAdapter {
     this.modIndex = new Map();
     this.builtinIndex = new Map();
     const tapeConnected = new Set<Unit>();
+    /** node id → the in-ports something is actually patched to. See `Unit.setFed`. */
+    const fedByNode = new Map<string, Set<string>>();
+    // FAILSAFE: MIDI sinks that have a source in the NEW graph. Diffed against
+    // `this.midiFed` once the whole graph is built — see `panicOrphans`.
+    const fedNow = new Set<string>();
     for (const net of g.nets) {
       if (net.kind === 'midi') {
         // The sink PORT travels with the sink: a unit with several MIDI inputs
         // has to know which cable an event came down (see `Unit.midiIn`).
         const sinks = net.sinks
-          .map((s) => ({ u: this.units.get(s.node)?.unit, port: s.port }))
-          .filter((s): s is { u: Unit; port: string } => !!s.u?.midiIn);
+          .map((s) => ({ u: this.units.get(s.node)?.unit, port: s.port, node: s.node }))
+          .filter((s): s is { u: Unit; port: string; node: string } => !!s.u?.midiIn);
         for (const src of net.sources) {
           const u = this.units.get(src.node)?.unit;
           if (!u) continue;
+          for (const s of sinks) fedNow.add(s.node + '\0' + s.port);
           const send = (ev: MidiEvent): void => {
             for (const s of sinks) s.u.midiIn!(ev, s.port);
           };
@@ -492,6 +579,10 @@ export class WebAudioEngine implements EngineAdapter {
         if (out) {
           out.connect(hub);
           this.netConns.push({ from: out, to: hub });
+          // BYPASS: remember the outlet→hub edge so a dry path can replace it.
+          let m = this.bypOut.get(src.node);
+          if (!m) this.bypOut.set(src.node, (m = new Map()));
+          m.set(src.port, { outlet: out, hub });
         }
       }
       const mods: ModRec[] = [];
@@ -513,9 +604,19 @@ export class WebAudioEngine implements EngineAdapter {
           continue;
         }
         const inl = u.inlet(snk.port);
+        if (inl) {
+          let f = fedByNode.get(snk.node);
+          if (!f) fedByNode.set(snk.node, (f = new Set()));
+          f.add(snk.port);
+        }
         if (inl instanceof AudioNode) {
           hub.connect(inl);
           this.netConns.push({ from: hub, to: inl });
+          // BYPASS: an AudioParam sink is a modulation target, not a signal
+          // path, so only real node inlets can source a dry path.
+          let m = this.bypIn.get(snk.node);
+          if (!m) this.bypIn.set(snk.node, (m = new Map()));
+          m.set(snk.port, hub);
         } else if (inl) {
           hub.connect(inl); // AudioParam
           this.netConns.push({ from: hub, to: inl });
@@ -579,6 +680,10 @@ export class WebAudioEngine implements EngineAdapter {
       this.nets.push(rec);
       for (const id of net.wireIds) this.wireLevels.set(id, rec.level);
     }
+    // Which inlets are fed, to every unit that asked — including the empty set,
+    // which is the whole point: this is how a unit hears that its clock has
+    // been unplugged and it should go back to its own Rate knob.
+    for (const [id, rec] of this.units) rec.unit.setFed?.(fedByNode.get(id) ?? NO_PORTS);
     // Tape decks whose wire is gone get an explicit eject (tapeIn(null) is
     // idempotent at the sink, so unaffected rebuilds are no-ops).
     for (const rec of this.units.values()) {
@@ -599,6 +704,136 @@ export class WebAudioEngine implements EngineAdapter {
         if (rec.gateHi) this.units.get(rec.node)?.unit.setParam(rec.mod.param, 0);
       } else {
         this.units.get(rec.node)?.unit.setParam(rec.mod.param, rec.base);
+      }
+    }
+    // FAILSAFE: MIDI lines that were unplugged. **Exactly the rule above, for
+    // notes instead of knobs** — and it is the same bug, which is why the two
+    // sit together: a gate left high by a pulled CV cable and a note left on by
+    // a pulled MIDI cable are one failure in two currencies. The CV half was
+    // written years earlier and the MIDI half was never noticed missing,
+    // because a stuck knob looks wrong and a stuck note *sounds* wrong, and
+    // only one of those two gets described as "it's still going".
+    this.panicOrphans(fedNow);
+    this.midiFed = fedNow;
+
+    // BYPASS: the nets (and with them every dry path) were just rebuilt, so
+    // re-apply what the document asked for. Instant, not ramped: nothing was
+    // audible across the rebuild to fade from.
+    this.bypassWant.clear();
+    for (const n of g.nodes) if (Number(n.params[BYPASS_PARAM])) this.bypassWant.set(n.id, true);
+    for (const id of this.bypassWant.keys()) this.applyBypass(id, false);
+  }
+
+  /**
+   * FAILSAFE: silence every MIDI sink whose feed has just disappeared.
+   *
+   * `fedNow` is the set of `node\0port` sinks that have a source in the graph
+   * we have just built; `this.midiFed` is the same for the graph before it.
+   * Anything in the old and not the new has had its cable pulled, its source
+   * deleted, or the whole net rebuilt around it — and whatever it is holding is
+   * now unreleasable, because the only thing that could have released it is the
+   * connection that went away.
+   *
+   * **The diff is the point, not a blanket panic on rebuild.** A recompile
+   * happens on any structural edit — renaming a block, moving a wire somewhere
+   * else entirely — and a failsafe that killed every held note on all of them
+   * would make the app unplayable: you could not edit a patch while holding a
+   * chord, which is most of what playing one *is*. Only lines that actually
+   * stopped existing panic.
+   */
+  private panicOrphans(fedNow: Set<string>): void {
+    if (!this.midiFed.size) return;
+    for (const key of this.midiFed) {
+      if (fedNow.has(key)) continue;
+      const sep = key.indexOf('\0');
+      const u = this.units.get(key.slice(0, sep))?.unit;
+      // A sink that has gone with its wire needs nothing: it took its voices
+      // with it (`dispose` releases them).
+      if (!u?.midiIn) continue;
+      try {
+        u.midiIn(PANIC, key.slice(sep + 1));
+      } catch {
+        /* a sink's panic handler must never break the rebuild */
+      }
+    }
+  }
+
+  /**
+   * FAILSAFE: release everything, everywhere. The user-reachable half.
+   *
+   * The automatic diff above covers a line that was broken by an edit; this
+   * covers everything else that can strand a note — a controller unplugged
+   * mid-chord, a device that dropped a note-off, a hosted plugin that lost
+   * track. It goes to **every** sink rather than to a selected one, because at
+   * the moment you reach for it you do not know which block is the one still
+   * sounding; that is why you are reaching for it.
+   */
+  panic(): void {
+    for (const rec of this.units.values()) {
+      if (!rec.unit.midiIn) continue;
+      try {
+        rec.unit.midiIn(PANIC);
+      } catch {
+        /* one deaf unit must not stop the rest being silenced */
+      }
+    }
+  }
+
+  /**
+   * BYPASS: route a node's audio inputs straight to its outputs, or undo that.
+   *
+   * The dry path is *inserted*, so an un-bypassed patch carries no extra nodes
+   * — the same opt-in bargain as the per-channel metering above. Pairing is by
+   * sorted port name, index-wise, matching `GraphExec` on the native engine so
+   * the two do not disagree about what a multi-port block bypasses to.
+   *
+   * `ramp` is false only when the graph was just rebuilt, where there is no
+   * previous sound to cross-fade from.
+   */
+  private applyBypass(nodeId: string, ramp = true): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const on = this.bypassWant.get(nodeId) ?? false;
+    let rec = this.bypassRecs.get(nodeId);
+    if (on && !rec) {
+      const outs = this.bypOut.get(nodeId);
+      const ins = this.bypIn.get(nodeId);
+      if (!outs || !ins) return; // nothing wired through it — nothing to bypass
+      const inPorts = [...ins.keys()].sort();
+      const outPorts = [...outs.keys()].sort();
+      const pairs: BypassRec['pairs'] = [];
+      for (let i = 0; i < Math.min(inPorts.length, outPorts.length); i++) {
+        const src = outs.get(outPorts[i])!;
+        const inHub = ins.get(inPorts[i])!;
+        const wet = ctx.createGain();
+        const dry = ctx.createGain();
+        dry.gain.value = 0;
+        try {
+          src.outlet.disconnect(src.hub);
+        } catch {
+          /* the direct edge may already be gone */
+        }
+        src.outlet.connect(wet);
+        wet.connect(src.hub);
+        inHub.connect(dry);
+        dry.connect(src.hub);
+        pairs.push({ outlet: src.outlet, hub: src.hub, inHub, wet, dry });
+      }
+      if (!pairs.length) return;
+      this.bypassRecs.set(nodeId, (rec = { pairs }));
+    }
+    if (!rec) return;
+    const t = ctx.currentTime;
+    const dur = ramp ? BYPASS_RAMP_S : 0;
+    for (const p of rec.pairs) {
+      for (const [g, to] of [
+        [p.wet, on ? 0 : 1],
+        [p.dry, on ? 1 : 0],
+      ] as Array<[GainNode, number]>) {
+        g.gain.cancelScheduledValues(t);
+        g.gain.setValueAtTime(g.gain.value, t);
+        if (dur) g.gain.linearRampToValueAtTime(to, t + dur);
+        else g.gain.setValueAtTime(to, t);
       }
     }
   }
@@ -623,6 +858,12 @@ export class WebAudioEngine implements EngineAdapter {
   }
 
   setParam(nodeId: string, paramId: string, v: ParamValue): void {
+    // BYPASS: the engine's own, never a unit's — no factory declares it.
+    if (paramId === BYPASS_PARAM) {
+      this.bypassWant.set(nodeId, !!Number(v));
+      this.applyBypass(nodeId);
+      return;
+    }
     const rec = this.modIndex.get(nodeId + ' ' + paramId);
     if (rec && rec.mod.mode !== 'gate' && typeof v === 'number') {
       // Param is CV-modulated: the knob writes the base; poll() applies CV on top.

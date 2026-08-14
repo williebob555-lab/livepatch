@@ -98,8 +98,25 @@ const FERRY_NEAR = 150;
 /** And empty — further back still, so its distance tells you whether it has
  *  anything without you having to look at the gripper. */
 const FERRY_FAR = 230;
-/** Nothing may come closer than this, ever. The pointer's own personal space. */
+/** Nothing may come closer than this while your hands are empty. The pointer's
+ *  own personal space. */
 const FERRY_KEEPOUT = 110;
+/**
+ * And how close it comes when you are holding something out to it.
+ *
+ * **`FERRY_KEEPOUT` applied to an offer was the whole of the cat-and-mouse**,
+ * and it survived the first fix because it is the *last* rule in the target
+ * chain: freezing while your hands are full stopped the retreat, but the
+ * instant the offer started closing, this clamp shoved the target back out to
+ * 110 units — so a slow, deliberate hand-over converged on a wall and the drop
+ * never landed. A fast lunge worked only because it never triggered the offer.
+ *
+ * Measured against `minionBodyAt`, which is what actually decides whether the
+ * drop lands and which measures to the middle of the figure. It is comfortably
+ * INSIDE that 48, so arriving means the hand-over is live, and far enough out
+ * that the machine is beside what you are carrying rather than on top of it.
+ */
+const HANDOVER_R = 34;
 /** How far ahead of you the corridor reaches at a brisk sweep, and how wide it
  *  opens. Both scale with speed: a fast sweep clears a lot of room, a slow
  *  drift barely disturbs it. */
@@ -131,6 +148,9 @@ const RIFT_S = 1.05;
  *  and the machine comes out of it. Arriving on the same frame you did made the
  *  whole thing one event, and one event is a jump cut. */
 const ARRIVE_DELAY = 0.9;
+/** How long the service panel takes to swing shut after he has climbed out of
+ *  it. See `Agent.spawnVia`. */
+const SPAWN_SHUT = 0.45;
 /**
  * How far past it you have to be before it turns round, and how long you have
  * to stay there.
@@ -183,6 +203,20 @@ export class Agent {
   private restIn = 0;
   private nextScan = 0;
   private spawnFrom = -220; // world y the gondola drops from
+  /**
+   * **How he ARRIVES.** Up through a service panel in the block he is landing
+   * on, or lowered in on the gondola when there is no panel to come up through
+   * — the same two answers `beginTravel` already picks between to reach a
+   * control, so arriving uses the machinery that already exists rather than a
+   * third way of getting somewhere.
+   *
+   * It matters most when you walk into a subpatch, which is where you see it
+   * every time: he relocates to the graph you have opened, and a character who
+   * simply *appeared* standing there would read as a redraw glitch.
+   */
+  private spawnVia: 'hatch' | 'gondola' = 'gondola';
+  /** Seconds spent shutting the panel after climbing out of it. */
+  private spawnShut = 0;
 
   /** How long he has been at a loose end — across wanders, sits and everything
    *  else that is not work. **Not `phaseT`.** See `idleTurn`. */
@@ -217,7 +251,13 @@ export class Agent {
     return this.surfId !== '';
   }
 
-  place(w: WalkWorld, graph: Graph, near: { x: number; y: number }, crowded?: (x: number, y: number) => boolean): void {
+  place(
+    w: WalkWorld,
+    graph: Graph,
+    near: { x: number; y: number },
+    crowded?: (x: number, y: number) => boolean,
+    theme?: Theme,
+  ): void {
     // **Hire two and they both arrive at the same spot**, because "the nearest
     // perch to the middle of the view" is the same answer for everybody — they
     // were placed at the identical surface and parameter and stood inside each
@@ -236,8 +276,48 @@ export class Agent {
     this.t = p.t;
     this.phase = 'spawn';
     this.phaseT = 0;
+    // **Come up through the patch when there is a way up through it.** The
+    // block he is landing on is the same kind of thing he opens a panel in to
+    // reach a knob, so the same `findHatch` answers it — no target this time,
+    // because he is not reaching for anything, he is getting in.
+    const surf = w.surfaces.get(this.surfId);
+    const b = surf?.kind === 'top' ? graph.blocks.find((x) => x.id === surf.blockId) : undefined;
+    // **The target is the ROOF, the whole width of it** — not `null`.
+    //
+    // A panel he climbs out of has to be *in the roof he ends up standing on*,
+    // and neither a null target nor `side === 'top'` gets that. `side` is
+    // decided from where the largest empty RECTANGLE starts, while the panel is
+    // then centred inside it: measured on a 420×220 block, `side: 'top'` came
+    // back with the panel drawn at **y+94.5** — halfway down the face. Passing
+    // the roof as the target windows the search to the top band (`REACH`) and
+    // clamps the trimmed panel up against it, so "at the roof" is true by
+    // construction instead of being tested for afterwards.
+    const roof = b ? { x: b.pos.x, y: b.pos.y, w: b.size.w, h: 1 } : null;
+    this.hatch = b && theme && roof ? findHatch(b, theme, roof) : null;
+    this.spawnVia = this.hatch ? 'hatch' : 'gondola';
+
+    // **He comes up AT the hatch.** The perch and the panel are found by two
+    // unrelated searches — nearest-to-the-view-centre, and largest-empty-
+    // rectangle — so leaving `t` where `nearestPerch` put it had him rising
+    // through the roof somewhere else entirely, at whatever end of the block
+    // the perch happened to land on, while the lid opened elsewhere. Reported
+    // as *"he seems to just appear and then rise on the right side of the
+    // block, no matter where the hatch is"*, and that is exactly what it was.
+    if (this.hatch && b) this.t = topTForX(b, this.hatch.x + this.hatch.w / 2);
+
     const at = onSurface(w, graph, this.surfId, this.t);
-    if (at) this.spawnFrom = at.p.y - 220;
+    if (!at) return;
+    // One number, opposite directions: the gondola lowers him from 220 above
+    // the perch, the hatch raises him from **just under the lip** — measured
+    // off the opening itself rather than guessed from his height, so he starts
+    // exactly hidden. A body-height guess left his head already 25 units clear
+    // of the hole on the first frame, which is the difference between climbing
+    // out of something and fading up beside it.
+    const startY =
+      this.spawnVia === 'hatch' && this.hatch
+        ? this.hatch.y + this.hatch.h + this.body.height + 2
+        : at.p.y - 220 + (this.body.height + 4);
+    this.spawnFrom = startY - (this.body.height + 4);
   }
 
   /** Is he currently standing on nothing (his surface was deleted)? */
@@ -457,18 +537,29 @@ export class Agent {
   // -------------------------------------------------------------------------
 
   private doSpawn(dt: number, w: WalkWorld, graph: Graph): void {
-    // Ride the gondola down to the perch, then step off.
     const at = onSurface(w, graph, this.surfId, this.t);
     if (!at) return;
     const target = at.p.y;
     const y = this.spawnFrom + (this.body.height + 4);
-    const ny = Math.min(target, y + 150 * dt);
+    // Up through the panel, or down on the gondola. Climbing out of a hole is
+    // slower than being lowered into place — it is his own arms doing it.
+    const ny = this.spawnVia === 'hatch' ? Math.max(target, y - 62 * dt) : Math.min(target, y + 150 * dt);
     this.spawnFrom = ny - (this.body.height + 4);
-    if (target - ny < 1) {
-      this.phase = 'idle';
-      this.phaseT = 0;
-      this.restIn = 0.4;
+    if (Math.abs(target - ny) >= 1) return;
+    // **The panel shuts behind him**, over `SPAWN_SHUT` once he is standing on
+    // the block. Clearing the hatch the instant he lands makes the lid vanish
+    // rather than close, which reads as the drawing giving up — and a hatch
+    // left set for ever is one the pose keeps drawing on the next block he
+    // works on.
+    if (this.spawnVia === 'hatch' && this.hatch && this.spawnShut < SPAWN_SHUT) {
+      this.spawnShut += dt;
+      return;
     }
+    this.phase = 'idle';
+    this.phaseT = 0;
+    this.restIn = 0.4;
+    this.hatch = null;
+    this.spawnShut = 0;
   }
 
   private doIdle(dt: number, w: WalkWorld, graph: Graph, theme: Theme, ctx: AgentCtx, quiet: boolean): void {
@@ -1261,6 +1352,30 @@ export class Agent {
   }
 
   /**
+   * Move to another level on foot rather than through a rift — the walkers'
+   * half of `crossLevel`.
+   *
+   * **Un-placed, not moved.** A surface id belongs to one graph, so carrying
+   * `surfId`/`t` across would leave him standing on a block that does not exist
+   * where he now is; `placed` is defined as "has a surface yet", so clearing it
+   * is exactly the state a freshly-hired minion is in, and the layer's existing
+   * per-frame placement pass gives him a perch and an arrival for free.
+   *
+   * Whatever he was part-way through is dropped, because the job, the mark and
+   * the block it is about all belong to the graph he has just left.
+   */
+  relocate(level: string): void {
+    if (this.job) this.abandon();
+    this.level = level;
+    this.surfId = '';
+    this.legs = [];
+    this.hatch = null;
+    this.spawnShut = 0;
+    this.phase = 'spawn';
+    this.phaseT = 0;
+  }
+
+  /**
    * Tick the pause between levels. Returns true on the frame it lands, which is
    * when the layer moves anything it is carrying into the new graph — doing
    * that at the moment of *departure* would leave the block sitting in the new
@@ -1464,14 +1579,30 @@ export class Agent {
    *  like taking something out of a machine's hand. */
   private recoil = 0;
 
-  /** Double-click: put it back where it came from, then go back to work. */
+  /**
+   * Double-click: put it back where it came from, then go back to work.
+   *
+   * **"Where it came from" can be another level**, and then this is a delivery
+   * rather than a set-down: the block goes back through to the graph it was
+   * picked up in, and whatever you wired it to over here is parted on the way,
+   * because a cable cannot span two graphs (`payload.ts`). Every one of those
+   * is said out loud, for the same reason `landCargo` announces the outbound
+   * cut — an edit you did not watch happen is one you cannot undo, because you
+   * do not know it happened.
+   *
+   * It still lets go when the return is impossible (the subpatch it came from
+   * has since been deleted). Holding on to it forever would be the worst of
+   * both: the block is not where it was, and the machine cannot work either.
+   */
   putBack(): void {
     if (!this.load) return;
-    restore(this.load);
+    const cut = restore(this.load);
     doc.touch('structure');
     this.load = null;
     this.recoil = 1;
-    this.say('RETURNED.', 1.8);
+    if (cut === null) this.say('NO WAY BACK. LEFT HERE.', 2.6);
+    else if (cut > 0) this.say(`RETURNED. ${cut} CABLE${cut > 1 ? 'S' : ''} PARTED.`, 2.6);
+    else this.say('RETURNED.', 1.8);
   }
 
   /**
@@ -1560,7 +1691,16 @@ export class Agent {
     //
     // Standing still is the entire behaviour. It is also the cheapest possible
     // implementation of "be easy to hand things to".
+    //
+    // **Holding still is NOT what the `offer` switch turns off**, and gating
+    // both on it was a footgun: that switch says *"it waits to be handed things
+    // rather than reaching for them"*, and off it would also have gone back to
+    // holding station 230 units away and running the keep-out cone — so
+    // "waits to be handed things" would have described a machine you cannot
+    // hand anything to. Meeting you halfway is the courtesy and is optional.
+    // Not backing away from you is the contract and is not.
     // -----------------------------------------------------------------------
+    const handsFull = !this.load && ui.handDrag !== null;
     // ---- the offer ----
     // Direction, sustained — never proximity. Drifting near it while you do
     // something else must not make it lunge, and a block dragged *past* it to
@@ -1569,8 +1709,7 @@ export class Agent {
     // **Decided before the freeze below, not after.** Putting the freeze first
     // meant the offer was never evaluated while your hands were full, so it
     // could only ever hold still — it would never come to meet you.
-    const handsFull = minionFlag(this.id, 'offer') && !this.load && ui.handDrag !== null;
-    if (handsFull && hot > 0.05) {
+    if (handsFull && minionFlag(this.id, 'offer') && hot > 0.05) {
       const bx = this.world.x - p.x;
       const by = this.world.y - p.y;
       const bd = Math.hypot(bx, by) || 1;
@@ -1642,13 +1781,34 @@ export class Agent {
       }
     }
 
-    // Never inside the pointer's own personal space, whatever the above said.
-    const kx = tx - p.x;
-    const ky = ty - p.y;
-    const kd = Math.hypot(kx, ky);
-    if (kd < FERRY_KEEPOUT && kd > 0.001) {
-      tx = p.x + (kx / kd) * FERRY_KEEPOUT;
-      ty = p.y + (ky / kd) * FERRY_KEEPOUT;
+    // Never inside the pointer's own personal space — **unless your hands are
+    // full**, in which case closing is the entire job and personal space is the
+    // thing standing in the way of it. Same contract as the freeze above, and
+    // it has to be stated twice because this rule runs last and would otherwise
+    // undo it: while you are carrying something it never backs away from you.
+    //
+    // The two are measured from different points on purpose. Personal space is
+    // about the point it hovers over; a hand-over is about the aircraft you are
+    // aiming at, which is most of its own height further up, and is decided by
+    // `minionBodyAt` — so the hand-over distance is measured where that
+    // measures or it would stop just outside the radius that matters.
+    if (handsFull) {
+      const cy = this.body.height * 0.6;
+      const hx = tx - p.x;
+      const hy = ty - cy - p.y;
+      const hd = Math.hypot(hx, hy);
+      if (hd < HANDOVER_R && hd > 0.001) {
+        tx = p.x + (hx / hd) * HANDOVER_R;
+        ty = p.y + cy + (hy / hd) * HANDOVER_R;
+      }
+    } else {
+      const kx = tx - p.x;
+      const ky = ty - p.y;
+      const kd = Math.hypot(kx, ky);
+      if (kd < FERRY_KEEPOUT && kd > 0.001) {
+        tx = p.x + (kx / kd) * FERRY_KEEPOUT;
+        ty = p.y + (ky / kd) * FERRY_KEEPOUT;
+      }
     }
 
     // **And always inside the viewport.** Last, so it overrides every rule
@@ -1984,6 +2144,13 @@ export class Agent {
 
     switch (this.phase) {
       case 'spawn':
+        // Coming up out of a panel is `climb` — his own arms on the coaming —
+        // where the gondola is `ride`, which is standing on a platform holding
+        // a rail. Getting the two the wrong way round is the whole difference
+        // between arriving and being delivered.
+        act = this.spawnVia === 'hatch' ? 'climb' : 'ride';
+        box = 'hand';
+        break;
       case 'gondola':
         act = 'ride';
         box = 'hand';
@@ -2105,8 +2272,22 @@ export class Agent {
       world: this.world,
       face: this.face,
       frame,
-      hatch: this.phase === 'open' || this.phase === 'fix' || this.phase === 'close' ? this.hatch : null,
-      hatchOpen: this.hatch ? (this.phase === 'open' ? frame.p : this.phase === 'close' ? 1 - frame.p : 1) : 0,
+      hatch:
+        this.phase === 'open' || this.phase === 'fix' || this.phase === 'close' || this.phase === 'spawn'
+          ? this.hatch
+          : null,
+      hatchOpen: !this.hatch
+        ? 0
+        : this.phase === 'open'
+          ? frame.p
+          : this.phase === 'close'
+            ? 1 - frame.p
+            : this.phase === 'spawn'
+              ? // Flips up in the first fifth of a second — he is pushing it
+                // from underneath — and swings shut over `SPAWN_SHUT` once he
+                // is out and standing on it.
+                Math.min(1, this.phaseT / 0.2) * (1 - Math.min(1, this.spawnShut / SPAWN_SHUT))
+              : 1,
       crane:
         this.phase === 'crane'
           ? {
@@ -2120,7 +2301,14 @@ export class Agent {
               rise: this.craneRise,
             }
           : null,
-      gondola: this.phase === 'gondola' || this.phase === 'spawn',
+      // The cart is drawn only when he is actually on it. A man climbing out of
+      // a hatch with a window gondola painted round him is two arrivals at once.
+      gondola: this.phase === 'gondola' || (this.phase === 'spawn' && this.spawnVia === 'gondola'),
+      // **He is inside the block until he is out of it**, and the layer has to
+      // enforce that — see `drawAgent`. Only true while he is actually below
+      // the lip, so the shutting panel does not go on clipping a man standing
+      // on top of it.
+      emerging: this.phase === 'spawn' && this.spawnVia === 'hatch' && this.spawnShut <= 0,
       clipboard: this.clipboardText(),
       mood: this.mood,
     };
@@ -2335,6 +2523,17 @@ export interface AgentPose {
   hatchOpen: number;
   crane: CraneFrame | null;
   gondola: boolean;
+  /**
+   * He is climbing up through `hatch` and everything below its opening must be
+   * clipped away.
+   *
+   * **The minion layer draws on top of the blocks**, so being "inside the
+   * block" hides nothing on its own — and `drawHatchShade` is a shadow painted
+   * *within* the panel rect, sized for an arm reaching in, not a mask that
+   * could hide a body. Without the clip he is a whole figure standing below the
+   * block, sliding up across its face: an apparition rather than an entrance.
+   */
+  emerging: boolean;
   clipboard: string | null;
   mood: number;
 }

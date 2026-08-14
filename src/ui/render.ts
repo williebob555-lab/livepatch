@@ -6,7 +6,7 @@
 import { doc, type NetInfo as DocNet } from '../core/graph';
 import { setFont, uiFont } from './canvastext';
 import { ParamSpec, cvTriggerPorts, getDef, isArtworkFace, paramSpec } from '../core/registry';
-import { Block, BlockShape, FaceItem, ParamValue, ShapePoint, Theme, Vec2, Wire } from '../core/types';
+import { Block, BlockShape, FaceItem, ParamValue, Port, ShapePoint, Theme, Vec2, Wire } from '../core/types';
 import { parsePoints, samplePath } from '../core/trajectory';
 import { runtime } from '../engine/runtime';
 import {
@@ -22,8 +22,11 @@ import {
   vSub,
 } from './geometry';
 import { type BundleMember, ribbonPaths } from './bundling';
+// REWIRE (src/ui/rewire.ts) — the run played after an automatic rewire.
+import { paintRewire, rewireAnimating, rewireFrame, rewirePrune } from './rewire';
 import { TITLE_H, contentOrigin, faceItems, linkTarget, padOf, syncBlockSize } from './layout';
 import {
+  MarkShape,
   SPEAKER_METER_PAD,
   SampleHandle,
   eqBandHandles,
@@ -37,6 +40,7 @@ import {
   matrixFaceRect,
   matrixGeom,
   speakerBarSlots,
+  traceMarkShape,
 } from './widgets';
 import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
 import { Rect, ResolvedRef, paintFaceWidget } from './facepaint';
@@ -71,6 +75,7 @@ import { cvRipplePoints, flowPrune } from './visuals/flow';
 // `MINIONS`-marked draw call below are the only renderer references. See
 // docs/07-ui.md.
 import { drawMinions } from './minions/layer';
+import { drawVirus } from './virusfx';
 import { minionsAnimating, minionsFrame } from './minions/clock';
 
 export interface View {
@@ -145,6 +150,37 @@ export interface Overlay {
   handDrag?: 'wire' | 'block' | null;
   hotWidget?: { blockId: string; ref: string } | null;
   snapWire?: string | null;
+  /**
+   * SPLICE: the wire a dropped block would be inserted into, resolved live
+   * during the drag.
+   *
+   * Shown *before* the drop, and that is the whole safety argument for the
+   * feature: an automatic rewire that only announces itself afterwards is one
+   * you have to undo to understand. `cut` is where the wire would be broken and
+   * `into` the two ports it would be re-routed through, so the picture can show
+   * the actual proposal rather than just lighting the cable up.
+   */
+  spliceWire?: { wireId: string; cut: Vec2; into: [Vec2, Vec2]; dir: Vec2 } | null;
+  /**
+   * MODULATE: the widget a held CV cable would land on, resolved live.
+   *
+   * Its own field rather than `hotWidget`: that one means "you are operating
+   * this control" and paints it as pressed. A drop target is a different fact
+   * and gets a different mark, or letting go over a knob would look like you
+   * had just turned it.
+   */
+  modWidget?: MarkShape | null;
+  /**
+   * QUICK ADD: the loose cable end the Library is currently picking a block
+   * for, and the radius inside which that block will take the cable.
+   *
+   * **The circle is the rule, drawn.** "Only if it is close enough" is
+   * otherwise an invisible threshold the user has to discover by having it not
+   * happen; a ring around the end says how close, in the place they are
+   * looking, before they let go. It also answers *which* cable the Library is
+   * waiting on when several ends are loose — the banner cannot.
+   */
+  awaitingEnd?: { at: Vec2; r: number; hot?: boolean } | null;
   /** Entanglement Field whose viewport a dragged wire end would latch into:
    *  the plate lights so the pull is visible before the drop, not after. */
   latchField?: string | null;
@@ -428,6 +464,8 @@ export class Renderer {
     // LIVE VISUALS: advance the animation clock once, before anything paints.
     const V = visualFlags();
     visualsFrame();
+    // REWIRE: same contract — one clock tick per drawn frame, never its own loop.
+    rewireFrame();
     // MINIONS: advance their frame clock alongside the visuals clock.
     minionsFrame();
     if (V.flow) flowPrune();
@@ -486,6 +524,10 @@ export class Renderer {
     // LIVE VISUALS: push unrelated wires back — here, while the blocks are not
     // yet painted, so the scrim can never land on top of one.
     if (focus) drawFocusWires(g, graph, this.paths, theme, focus, theme.wireWidth);
+    // REWIRE: the run that plays after a splice / heal / drag-to-modulate. On
+    // top of the cables it describes, under the blocks — a run passing behind
+    // a block goes behind it, exactly as the cable does.
+    paintRewire(g, this.paths, theme);
 
     // ---- blocks ----
     for (const b of graph.blocks) if (b.style.wireLayer !== 'behind') this.drawBlock(b, theme, overlay);
@@ -500,6 +542,56 @@ export class Renderer {
     // always aiming at. Only when an overlay actually painted, so an ordinary
     // frame does not pay for a second port pass.
     if (focus || heat) for (const b of graph.blocks) this.drawPorts(b, theme);
+
+    // SPLICE / MODULATE: the live proposals, over the finished blocks.
+    //
+    // **Above the block pass, not with the wires.** Both of these mark a place
+    // that is *on the thing in your hand*: a splice's cut point lies inside the
+    // dragged block by construction, and a modulation target is a widget on a
+    // block's face. Painted with the cables they were simply covered up — the
+    // proposal was being drawn correctly and was invisible, which is the same
+    // outcome as not drawing it and much harder to notice.
+    if (overlay.spliceWire) this.drawSpliceProposal(overlay.spliceWire, theme);
+    if (overlay.modWidget) {
+      g.save();
+      g.strokeStyle = theme.portControlColor;
+      g.lineWidth = 2;
+      g.setLineDash([5, 4]);
+      traceMarkShape(g, overlay.modWidget);
+      g.stroke();
+      g.setLineDash([]);
+      g.restore();
+    }
+    // QUICK ADD: the cable end the Library is picking a block for, and how near
+    // that block has to land. Drawn with the proposals because it is one — it
+    // says what is about to be possible, not what has happened.
+    if (overlay.awaitingEnd) {
+      const a = overlay.awaitingEnd;
+      g.save();
+      g.strokeStyle = theme.selectionColor;
+      // `hot`: a block is being dragged inside the radius, so letting go here
+      // WILL plug it in. The ring closes up and brightens — the same before/
+      // after promise the splice proposal makes, in the same colour.
+      g.globalAlpha = a.hot ? 1 : 0.5;
+      g.lineWidth = a.hot ? 2 : 1.5;
+      g.setLineDash(a.hot ? [] : [4, 6]);
+      g.beginPath();
+      g.arc(a.at.x, a.at.y, a.r, 0, Math.PI * 2);
+      g.stroke();
+      g.setLineDash([]);
+      g.globalAlpha = 1;
+      g.fillStyle = theme.selectionColor;
+      g.beginPath();
+      g.arc(a.at.x, a.at.y, 4, 0, Math.PI * 2);
+      g.fill();
+      g.restore();
+    }
+
+    // VIRUS: spores travelling the wires and the motes a colonised block gives
+    // off. Over the finished wires and blocks, still in world space. One
+    // guarded call — deleting `virusfx.ts`, `core/virus.ts` and this line
+    // removes the feature.
+    drawVirus(g, graph, this.paths, theme);
 
     // MINIONS: the characters, their tools and their work marks, over the
     // finished blocks and ports. Still in world space (the transform set at the
@@ -610,6 +702,9 @@ export class Renderer {
     // MINIONS: a character mid-motion (walking, a shatter cooling) keeps the
     // canvas live the same way, and by the same on-demand rule.
     if (minionsAnimating()) this.dirty = true;
+    // REWIRE: a run in flight. Same on-demand rule — it is the only thing that
+    // keeps the canvas awake for the ~½ second after an automatic rewire.
+    if (rewireAnimating()) this.dirty = true;
   }
 
   /**
@@ -1005,6 +1100,13 @@ export class Renderer {
 
     if (w.selected) this.strokePath(pts, width + theme.wireBorderWidth * 2 + 4, theme.selectionColor + '88');
     if (overlay.snapWire === w.id) this.strokePath(pts, width + theme.wireBorderWidth * 2 + 6, theme.selectionColor + '55');
+    // SPLICE: a stronger halo than the bundle snap above, because this proposal
+    // is a *structural* edit rather than a cosmetic one — dressing two cables
+    // into a ribbon is undone by dragging one out again, and re-plumbing a
+    // chain is not. Same colour family, so it still reads as the same "this is
+    // what the drop does" language.
+    if (overlay.spliceWire?.wireId === w.id)
+      this.strokePath(pts, width + theme.wireBorderWidth * 2 + 9, theme.selectionColor + '99');
     // Solid border first, signal color on top. A wire on a cycle swaps the
     // border for the loop tint — the signal color still carries the level, so
     // a looped wire stays as readable as any other (see `loopNets`).
@@ -1546,6 +1648,11 @@ export class Renderer {
       }
     }
 
+    // ---- bypass ----
+    // Above the face, below the ports: the ports are what you aim at and must
+    // stay legible over any wash (see `drawPorts`).
+    if (b.bypass) this.drawBypass(b, theme, shape, radius, custom);
+
     // ---- ports ----
     this.drawPorts(b, theme);
 
@@ -1586,6 +1693,143 @@ export class Renderer {
     ripplePoolFacePrune(live);
     myceliumFacePrune(live);
     sympathyFacePrune(live);
+    // REWIRE: a run whose wires have been undone/deleted mid-flight. Wire ids,
+    // not block ids — so it gets its own set rather than sharing the one above.
+    const liveWires = new Set<string>();
+    const walkWires = (gr: { wires: { id: string }[]; blocks: Block[] }): void => {
+      for (const w of gr.wires) liveWires.add(w.id);
+      for (const b of gr.blocks) if (b.graph) walkWires(b.graph);
+    };
+    walkWires(doc.scene.root);
+    rewirePrune(liveWires);
+  }
+
+  /**
+   * SPLICE: draw what dropping here would do, while it can still be reconsidered.
+   *
+   * Two dashed runs — from the cut into the block's input, and out of the block
+   * back to the cut — so the picture is the *detour* the signal would take.
+   * Dashed and not solid on purpose: nothing here exists yet, and a proposal
+   * that looks identical to a wire is a proposal you will misread as one.
+   *
+   * Together with the thickened cable this is the answer to "don't let it
+   * change things behind my back": the edit is drawn before it happens, so a
+   * drop is a confirmation rather than a discovery.
+   */
+  private drawSpliceProposal(s: NonNullable<Overlay['spliceWire']>, theme: Theme): void {
+    const g = this.g;
+    g.save();
+    g.strokeStyle = theme.selectionColor;
+    g.lineWidth = 2;
+    g.lineCap = 'round';
+    g.setLineDash([6, 5]);
+    g.beginPath();
+    g.moveTo(s.cut.x, s.cut.y);
+    g.lineTo(s.into[0].x, s.into[0].y);
+    g.moveTo(s.into[1].x, s.into[1].y);
+    g.lineTo(s.cut.x, s.cut.y);
+    g.stroke();
+    g.setLineDash([]);
+    // The break mark: two ticks ACROSS the cable at the cut.
+    //
+    // This is the part that makes a proposal unmistakable, and it was added
+    // after looking at the common case rather than the convenient one. Drop a
+    // block squarely on a straight horizontal cable — which is exactly what
+    // this feature is *for* — and the two dashed detour lines land collinear
+    // with the wire and with each other, so the proposal renders as a cable
+    // that simply runs into the block's ports. Indistinguishable from an edit
+    // that has already happened, which defeats the whole point of showing it
+    // before the drop.
+    //
+    // Ticks across the cable cannot collapse that way: they are perpendicular
+    // to the thing they mark, whatever direction it runs.
+    const nx = -s.dir.y;
+    const ny = s.dir.x;
+    g.lineWidth = 2.5;
+    for (const off of [-3, 3]) {
+      const cx = s.cut.x + s.dir.x * off;
+      const cy = s.cut.y + s.dir.y * off;
+      g.beginPath();
+      g.moveTo(cx - nx * 7, cy - ny * 7);
+      g.lineTo(cx + nx * 7, cy + ny * 7);
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  /**
+   * BYPASS: what a bypassed block looks like.
+   *
+   * **The mechanism, drawn — not a badge.** A scrim drains the face back so the
+   * block reads as out of circuit, and a jumper runs straight across it from
+   * its audio input to its audio output: the signal visibly goes *past* the
+   * block rather than through it. That is what bypass is, so that is the
+   * picture; a corner label saying "BYP" would be one more thing to learn and
+   * would vanish at the zoom where a patch is actually read.
+   *
+   * Three constraints from `docs/14-dynamic-blocks.md` and the memory of what
+   * has been rejected here before:
+   *
+   *  * **Flat and face-on.** A scrim and two strokes — no gradient field, no
+   *    shading that implies a rounded solid.
+   *  * **No animation.** Bypass is a *state*, not an event. Fault heat cools
+   *    because it reports something that happened; this reports something that
+   *    is, so it holds still and costs the idle canvas nothing.
+   *  * **No load-bearing colour.** Blue/violet/green/amber/red all mean signal
+   *    kinds and faults. The jumper takes the theme's own text colour, so it
+   *    cannot be misread as a cable of some kind.
+   */
+  private drawBypass(
+    b: Block,
+    theme: Theme,
+    shape: string,
+    radius: number,
+    custom: Block['style']['customShape'],
+  ): void {
+    const g = this.g;
+    const { x, y } = b.pos;
+    const { w, h } = b.size;
+    g.save();
+    traceBlockShape(g, x, y, w, h, shape, radius, custom);
+    g.clip();
+    // Drain the face. The canvas ground rather than black: on a light theme a
+    // black wash would be the loudest thing on the screen (U2 cuts both ways).
+    //
+    // **The title band is left alone**, which is the same call proximity focus
+    // makes when it collapses a distant block: whatever else is dimmed, a block
+    // still says what it is (visual-standard B1). Without this the one label
+    // you need in order to find the thing you bypassed is the one that fades.
+    g.fillStyle = theme.canvasBg + 'a8';
+    const top = Math.min(TITLE_H, h);
+    g.fillRect(x, y + top, w, h - top);
+    g.restore();
+
+    // The jumper, between the real ports — so on a block whose ports have been
+    // slid along the edge it still leaves and arrives where the cables do.
+    const first = (dir: 'in' | 'out'): Port | undefined =>
+      b.ports.find((p) => p.kind === 'audio' && p.role !== 'cv' && p.dir === dir);
+    const pi = first('in');
+    const po = first('out');
+    if (!pi || !po) return;
+    const a = portPos(b, pi);
+    const c = portPos(b, po);
+    g.save();
+    g.lineCap = 'round';
+    // A dark casing under a bright core — the same read as the cored cable the
+    // wires use, so the jumper looks like patch cord rather than like a scratch.
+    g.strokeStyle = theme.canvasBg;
+    g.lineWidth = 5;
+    g.beginPath();
+    g.moveTo(a.x, a.y);
+    g.lineTo(c.x, c.y);
+    g.stroke();
+    g.strokeStyle = theme.blockText;
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(a.x, a.y);
+    g.lineTo(c.x, c.y);
+    g.stroke();
+    g.restore();
   }
 
   /**

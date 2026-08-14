@@ -16,6 +16,7 @@
 // ============================================================================
 
 import type { Block, Theme } from '../core/types';
+import { traceBlockShape } from './geometry';
 import {
   MYC_CAP,
   MYC_CONTROL_TOP,
@@ -117,6 +118,16 @@ export function paintMyceliumFace(g: CanvasRenderingContext2D, b: Block, theme: 
   const radius = theme.blockCornerRadius ?? 8;
   const px = (n: { x: number; y: number }): number => f.x + n.x * f.w;
   const py = (n: { x: number; y: number }): number => f.y + n.y * f.h;
+
+  // ONE clip, round the block's REAL outline, over everything this file draws.
+  // The plate used to clip itself to a rounded rectangle while the block is a
+  // chamfer, so the flange bands squared off the corners and sat over the
+  // outline; and the rivets, the caption and the tap indicator lines were not
+  // clipped at all. Same fix and same reasoning as `entangleface.ts` — one clip
+  // covers the module, and nothing added here later has to remember the shape.
+  g.save();
+  traceBlockShape(g, x, y, w, h, b.style.shape ?? theme.blockShape, b.style.cornerRadius ?? radius, b.style.customShape);
+  g.clip();
 
   // ---- plate ---------------------------------------------------------------
   g.save();
@@ -318,6 +329,7 @@ export function paintMyceliumFace(g: CanvasRenderingContext2D, b: Block, theme: 
     g.stroke();
   }
   g.restore();
+  g.restore(); // the block-shape clip
 
   // ---- advance -------------------------------------------------------------
   for (let i = 0; i < s.lit.length; i++) {

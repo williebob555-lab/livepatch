@@ -2064,13 +2064,19 @@ function build(body: HTMLElement): DockTabHandle {
       const vFrac = (f.mid.y - rr.y) / Math.max(1, rr.h);
       const anchorNote = v.lo + (1 - vFrac) * v.rows;
       v.rows = rows;
+      v.lo = Math.max(0, Math.min(127 - rows, Math.round(anchorNote - (1 - vFrac) * rows)));
       // `+ f.dy`, matching the `- f.dx` above: both are the **grab** sign, which
       // is what a finger on the surface means — the note under the fingers stays
       // under them. It reads as `+` only because the pitch axis is drawn
       // inverted against screen y (`ny` puts `lo` at the bottom), so dragging
       // down reveals the higher notes that were above the top edge. This was `-`
       // — scroll-style on the pitch axis and grab-style on time, in one gesture.
-      v.lo = Math.max(0, Math.min(127 - rows, Math.round(anchorNote - (1 - vFrac) * rows + f.dy / roll.rowH(canvas.clientHeight))));
+      //
+      // The pan is a separate step from the zoom anchor above because it is
+      // *incremental*: a frame's `dy` is a fraction of a row, and rounding it
+      // into a whole `lo` every frame discarded the whole pan. See
+      // `scrollPitch` — the same defect the trackpad's pitch scroll had.
+      roll.scrollPitch(f.dy / roll.rowH(canvas.clientHeight));
     } else {
       const pr = plot();
       const span0 = view.t1 - view.t0;

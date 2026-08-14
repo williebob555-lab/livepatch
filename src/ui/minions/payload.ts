@@ -39,7 +39,7 @@
 // ============================================================================
 
 import { doc } from '../../core/graph';
-import type { Vec2 } from '../../core/types';
+import type { Block, Vec2, Wire } from '../../core/types';
 
 /**
  * Where a payload came from, so it can be put back.
@@ -50,7 +50,23 @@ import type { Vec2 } from '../../core/types';
  * leave an unwanted block parked wherever the drone happened to be hovering.
  */
 export type Origin =
-  | { kind: 'at'; pos: Vec2 }
+  | {
+      kind: 'at';
+      pos: Vec2;
+      /**
+       * Which level it was picked up on — `doc.path.join('/')`, '' for the top.
+       *
+       * **A position is only a position on the graph it was measured in.** The
+       * one thing that can cross a subpatch boundary in a gripper is a block,
+       * which makes "carry it through the rift" the way you move a block
+       * between levels — and it made "put it back" return the block to a
+       * coordinate belonging to a graph it is no longer in. It looked like a
+       * random teleport, usually to somewhere off screen, because the two
+       * levels have no reason to share an origin. Going back has to mean going
+       * back *there*, so where "there" was has to travel with the payload.
+       */
+      level: string;
+    }
   | { kind: 'port'; blockId: string; portId: string }
   | { kind: 'float'; pos: Vec2 }
   | { kind: 'library' };
@@ -139,27 +155,82 @@ export function payloadAlive(p: Payload): boolean {
   return p.ends.some((e) => !!doc.wire(e.wireId));
 }
 
+/** The level the open graph is, in the same form an `Origin` stores. */
+const hereLevel = (): string => doc.path.join('/');
+
+/** The graph at a level key, or null if that level has since gone. */
+function graphAtLevel(level: string): { blocks: Block[]; wires: Wire[] } | null {
+  try {
+    return doc.graphAt(level ? level.split('/') : []);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Put it back where it came from, and report whether that was possible.
+ * Carry a block back to the level it was picked up on.
+ *
+ * Returns how many of its cables had to be cut, or null if it could not go —
+ * the level has been deleted since, in which case leaving it here is the only
+ * honest answer.
+ *
+ * **Its cables cannot come with it**, exactly as on the way out (`landCargo` in
+ * `layer.ts`): a wire belongs to one graph. Anything you wired it to while it
+ * was over here is parted, and the caller says so out loud — a block quietly
+ * unplugging itself as it leaves is the version of this that gets reported as
+ * "half my patch disconnected itself".
+ */
+function carryHome(b: Block, level: string): number | null {
+  const src = graphAtLevel(hereLevel());
+  const dst = graphAtLevel(level);
+  if (!src || !dst) return null;
+  const at = src.blocks.indexOf(b);
+  if (at < 0) return null;
+  const cut = src.wires.filter((w) => w.a.port?.blockId === b.id || w.b.port?.blockId === b.id);
+  for (const w of cut) src.wires.splice(src.wires.indexOf(w), 1);
+  dst.blocks.push(...src.blocks.splice(at, 1));
+  return cut.length;
+}
+
+/**
+ * Put it back where it came from, and report what that cost.
  *
  * Anything whose origin has since evaporated — the port it was plugged into is
- * gone, the block was deleted — is simply left where it is rather than being
- * teleported to a remembered coordinate that no longer means anything.
+ * gone, the block was deleted, the subpatch it lived in was — is simply left
+ * where it is rather than being teleported to a remembered coordinate that no
+ * longer means anything.
+ *
+ * The return value is the one thing the caller cannot see for itself: how many
+ * cables a cross-level return had to part. `0` for the ordinary case, `null`
+ * when it could not go home at all.
  */
-export function restore(p: Payload): void {
+export function restore(p: Payload): number | null {
   if (p.kind === 'block') {
     const b = doc.block(p.blockId);
-    if (!b) return;
+    if (!b) return 0;
     if (p.origin.kind === 'library') {
       // It was never anywhere. Back to stock.
       doc.deleteBlocks([p.blockId]);
-      return;
+      return 0;
     }
     if (p.origin.kind === 'at') {
+      // **Through the rift first, then to the coordinate.** In that order: the
+      // coordinate is only meaningful once the block is in the graph it was
+      // measured against, and a return that sets the position first would put
+      // it briefly at a nonsense point in this level — visible for a frame,
+      // and permanent if the move then fails.
+      let cut = 0;
+      if (p.origin.level !== hereLevel()) {
+        const n = carryHome(b, p.origin.level);
+        if (n === null) return null;
+        cut = n;
+      }
       b.pos.x = p.origin.pos.x;
       b.pos.y = p.origin.pos.y;
+      doc.syncRigPorts();
+      return cut;
     }
-    return;
+    return 0;
   }
   for (const e of p.ends) {
     const w = doc.wire(e.wireId);
@@ -179,4 +250,6 @@ export function restore(p: Payload): void {
     if (e.origin.kind === 'float') side.float = { ...e.origin.pos };
   }
   doc.syncRigPorts();
+  // A cable never crossed a level, so there was never anything to cut.
+  return 0;
 }

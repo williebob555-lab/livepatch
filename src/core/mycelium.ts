@@ -52,12 +52,34 @@ export interface MycField {
   h: number;
 }
 
+/** Smallest field worth growing anything in. */
+const MYC_MIN_FIELD = 24;
+
+/**
+ * Where the organism lives, in world coordinates.
+ *
+ * **It never leaves the block.** The floor used to be `Math.max(24, …)` on the
+ * SIZE while the ORIGIN stayed pinned at a fixed inset, so a block dragged
+ * smaller than the chrome around it grew its loam, hyphae and fruiting bodies
+ * straight out through the bottom and the right — measured at 51 px of overhang
+ * on a 160×120 block. That is a size you can reach by hand: `Editor.applyResize`
+ * clamps at 44×30 and does not enforce `def.minH`, and a `customFace` block is
+ * exempt from the "too tight for its widgets" floor by definition.
+ *
+ * So the CHROME gives way before the field does — the insets are what the field
+ * would *like*, not what it gets. When even the minimum will not fit inside the
+ * block, the origin is pulled back in so a floored field still lands on it.
+ */
 export function myceliumField(b: Block): MycField {
+  const bw = Math.max(2, b.size.w);
+  const bh = Math.max(2, b.size.h);
+  const w = Math.min(Math.max(MYC_MIN_FIELD, bw - MYC_INSET_L - MYC_INSET_R), bw - 2);
+  const h = Math.min(Math.max(MYC_MIN_FIELD, bh - MYC_FIELD_TOP - MYC_FLANGE_BOTTOM), bh - 2);
   return {
-    x: b.pos.x + MYC_INSET_L,
-    y: b.pos.y + MYC_FIELD_TOP,
-    w: Math.max(24, b.size.w - MYC_INSET_L - MYC_INSET_R),
-    h: Math.max(24, b.size.h - MYC_FIELD_TOP - MYC_FLANGE_BOTTOM),
+    x: b.pos.x + Math.max(1, Math.min(MYC_INSET_L, bw - 1 - w)),
+    y: b.pos.y + Math.max(1, Math.min(MYC_FIELD_TOP, bh - 1 - h)),
+    w,
+    h,
   };
 }
 

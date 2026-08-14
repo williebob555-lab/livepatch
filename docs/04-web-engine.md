@@ -1,6 +1,6 @@
 # 04 — Web Audio Engine
 
-_Last verified: 2026-08-02. Files: `src/engine/webaudio.ts`,
+_Last verified: 2026-08-13. Files: `src/engine/webaudio.ts`,
 `src/blocks/units.ts`, `src/engine/engine.ts`._
 
 The in-app engine. Builds a live `AudioNode` graph from a `CompiledGraph` on the
@@ -113,9 +113,37 @@ several times a second is what a naive re-hydrate does to a live take.
 4. CV sinks (`snk.mod`) are handled as **control-rate param modulation**, not by
    patching an audio inlet — see below.
 
+5. **`Unit.setFed(ports)`** goes to every unit that declares it, with the set of
+   its in-ports something is actually patched to — *including the empty set*,
+   which is the whole point.
+
 **Invariant — units keep state across edits.** Because kept units are not
 re-created, they must reflect live values through `setParam`, not by re-reading
 `params` at construction. This mirrors the native engine's identical rule.
+
+### `setFed` — only the graph knows an inlet is unplugged (2026-08-13)
+
+A unit **cannot** tell an unconnected inlet from a silent one. That is the same
+fact the Sample & Hold's explicit *Source* switch exists for, and anything that
+needs the distinction has to be told it rather than sniff for it.
+
+`clockInlet` (arp, step sequencer, MIDI echo) sniffed: it latched `connected`
+true the first time a non-zero sample came down the line and never cleared it.
+Combined with the reuse rule above — units survive rebuilds — **an arpeggiator
+or sequencer that had ever seen a clock never free-ran from its own Rate knob
+again.** Unplug the clock and it simply stopped, for the rest of the session.
+Reported as *"blocks freeze their rate when you have a clock plugged in and then
+unplug it"*, and it was not visual: the block genuinely stopped advancing.
+
+> **Sniffing cannot work here whichever way round you write it.** A square clock
+> sits at zero for most of its cycle, so "silent for a while" is
+> indistinguishable from "unplugged" at any threshold slow enough for a 0.2 Hz
+> clock.
+
+This was also a **silent divergence between the two engines**: the native
+kernels get the answer for free, because `ins['clock']` simply stops existing
+when nothing is wired to it (`engine/src/dsp.ts`, `seq`/`path`/`orbit`). Only
+the web engine had to be told, and only the web engine was wrong.
 
 ## CV modulation (`ModRec`, `applyMod`, `poll`)
 
@@ -215,6 +243,38 @@ read every param in `setParam` (kept units never re-read `params`), smooth
 AudioParam changes (`smooth()` helper = `setTargetAtTime`), and disconnect
 everything in `dispose`.
 
+### A feedback loop does not go in the node graph
+
+**Web Audio adds a render quantum of latency to any cycle, and it lands on the
+feedback branch only.** That is not a rounding error, it changes what the
+filter *is*, and it is invisible until somebody measures.
+
+`decorrelate` is the worked example. Four Schroeder allpasses a side:
+
+```
+v[n] = x[n] + g·y[n]      y[n] = −g·x[n] + v[n−d]
+```
+
+which is a textbook allpass — `H(z) = (z⁻ᵈ − g)/(1 − g·z⁻ᵈ)`, pole and zero
+mirrored, magnitude flat everywhere. Built from Delay + two Gains per stage it
+came out **+12 dB**: white noise through four stages measured 4.06× the input.
+With the inserted quantum `q` on the feedback branch the real response is
+`(z⁻ᵈ − g)/(1 − g·z⁻⁽ᵈ⁺ᑫ⁾)` — the zero stayed at `d`, the pole moved to `d+q`,
+and an allpass whose pole and zero no longer mirror is a comb filter with a peak
+of `1.6/0.4 = 4`, i.e. **+12.04 dB**. The meter and the algebra agreed to two
+decimal places.
+
+So: if the loop's phase relationships matter, the loop goes in an
+**AudioWorklet**, with the kernel's sample loop lifted across verbatim. That is
+what `lp-decorr` and `lp-logic` are, and it is the standing answer for every
+delay-feedback structure anyone builds here next — combs, ladders, reverbs.
+
+The tell that it is working, on the same rig: a mono source into `decorrelate`
+at `amount = 1` reads **−3 dB** on the downstream wire, because the net's
+analyser down-mixes two now-*uncorrelated* channels (`½(L+R)` → `1/√2`). A
+pass-through, or two channels that are still identical, reads 0 dB. Measure
+that, not "it sounds wider".
+
 ---
 
 ## The AudioWorklet engine — REMOVED 2026-08-02
@@ -226,10 +286,20 @@ capture built on top of it — see `docs/11-packaging.md`.
 
 **The consequence is standing, and it is a limitation rather than a bug:** off
 the desktop — a browser, and the Android APK — the engine is Web Audio, where
-those 25 kernels (`upmix`, `distance`, `decorrelate`, `panner3d`, `binaural`,
-the ambisonics chain, `chan-*`, `room`, `orbit`, `path`, `spectral-scatter`)
-are silent pass-throughs. A surround patch loads fine and plays nothing
-recognisable.
+those kernels (`upmix`, `distance`, `panner3d`, `binaural`, the ambisonics
+chain, `chan-*`, `room`, `orbit`, `path`, `spectral-scatter`) are silent
+pass-throughs. A surround patch loads fine and plays nothing recognisable.
+
+**`node scripts/web-parity-test.mjs` is the standing count of this**, and the
+number it ends on is the one that matters: how many blocks in the *shipped
+presets* are silent on Android. It was 11 when the gap was first measured
+(2026-08-13), reported as "most of the factory scenes on the Android version
+have Native blocks that just don't work" — which is exactly what a `NATIVE`
+badge on a block that makes no sound is. `decorrelate` has a real web unit as of
+that date (an AudioWorklet — see the feedback-loop note above), taking it to 6:
+`panner3d` ×3, `orbit` ×2, `upmix` ×1. The report is deliberately not a build
+gate; some entries (`asio-*`, `key-*`) are things a browser genuinely cannot do,
+and failing the build over those is how a check gets switched off.
 
 If it is ever wanted back, the shape of the answer is the same one: **host the
 existing `dsp.ts`; do not port the kernels into Web Audio nodes a second time**,

@@ -1,6 +1,6 @@
 # 05 — Native Engine
 
-_Last verified: 2026-08-01. Files: `engine/src/*`, `src/engine/native.ts`,
+_Last verified: 2026-08-12. Files: `engine/src/*`, `src/engine/native.ts`,
 `electron/main.cjs`, `electron/preload.cjs`._
 
 The native engine is a **separate OS process** that runs the DSP graph on real
@@ -156,6 +156,39 @@ then runs one quantum at a time.
 - **`hardwareNeeds()`** scans nodes for IO blocks and produces the `HwNeeds`
   (WASAPI outputs with channel counts, WASAPI/ASIO inputs, ASIO span) that
   `IoManager` opens streams from.
+
+### Bypass in the executor (`renderBypassed`, 2026-08-12)
+
+`__bypass` (see [`02-core-ir.md`](02-core-ir.md)) is handled **here, not in any
+kernel**: the executor copies the node's audio inputs onto its audio outputs and
+stops calling `process`. Four things it has to get right, three of which are
+golden rules and all four of which are asserted by
+`scripts/bypass-exec-test.cjs`:
+
+- **The pairing is resolved at set-graph time**, never in `process` — building it
+  per quantum would allocate (rule 1). The compiled graph never lists a node's
+  ports, only the nets name them, so the pairing is gathered while walking the
+  nets and matched **index-wise over sorted port names**. That is exactly right
+  for the 1-in/1-out effects bypass is for, and an arbitrary-but-stable choice
+  for a Matrix or an Upmix — documented as such rather than becoming a table of
+  per-type special cases that goes stale the first time somebody adds a port.
+- **The switch ramps** (rule 10). Wet→dry in one step is a discontinuity, and it
+  would fire on *every* comparison — the exact thing the feature is used for.
+  12 ms, per-sample across the quantum; the kernel keeps being processed while a
+  fade is in flight and only stops once fully dry.
+- **The dry path writes, it never blends against the output buffer** (rule 13).
+  Once fully dry the kernel's buffer is no longer written, so it holds whatever
+  it last produced — possibly a latched non-finite. `0 * NaN` is NaN, so a naive
+  cross-fade would make bypass a way to **permanently poison a net**.
+- **Invented channels go silent, not stale** (rule 15's width half). A block that
+  widens 2 → 8 has output channels with no dry counterpart; they fade to zero,
+  because "as if it were not here" means the channels it invented do not exist
+  either.
+
+The same semantics are implemented in the web engine (`src/engine/webaudio.ts`,
+`applyBypass`) by inserting a wet/dry gain pair on first use and cross-fading
+them — opt-in per node, the same bargain the per-channel metering makes, so an
+un-bypassed patch carries no extra AudioNodes.
 
 ## DSP kernels (`engine/src/dsp.ts`)
 

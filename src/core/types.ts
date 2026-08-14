@@ -313,6 +313,15 @@ export interface Block {
   vstParams?: VstParamDesc[];
   /** vst blocks: plugin param ids ('p<ParamID>') pinned as face widgets. */
   vstPinned?: string[];
+  /**
+   * Bypassed: the block's audio inputs are passed straight to its audio
+   * outputs and its kernel stops processing. Reaches both engines as the
+   * compiler-injected `__bypass` param, so toggling it is a `'param'` change
+   * and never a recompile — a bypass that tore down and rebuilt the graph
+   * would reload every hosted plugin on the way through, which is the opposite
+   * of the fast A/B this exists to be. See `docs/02-core-ir.md`.
+   */
+  bypass?: boolean;
   selected?: boolean;
 }
 

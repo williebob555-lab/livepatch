@@ -181,6 +181,12 @@ export class NativeEngineClient implements EngineAdapter {
     this.b()?.engineSend({ op: 'midi-learn', on });
   }
 
+  /** FAILSAFE: release every note in the engine process. See `MidiEvent`'s
+   *  `panic` in `engine.ts` for what this is for. */
+  panic(): void {
+    this.b()?.engineSend({ op: 'midi-panic' });
+  }
+
   private unsub: (() => void) | null = null;
   private unMidi: (() => void) | null = null;
   private levels = new Map<string, LevelFrame>(); // by editor wireId

@@ -21,13 +21,49 @@ export interface LevelFrame {
  *  - 'bend'          note = 0, velocity = bend −1..1 (14-bit, centered)
  *  - 'pressure'      note = 0, velocity = channel pressure 0..1
  *  - 'polyat'        note = MIDI note, velocity = key pressure 0..1
+ *  - 'panic'         both fields unused — see below
+ *
+ * ---------------------------------------------------------------------------
+ * `panic` — the failsafe, and why it is an EVENT rather than a method
+ * ---------------------------------------------------------------------------
+ *
+ * **A note-on is a promise that a note-off is coming, and the patch is free to
+ * break that promise at any moment.** Pull the cable between a keyboard and a
+ * synth while a key is down and the note-off has nowhere to go: the voice
+ * sounds forever, and there is nothing you can do to it — the thing that would
+ * have stopped it is the connection you just removed. Unplug the controller
+ * itself and the same. It is the one failure in the app with no recovery from
+ * inside the app, which is what makes it worth a rule of its own:
+ *
+ *   > **Nothing may be left sounding with no way to stop it.**
+ *
+ * `panic` means "release everything you are holding, now". It travels as an
+ * ordinary MIDI event for two reasons, both of which are about not being able
+ * to forget it:
+ *
+ *   1. **It reaches sinks through the routing that already exists** — the same
+ *      `midiIn` every other event arrives through, on both engines, including
+ *      through subgraph portals. A separate method would need its own copy of
+ *      the routing, and a second copy of routing is how two paths drift.
+ *   2. **A MIDI processor forwards it and is then correct by construction.**
+ *      An arp, a chord block, a transpose all hold notes *and* emit them; each
+ *      one drops its own state and passes the panic on, so a chain of six
+ *      blocks silences end to end without any of them knowing about the chain.
+ *
+ * A unit that holds no note state ignores it, which is the right answer and
+ * costs nothing. A unit that holds note state and ignores it is a bug —
+ * `scripts/midi-panic-test.mjs` is what stops that shipping.
  */
 export interface MidiEvent {
-  type: 'on' | 'off' | 'cc' | 'bend' | 'pressure' | 'polyat';
+  type: 'on' | 'off' | 'cc' | 'bend' | 'pressure' | 'polyat' | 'panic';
   note: number;
   velocity: number;
   channel: number;
 }
+
+/** The failsafe event itself. One shape, made in one place, so nothing invents
+ *  a variant of it. */
+export const PANIC: MidiEvent = Object.freeze({ type: 'panic', note: 0, velocity: 0, channel: 0 });
 
 /** Cassette reference carried by tape nets (see core/cassettes.ts). */
 export interface TapeRef {
@@ -119,6 +155,13 @@ export interface EngineAdapter {
    * take visible to the Clip tab, the Library and every tape consumer.
    */
   onAsset?: ((nodeId: string, assetId: string) => void) | null;
+  /**
+   * FAILSAFE: release every note everywhere, now. See `MidiEvent`'s `panic`.
+   *
+   * Optional on the interface and implemented by every real adapter — an
+   * adapter that cannot do it (the stub) is one where nothing is sounding.
+   */
+  panic?(): void;
 }
 
 const ZERO: LevelFrame = { rms: 0, peak: 0 };

@@ -17,6 +17,7 @@ import { ParamSpec, VisualKind, cvInputsByParam, getDef, paramSpec } from '../co
 import { doc } from '../core/graph';
 import { runtime } from '../engine/runtime';
 import { getCassettePeaks } from '../core/cassettes';
+import { type ViralLook, viralLook, virusOn, virusValue } from '../core/virus';
 import { resolveAssetFor } from './tape';
 import { MARK_H, SWAPPABLE_WIDGETS, linkTarget, widgetSize } from './layout';
 import { PANEL_GLYPHS, drawPanelGlyph } from './glyphs';
@@ -185,13 +186,36 @@ export function controlOfStyle(spec: ParamSpec, cs?: ControlStyle): { kind: Para
 export function modOf(b: Block, paramId: string, nodeId: string, container: Block | null): number | null {
   if (cvPatched(b, paramId, container) || builtinCvPatched(b, paramId) || b.midiMaps?.[paramId])
     return runtime.modValueFor(nodeId, paramId);
+  // THE VIRUS (src/core/virus.ts). Checked last, and only when nothing real is
+  // driving the param: a patched cable always outranks an infection, and the
+  // sim will not take a patched param in the first place. The value comes back
+  // already through `cvValue`, so it is clamped to the param's own range like
+  // every other marker here.
+  const vspec = paramSpec(b, paramId);
+  if (vspec) {
+    const vv = virusValue(nodeId, paramId, vspec, Number(b.params[paramId] ?? vspec.def ?? 0));
+    if (vv != null) return vv;
+  }
   return null;
 }
 
 /** Marker color source for a param's live indicator ('cv' wins over midi). */
-export function modSrcOf(b: Block, paramId: string, container: Block | null): 'cv' | 'midi' | null {
+export function modSrcOf(
+  b: Block,
+  paramId: string,
+  container: Block | null,
+  nodeId?: string,
+): 'cv' | 'midi' | 'virus' | null {
   if (cvPatched(b, paramId, container) || builtinCvPatched(b, paramId)) return 'cv';
-  return b.midiMaps?.[paramId] ? 'midi' : null;
+  if (b.midiMaps?.[paramId]) return 'midi';
+  return nodeId && virusOn(nodeId, paramId) ? 'virus' : null;
+}
+
+/** Everything the painter needs to draw an infection, derived from the strain's
+ *  own genome. Null for anything that is not infected. */
+export function modLookOf(nodeId: string, paramId: string): ViralLook | null {
+  const inf = virusOn(nodeId, paramId);
+  return inf ? viralLook(inf) : null;
 }
 
 /**
@@ -323,6 +347,31 @@ export interface WidgetPaintOpts {
  * what makes a widget mirrored onto a custom block's face show the CV marker
  * from the parent's port rather than nothing at all.
  */
+/**
+ * The panel mark this widget prints, if any.
+ *
+ * The machined 'panel' button engraves its own mark into the key, so it gets no
+ * printed strip — and `layout.ts` reserved none for it either.
+ */
+function markOf(spec: ParamSpec, cs?: ControlStyle): string | undefined {
+  const engraves = controlOfStyle(spec, cs).variant === 'panel';
+  return cs?.showMark === false || engraves ? undefined : spec.mark;
+}
+
+/**
+ * The widget's own box inside its face item — the item minus whatever the
+ * silkscreen strip took.
+ *
+ * Exported because **anything drawn onto a widget from outside has to use the
+ * same box the painter used**, or it sits a mark-strip's height off centre on
+ * exactly the blocks that print marks. The modulation drop target is the one
+ * that does this.
+ */
+export function widgetBox(rect0: Rect, spec: ParamSpec, cs?: ControlStyle): Rect {
+  const mark = markOf(spec, cs);
+  return mark && rect0.h > MARK_H * 2 ? { ...rect0, h: rect0.h - MARK_H } : rect0;
+}
+
 export function paintFaceWidget(
   g: CanvasRenderingContext2D,
   rect0: Rect,
@@ -338,11 +387,8 @@ export function paintFaceWidget(
   // bottom of the item. Carved off here, once, so every painter below sees the
   // widget's own box and none of them has to know the mark exists. Drawn last
   // (after the widget) so a mark can never be painted over.
-  // The machined 'panel' button engraves its own mark into the key, so it gets
-  // no printed strip — and `layout.ts` reserved none for it either.
-  const engraves = controlOfStyle(spec, o.cs).variant === 'panel';
-  const mark = o.cs?.showMark === false || engraves ? undefined : spec.mark;
-  const rect: Rect = mark && rect0.h > MARK_H * 2 ? { ...rect0, h: rect0.h - MARK_H } : rect0;
+  const mark = markOf(spec, o.cs);
+  const rect: Rect = widgetBox(rect0, spec, o.cs);
   const paintMark = (): void => {
     if (!mark || rect === rect0) return;
     const box = { x: rect0.x, y: rect0.y + rect0.h - MARK_H, w: rect0.w, h: MARK_H };
@@ -455,8 +501,9 @@ export function paintFaceWidget(
     mod2,
     eff.variant,
     o.cs,
-    modSrcOf(t, spec.id, r.container),
+    modSrcOf(t, spec.id, r.container, r.nodeId),
     axes?.y,
+    modLookOf(r.nodeId, spec.id),
   );
   if (!o.noBadges) drawBindingBadges(g, t, spec.id, rect, theme, r.container);
   paintMark();

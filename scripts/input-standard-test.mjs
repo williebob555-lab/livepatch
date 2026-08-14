@@ -45,10 +45,33 @@ try {
   process.exit(1);
 }
 
-// `performance` exists on modern node; the module also touches nothing else.
-const mod = await import(pathToFileURL(join(out, 'input.js')).href);
-const { TwoPointerGesture, wheelIntent, wheelDelta, grabSlop, ZOOM_DEADZONE, LONGPRESS_NUDGE, LONGPRESS_SLOP, LONGPRESS_MS } =
-  mod;
+// A wheel event stream is only classifiable *with its timing* — a dense stream
+// of big deltas is a trackpad flick, the same deltas 300 ms apart are wheel
+// notches. So drive `performance.now()` from here rather than from the wall
+// clock, which cannot express either case reliably. (The module reads the
+// global at call time, so this is picked up by the import below.)
+let clock = 10_000;
+Object.defineProperty(globalThis, 'performance', {
+  value: { now: () => clock },
+  writable: true,
+  configurable: true,
+});
+
+const modUrl = pathToFileURL(join(out, 'input.js')).href;
+const mod = await import(modUrl);
+const {
+  TwoPointerGesture,
+  StepPan,
+  wheelIntent,
+  wheelDelta,
+  grabSlop,
+  ZOOM_DEADZONE,
+  LONGPRESS_NUDGE,
+  LONGPRESS_SLOP,
+  LONGPRESS_MS,
+} = mod;
+/** A module instance that has never seen a wheel event — a cold session. */
+const coldModule = (tag) => import(`${modUrl}?cold=${tag}`);
 
 // ---- 1. pan-first: translation must not zoom -------------------------------
 console.log('-- rule 1: a two-finger translation does not zoom --');
@@ -222,6 +245,61 @@ const ev = (o) => ({ deltaX: 0, deltaY: 0, deltaMode: 0, ctrlKey: false, metaKey
   check(it.kind === 'zoom', `a line-mode event immediately after a trackpad run → ${it.kind} (expected zoom)`);
 }
 
+// ---- 5b. the verdict must not change in the middle of a gesture ------------
+//
+// The 2026-08-12 report: "the two-finger pan switches between zoom and pan
+// every so often", and the Clip tab — where you flick across a whole file —
+// was the worst of them.
+//
+// A fast vertical two-finger scroll is the case that broke it. Windows
+// precision touchpads report whole pixels, a vertical gesture carries no
+// `deltaX` at all, and the fast stretch is all large deltas, so the old
+// heuristic (fresh evidence or a 600 ms expiry) ran out of evidence in the
+// MIDDLE of the flick and started zooming under the user's fingers. Length and
+// speed are the whole test: a short slow scroll passed this the entire time.
+console.log('-- rule 2: a gesture keeps the verdict it started with --');
+{
+  clock += 5000; // a gesture of its own
+  const stream = [];
+  for (let i = 0; i < 6; i++) stream.push(6 + i * 8); // ramp up off the finger
+  for (let i = 0; i < 90; i++) stream.push(60); // 1.1 s of fast, whole-px, y-only
+  for (let i = 0; i < 6; i++) stream.push(18 - i * 3); // momentum tail
+  const kinds = [];
+  for (const dy of stream) {
+    clock += 12; // ~83 Hz, which is what a stream is
+    kinds.push(wheelIntent(ev({ deltaY: dy })).kind);
+  }
+  const zoomed = kinds.filter((k) => k === 'zoom').length;
+  check(zoomed === 0, `a 1.3 s fast vertical flick stayed a pan for all ${kinds.length} events (${zoomed} zoomed)`);
+}
+{
+  // The same stream, but the surface says it cannot pan: it must still zoom.
+  clock += 5000;
+  const it = wheelIntent(ev({ deltaY: 8 }), { noPan: true });
+  check(it.kind === 'zoom', `a trackpad scroll on a noPan surface → ${it.kind} (expected zoom)`);
+}
+{
+  // ...and a mouse must get zoom back after all that. A wheel is discrete and
+  // repeats itself exactly; two notches is the evidence. The first notch after
+  // a trackpad run is the documented cost of never flipping mid-gesture.
+  clock += 5000;
+  const kinds = [];
+  for (let i = 0; i < 3; i++) {
+    kinds.push(wheelIntent(ev({ deltaY: 100 })).kind);
+    clock += 300; // notches, not a stream
+  }
+  check(kinds[1] === 'zoom' && kinds[2] === 'zoom', `a mouse wheel wins the verdict back within 2 notches (${kinds.join(', ')})`);
+}
+{
+  // Cold start, both devices: the FIRST gesture of a session must be right,
+  // because there is no history to fall back on and a wrong first gesture is
+  // the one the user remembers.
+  const pad = await coldModule('pad');
+  check(pad.wheelIntent(ev({ deltaY: 6 })).kind === 'pan', 'the first trackpad event of a session already pans');
+  const mouse = await coldModule('mouse');
+  check(mouse.wheelIntent(ev({ deltaY: 100 })).kind === 'zoom', 'the first mouse notch of a session zooms');
+}
+
 console.log('-- rule 2: modifiers scale, and address the right axis --');
 {
   const c = wheelIntent(ev({ deltaY: -50, ctrlKey: true }), { axes: '2d' });
@@ -259,6 +337,55 @@ console.log('-- value wheels land in the same place on both devices --');
   for (let i = 0; i < 12; i++) pad += wheelDelta(ev({ deltaY: 4 })).dy;
   check(mouse === 48, `line-mode normalises to px (${mouse})`);
   check(Math.abs(mouse - pad) < 1, `equal travel gives equal delta (mouse ${mouse}, trackpad ${pad})`);
+}
+
+// ---- 5c. the recorder can actually answer the question ---------------------
+//
+// `__lp.wheel` is what a scroll complaint gets measured with, so it has to work
+// the first time it is asked for — a diagnostic that throws in the user's
+// console has cost them the round trip it was meant to save. Drive it here
+// rather than finding out live.
+console.log('-- the wheel recorder reports what happened --');
+{
+  const w = mod.wheelDiagnostics;
+  w.watch();
+  clock += 5000;
+  for (let i = 0; i < 8; i++) {
+    clock += 12;
+    wheelIntent(ev({ deltaX: 5, deltaY: 7 })); // a diagonal trackpad scroll
+  }
+  clock += 900; // ...a pause, then a mouse notch
+  wheelIntent(ev({ deltaY: 100 }));
+  const out = w.report(true);
+  w.stop();
+  check(/2 gesture\(s\)/.test(out), `two gestures separated by the pause\n     ${out.replace(/\n/g, '\n     ')}`);
+  check(/both-axes 8/.test(out), 'counted the events that carried both axes — the number the OS axis-lock question turns on');
+  check(!/FLIP/.test(out), 'no mid-gesture flip to report');
+  check(w.report(true).length > 0 && w.stop().includes('9 events'), 'stop() reports what it holds');
+}
+
+// ---- 6b. an integer axis still pans on small deltas ------------------------
+//
+// The other half of the 2026-08-12 report: "when you start going in one axis
+// the other axis is locked until you stop". The roll's pitch is a whole note
+// number, a trackpad event is ~4 px, a row is ~16 px — so rounding each event
+// on its own returned the SAME note every time and the axis never moved, while
+// time (a float) panned smoothly in the same gesture. A dead axis, not a
+// rounding error.
+console.log('-- an integer view axis pans on a stream of small deltas --');
+{
+  const p = new StepPan();
+  let lo = 48;
+  for (let i = 0; i < 40; i++) lo = p.step(lo, 0.25, 0, 97); // 40 events × ¼ row
+  check(lo === 58, `40 quarter-row deltas moved 10 rows (got ${lo - 48})`);
+  // And the remainder must not bank up at the end of the axis, or scrolling
+  // back costs everything that was thrown at the wall first.
+  const q = new StepPan();
+  let hi = 95;
+  for (let i = 0; i < 60; i++) hi = q.step(hi, 0.5, 0, 97);
+  check(hi === 97, `clamped at the top (${hi})`);
+  const back = q.step(hi, -1, 0, 97);
+  check(back === 96, `one step back off the clamp moves immediately (${back})`);
 }
 
 // ---- 7. touch targets widen, mouse targets do not --------------------------

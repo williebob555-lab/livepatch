@@ -15,6 +15,22 @@ import { onPrefsChange } from './core/prefs';
 import { installRollHistory, syncRolls } from './core/rolls';
 import { installTakeHistory } from './core/takehistory';
 import { stepLiving } from './core/living';
+import {
+  BASIS,
+  blockAllowed,
+  clearVirus,
+  infectRefusal,
+  infectableParams,
+  lawFor,
+  clearVirusParam,
+  seedVirus,
+  seedVirusOn,
+  stepVirus,
+  virusBusy,
+  virusCount,
+  virusInfections,
+} from './core/virus';
+import { getDef, paramSpec } from './core/registry';
 import { showBanner } from './ui/menus';
 import { applyUiScale, onUiScaleChange } from './ui/uiscale';
 import { setImageLoadCallback } from './ui/images';
@@ -31,6 +47,7 @@ import './ui/rigview';
 // same as the other tabs. The workspace layer is imported by render.ts.
 import './ui/minions/tab';
 import { minionDebug } from './ui/minions/layer';
+import { wheelDiagnostics } from './ui/input';
 import { DOCK_PANEL_ID, dockFrame, dockSelectionChanged, initDockPanel, refreshDock, repaintDock } from './ui/dockpanel';
 import { initWidgetDock } from './ui/widgetdock';
 import { initMainDockLink, mirrorDock, sendParamToDock, setDockRevealHandler, valueFramePump } from './ui/docklink';
@@ -293,7 +310,75 @@ function boot(): void {
    */
   const frameStats: { on: boolean; samples: number[] } = { on: false, samples: [] };
 
-  (window as any).__lp = { doc, renderer, editor, runtime, frameStats, minions: minionDebug };
+  /**
+   * `__lp.virus` — seed, cure and inspect an outbreak from the console.
+   *
+   * The same handle `__lp.minions` is, and for the same reason: this is a
+   * feature whose whole behaviour is emergent and slow, so being able to state
+   * "infect the Gain, now tell me what is alive" is the difference between
+   * testing it and watching it.
+   */
+  const virusDebug = {
+    seed: (blockId?: string) => {
+      const b = blockId ? doc.graph.blocks.find((x) => x.id === blockId) : doc.selectedBlocks()[0];
+      if (!b) return 'no block (pass an id, or select one)';
+      if (!blockAllowed(b)) return `${b.id} is in ${getDef(b.type).category}, which is off limits`;
+      return seedVirus(runtime.nodeId(b.id), b, doc.graph)
+        ? `infected ${b.id}`
+        : `${b.id} has no widget an infection could live on`;
+    },
+    /** What is alive, in one line each. */
+    list: () =>
+      virusInfections().map((i) => {
+        // The EFFECTIVE law, not the evolved one — a level or log-curve param
+        // overrides what the strain carries, and printing the strain's own
+        // value made a safely-ducked Gain read as `replace`.
+        const b = doc.graph.blocks.find((x) => x.id === i.blockId);
+        const sp = b ? paramSpec(b, i.paramId) : undefined;
+        const law = sp ? lawFor(sp, i.strain) : i.strain.law;
+        const mix = i.strain.w
+          .map((x, k) => (x > 0.22 ? BASIS[k] : null))
+          .filter(Boolean)
+          .join('+');
+        return (
+          `${i.blockId}.${i.paramId}  ${mix || 'mixed'}/${law} g${i.strain.gen} ` +
+          `hue${i.strain.hue.toFixed(0)} rate${i.strain.rate.toFixed(2)} ` +
+          `health${i.health.toFixed(2)} cv${i.cv.toFixed(2)}`
+        );
+      }),
+    /** Infect one named widget — the manual gesture, which overrules the
+     *  category ban and the spare list exactly as the menu item does. */
+    infect: (blockId: string, paramId: string) => {
+      const b = doc.graph.blocks.find((x) => x.id === blockId);
+      if (!b) return 'no such block';
+      // Say WHICH refusal it is. "could not" on a knob you are looking at is
+      // the least useful thing this handle could print.
+      const no = infectRefusal(b, paramId, doc.graph);
+      if (no) return `${blockId}.${paramId}: ${no}`;
+      return seedVirusOn(runtime.nodeId(b.id), b, paramId, undefined, doc.graph)
+        ? `infected ${blockId}.${paramId}`
+        : `${blockId}.${paramId} is already infected`;
+    },
+    cureOne: (blockId: string, paramId: string) => {
+      clearVirusParam(runtime.nodeId(blockId), paramId, (n, p, v) => runtime.sendParam(n, p, v));
+      return 'cured ' + blockId + '.' + paramId;
+    },
+    count: virusCount,
+    /** Which widgets on a block could ever be taken. */
+    habitat: (blockId: string) => {
+      const b = doc.graph.blocks.find((x) => x.id === blockId);
+      return b ? infectableParams(b, doc.graph).map((p) => p.id) : 'no such block';
+    },
+    cure: () => {
+      clearVirus((n, p, v) => runtime.sendParam(n, p, v));
+      return 'cured';
+    },
+  };
+
+  // `__lp.wheel` — the trackpad/wheel recorder. It lives in `ui/input.ts` beside
+  // the classifier it reports on (and is exercised by
+  // `scripts/input-standard-test.mjs`); this is only the handle.
+  (window as any).__lp = { doc, renderer, editor, runtime, frameStats, minions: minionDebug, virus: virusDebug, wheel: wheelDiagnostics };
 
   // Render on demand: always while audio runs (live meters/visuals), otherwise
   // only when something changed. Keeps idle CPU near zero.
@@ -315,6 +400,25 @@ function boot(): void {
       const dt = (n - lastLive) / 1000;
       lastLive = n;
       stepLiving(dt, (nodeId, paramId, v) => runtime.sendParam(nodeId, paramId, v));
+      // THE VIRUS (src/core/virus.ts) — modulation that spreads along the
+      // patch's own wires. Stepped here for the same reason `stepLiving` is:
+      // one animation loop (docs/10), and CV-shaped modulation is applied on
+      // it. It writes to the engine only, never to the document, so there is
+      // nothing here to undo. Delete these two lines and the import to remove
+      // the feature entirely.
+      stepVirus(
+        dt,
+        (nodeId, paramId, v) => runtime.sendParam(nodeId, paramId, v),
+        (wireId) => runtime.levelFor(wireId)?.rms ?? 0,
+      );
+      // An infected widget moves, so it has to be redrawn. Normally
+      // `runtime.audioOn` already covers it — and a virus with no audio is
+      // starving anyway — but the dying frames are exactly the ones worth
+      // seeing, and without this they freeze instead of receding.
+      //
+      // `virusBusy`, not `virusCount`: the last thing that happens is a cured
+      // colony dispersing, and there are no infections left by then.
+      if (virusBusy()) renderer.dirty = true;
     }
     if (renderer.dirty || runtime.audioOn) {
       // Cleared BEFORE the draw, not after: a draw that discovers it needs

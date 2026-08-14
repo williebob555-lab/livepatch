@@ -473,6 +473,23 @@ class VstKernel implements Kernel {
         this.h!.midi(this.handle, 0xe0 | ch, v14 & 0x7f, (v14 >> 7) & 0x7f);
         break;
       }
+      // FAILSAFE: **the case with the least visibility in the whole app.** A
+      // hosted plugin's voices are inside somebody else's DLL; we cannot see
+      // them, count them or reach past the MIDI port to stop them, and plenty
+      // of instruments are famous for hanging a note on a dropped event. So it
+      // gets the full hardware treatment — CC 123/120, the sustain pedal up,
+      // and an explicit note-off for all 128 notes — on every channel, because
+      // the panic exists precisely for the case where our model of what is
+      // sounding is already wrong. 2048 three-byte events into a local
+      // function, once, on a failure.
+      case 'panic':
+        for (let c = 0; c < 16; c++) {
+          this.h!.midi(this.handle, 0xb0 | c, 123, 0);
+          this.h!.midi(this.handle, 0xb0 | c, 120, 0);
+          this.h!.midi(this.handle, 0xb0 | c, 64, 0);
+          for (let n = 0; n < 128; n++) this.h!.midi(this.handle, 0x80 | c, n, 0);
+        }
+        break;
     }
   };
 

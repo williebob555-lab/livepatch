@@ -2,7 +2,7 @@
 // WebMIDI hardware input bus. midi-in blocks subscribe by device filter; the
 // native engine will replace this with its own MIDI stack.
 // ============================================================================
-import { MidiEvent } from './engine';
+import { MidiEvent, PANIC } from './engine';
 
 type MidiListener = (ev: MidiEvent, deviceName: string) => void;
 
@@ -35,13 +35,33 @@ function handleMessage(deviceName: string, e: MIDIMessageEvent): void {
   if (ev) for (const fn of listeners) fn(ev, deviceName);
 }
 
+/**
+ * FAILSAFE: a device that goes away takes its note-offs with it.
+ *
+ * Unplugging a controller mid-chord, or a class-compliant interface
+ * re-enumerating itself, ends the port — and every key that was down at that
+ * instant is a note-on whose note-off is never being sent by anybody. The
+ * synth downstream has no way to know: nothing arrives, which is
+ * indistinguishable from a key still being held.
+ *
+ * So the disappearance is itself the event. A `panic` is delivered *as if it
+ * came from that device*, down the same listener path every other event from it
+ * takes, so it reaches exactly the blocks that were listening to it and nothing
+ * else — a second controller holding a pad is not silenced because the first
+ * one was unplugged.
+ */
 function rescan(): void {
   if (!access) return;
+  const before = midiDeviceNames;
   midiDeviceNames = [];
   access.inputs.forEach((input) => {
     midiDeviceNames.push(input.name || input.id);
     input.onmidimessage = (e) => handleMessage(input.name || input.id, e);
   });
+  for (const gone of before) {
+    if (midiDeviceNames.includes(gone)) continue;
+    for (const fn of listeners) fn(PANIC, gone);
+  }
 }
 
 export let midiOutNames: string[] = [];

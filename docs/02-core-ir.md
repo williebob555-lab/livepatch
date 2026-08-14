@@ -1,6 +1,6 @@
 # 02 — Core IR: Types, Registry, Compiler, Signal Model
 
-_Last verified: 2026-07-31. Files: `src/core/types.ts`, `src/core/registry.ts`,
+_Last verified: 2026-08-12. Files: `src/core/types.ts`, `src/core/registry.ts`,
 `src/core/compile.ts`._
 
 This is the heart of the app. Everything else is either producing this IR
@@ -110,6 +110,34 @@ def sets `needsRig`.
   (~60 µs a side, measured). The kernel's own filter rebuild is gated behind an
   integer hash so *that* does not follow the drag — see
   [`05-native-engine.md`](05-native-engine.md).
+
+### Bypass reaches the engines the same way (2026-08-12)
+
+`Block.bypass` is injected by `compileScene` as **`__bypass`** (`BYPASS_PARAM`),
+0 or 1, on **every** node. Same convention as `__rig`, for the same reason: the
+engines learn no new concept, `CompiledGraph` gains no new field, and the flag
+travels on the one contract that already exists.
+
+Three things about it are load-bearing.
+
+- **It is always emitted, including the 0.** Both engines' reconcile diffs walk
+  the *new* params (`for (const [k, v] of Object.entries(n.params))`), so a key
+  that *disappears* is never applied. Omit it when off and a node that was
+  bypassed, then un-bypassed, then recompiled for some unrelated reason comes
+  back still bypassed, with a document that says it isn't. One number per node
+  removes the whole class.
+- **Toggling it is a `'param'` change, never `'structure'`.** A bypass that
+  recompiled would tear down and rebuild every kernel it touched — which on a
+  `vst` node means reloading the plugin. The single most-used A/B in the app
+  would become the slowest thing in it.
+- **The executor owns it; no kernel sees it.** `GraphExec.setParam` and the
+  reconcile loop both intercept it. No def declares it, and handing an unknown
+  param to all 104 kernels to be ignored is a contract nobody signed.
+
+What bypass *means* is defined in [`07-ui.md`](07-ui.md) (it is "as if the block
+were not there", latency included) and how the executor does it — the pairing,
+the ramp, the stale-buffer trap — is in
+[`05-native-engine.md`](05-native-engine.md).
 
 ## `types.ts` — the document + compiled IR
 

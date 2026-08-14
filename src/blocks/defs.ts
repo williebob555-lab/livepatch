@@ -165,7 +165,10 @@ registerBlock({
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [knob('amount', 'Amount', 0, 1, 0.7, { mark: 'spread' }), knob('size', 'Size', 0, 1, 0.5, { face: false })],
-  stubbed: true,
+  // NOT `stubbed` any more: there is a real Web Audio unit for this one now
+  // (`src/blocks/units.ts`), built from the same allpass lengths as the kernel.
+  // The badge means "this block does nothing on the web engine", so leaving it
+  // on would be the same lie in the opposite direction.
   style: { shape: 'chamfer', fill: '#2f2c3b', stroke: '#9a7fe0' },
 });
 

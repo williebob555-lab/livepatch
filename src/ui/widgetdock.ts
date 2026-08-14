@@ -245,10 +245,23 @@ function build(body: HTMLElement): DockTabHandle {
     // in, so all the layout math stays zoom-free. The BACKING STORE still has
     // to be dpr × zoom, or the bitmap is upscaled and everything goes soft
     // (fitCanvasBacking, docs/07-ui.md).
-    const availW = Math.max(80, scroller.clientWidth);
-    const availH = Math.max(60, scroller.clientHeight);
-    const cssW = Math.max(availW, Math.ceil(needW + 24));
-    const cssH = Math.max(availH, Math.ceil(needH + 24));
+    const availW = Math.max(1, scroller.clientWidth);
+    const availH = Math.max(1, scroller.clientHeight);
+    // **The canvas may only outgrow the pane when there is CONTENT out there to
+    // scroll to.** This used to take a hard 80×60 floor, and on a slim dock
+    // that floor is bigger than the pane itself — so the canvas overflowed,
+    // `overflow: auto` put a scrollbar up, the scrollbar took its width back
+    // off `clientWidth`/`clientHeight`, and the NEXT frame sized the canvas
+    // from the smaller number and took it away again. `resizeCanvas` runs once
+    // per frame, so that is a loop that never settles, and the empty-state
+    // hint is centred on `vw / 2` — which is exactly the number oscillating.
+    // Reported as the text shaking when the dock is slim.
+    //
+    // Driving the size from `needW`/`needH` when there IS content is stable for
+    // the same reason: the scrollbar changes `avail*`, which no longer feeds
+    // back into the size the canvas asks for.
+    const cssW = needW ? Math.max(availW, Math.ceil(needW + 24)) : availW;
+    const cssH = needH ? Math.max(availH, Math.ceil(needH + 24)) : availH;
     return fitCanvasBacking(canvas, cssW, cssH);
   };
 

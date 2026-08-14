@@ -26,7 +26,7 @@ import {
   setRollData,
 } from '../core/rolls';
 import { MenuItem, showContextMenu } from './menus';
-import { COARSE_SLOP, WheelIntent } from './input';
+import { COARSE_SLOP, StepPan, WheelIntent } from './input';
 
 type Vec = { x: number; y: number };
 
@@ -166,6 +166,31 @@ export class PianoRoll {
   /** Grab tolerance in px, widened for touch. */
   private slop(base: number): number {
     return this.touch ? base * TOUCH_SLOP : base;
+  }
+
+  /** Sub-row remainder of an incremental pitch pan. See `scrollPitch`. */
+  private pitchPan = new StepPan();
+
+  /**
+   * Scroll the pitch axis by a **fractional** number of rows, keeping what does
+   * not fit.
+   *
+   * `view.lo` is a whole note number — the grid is drawn from it row by row —
+   * so an incremental pan has to round, and rounding *without* keeping the
+   * remainder froze the axis outright: a trackpad's ~4 px per event is a
+   * quarter of a row, and a quarter of a row rounds to nothing every time.
+   * Time never had this because `t0` is a float, so a single diagonal gesture
+   * moved in x and stood still in y. `StepPan` in `input.ts` carries the
+   * remainder and the reasoning.
+   *
+   * Both signs are correct at their call sites: a wheel/scroll pan passes
+   * `-dy` (the viewport moves the way the fingers went) and a two-finger drag
+   * passes `+dy` (the note under the fingers stays under them) — the pitch axis
+   * is drawn inverted against screen y, so the two read backwards from each
+   * other. docs/14-input.md, "the sign of a pan".
+   */
+  scrollPitch(rows: number): void {
+    this.view.lo = this.pitchPan.step(this.view.lo, rows, 0, 127 - this.view.rows);
   }
 
   private markEdit(): void {
@@ -579,10 +604,11 @@ export class PianoRoll {
       // viewport-relative (scroll right → later beats), and the grab-drag in
       // `applyDrag` keeps the opposite sign on purpose, because there the note
       // under the finger has to stay under the finger.
-      this.view.lo = Math.max(
-        0,
-        Math.min(127 - this.view.rows, Math.round(this.view.lo - it.dy / this.rowH(h))),
-      );
+      //
+      // Through `scrollPitch` because `lo` is a whole note and a trackpad delta
+      // is a fraction of a row — rounding each event on its own threw the pan
+      // away entirely (see `scrollPitch`).
+      this.scrollPitch(-it.dy / this.rowH(h));
       return;
     }
     if (it.axis === 'x' || it.axis === 'both') {

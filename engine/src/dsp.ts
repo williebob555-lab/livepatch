@@ -2032,6 +2032,11 @@ registerKernel('note-space', (params) => {
       } else if (ev.type === 'off') {
         const i = held.lastIndexOf(ev.note);
         if (i >= 0) held.splice(i, 1);
+      } else if (ev.type === 'panic') {
+        // Position is sample-and-hold and stays put — a panic is about notes,
+        // and sweeping the source back to the origin would be a failsafe you
+        // could hear move.
+        held.length = 0;
       }
       // Pass through unchanged, offset intact (sub-quantum timing, docs/06).
       k.midiOut?.(ev, offset);
@@ -6681,6 +6686,16 @@ registerKernel('keyboard', (params) => {
         k.midiOut?.({ type: 'off', note: abs ?? rel + oct * 12, velocity: 0, channel: 0 });
       }
     },
+    // FAILSAFE: an on-screen key is held by a POINTER, and a pointer can be
+    // taken away mid-press (focus lost, touch cancelled) so the key-up never
+    // comes. The map is cleared as well as released, or the key would still
+    // read as down and its next press would emit nothing.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      for (const abs of held.values()) k.midiOut?.({ type: 'off', note: abs, velocity: 0, channel: 0 });
+      held.clear();
+      k.midiOut?.(ev);
+    },
     midiOut: null,
   };
   return k;
@@ -6715,6 +6730,14 @@ registerKernel('midi-trigger', (params) => {
           lastOn = -1;
         }
       }
+    },
+    // FAILSAFE: the CV gate that would have lifted this note can be unplugged
+    // while it is high, and then nothing is ever going to lift it.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (lastOn >= 0) k.midiOut?.({ type: 'off', note: lastOn, velocity: 0, channel: 0 });
+      lastOn = -1;
+      k.midiOut?.(ev);
     },
     midiOut: null,
   };
@@ -6761,6 +6784,11 @@ registerKernel('midi-cv', (params) => {
         if (i >= 0) held.splice(i, 1);
         if (held.length) cur.pitch = (held[held.length - 1] - 60) / 12;
         else cur.gate = 0; // pitch holds its last value (analog S&H style)
+      } else if (ev.type === 'panic') {
+        // A `gate` line stranded at 1 holds every envelope downstream open —
+        // a stuck note in CV. Pitch holds, as it does on a real release.
+        held.length = 0;
+        cur.gate = 0;
       } else if (ev.type === 'bend') cur.bend = ev.velocity;
       else if (ev.type === 'pressure' || ev.type === 'polyat') cur.press = ev.velocity;
       else if (ev.type === 'cc' && ev.note === ccnum) cur.cc = ev.velocity;
@@ -6802,6 +6830,18 @@ registerKernel('cv-midi', (params) => {
       if (id === 'velocity') vel = num(v, 0.9);
     },
     midiOut: null,
+    // FAILSAFE: its stuck case is a gate line that went away HIGH — `gateHi`
+    // then stays true forever, because the falling edge that clears it needs a
+    // cable that no longer exists. Cleared as well as released, or the next
+    // rise is not an edge and the block goes silent instead of stuck.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (gateHi && lastNote >= 0) k.midiOut?.({ type: 'off', note: lastNote, velocity: 0, channel: 0 });
+      gateHi = false;
+      prevG = 0;
+      lastNote = -1;
+      k.midiOut?.(ev);
+    },
     process: (ins, ctx) => {
       const gate = ins['gate']?.[0];
       const pitch = ins['pitch']?.[0];
@@ -7264,6 +7304,16 @@ registerKernel('arp', (params) => {
           cur = -1;
           gateLeft = 0;
         }
+      } else if (ev.type === 'panic') {
+        // The chord AND the note being arpeggiated off it: the pattern is
+        // regenerated from `held`, so a leftover would keep playing off a
+        // chord nobody is holding.
+        held.length = 0;
+        poolDirty = true;
+        if (cur >= 0) k.midiOut?.({ type: 'off', note: cur, velocity: 0, channel: 0 });
+        cur = -1;
+        gateLeft = 0;
+        k.midiOut?.(ev);
       }
     },
     process: (ins, ctx) => {
@@ -7332,6 +7382,12 @@ registerKernel('chord', (params) => {
         const notes = held.get(ev.note);
         held.delete(ev.note);
         if (notes) for (const n of notes) k.midiOut?.({ type: 'off', note: n, velocity: 0, channel: 0 }, offset);
+      } else if (ev.type === 'panic') {
+        // Every note of every chord it built, not just the keys that made them.
+        for (const notes of held.values())
+          for (const n of notes) k.midiOut?.({ type: 'off', note: n, velocity: 0, channel: 0 }, offset);
+        held.clear();
+        k.midiOut?.(ev, offset);
       } else k.midiOut?.(ev, offset); // pass bend/pressure/cc through
     },
   };
@@ -7374,6 +7430,12 @@ registerKernel('transpose', (params) => {
         const nn = held.get(ev.note);
         held.delete(ev.note);
         k.midiOut?.({ type: 'off', note: nn ?? map(ev.note), velocity: 0, channel: 0 }, offset);
+      } else if (ev.type === 'panic') {
+        // The TRANSPOSED notes: what went out has to come back off, and
+        // `semis` may well have moved since it did.
+        for (const nn of held.values()) k.midiOut?.({ type: 'off', note: nn, velocity: 0, channel: 0 }, offset);
+        held.clear();
+        k.midiOut?.(ev, offset);
       } else k.midiOut?.(ev, offset);
     },
   };
@@ -7400,6 +7462,16 @@ registerKernel('seq', (params) => {
       else if (id === 'rate') rate = num(v, 8);
       else if (id === 'length') length = Math.round(num(v, 8));
       else if (id === 'gate') gate = num(v, 0.5);
+    },
+    // FAILSAFE: a sequencer is a source, so only the user-reachable panic ever
+    // reaches it. It keeps running — panic means "let go", not "stop", and
+    // stopping is what the transport is for — but the step it is holding goes.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      if (cur >= 0) k.midiOut?.({ type: 'off', note: cur, velocity: 0, channel: 0 });
+      cur = -1;
+      gateLeft = 0;
+      k.midiOut?.(ev);
     },
     process: (ins, ctx) => {
       const clk = ins['clock']?.[0];
@@ -7486,6 +7558,16 @@ registerKernel('midi-echo', (params) => {
     },
     midiIn: (ev, offset) => {
       k.midiOut?.(ev, offset); // pass the live note straight through
+      if (ev.type === 'panic') {
+        // Kill the queue. A pending repeat is a note-on this kernel has
+        // PROMISED to make later, so a panic that only silenced the present
+        // would be followed by the echo it forgot to cancel.
+        for (const e of pool) {
+          if (e.active) k.midiOut?.({ type: 'off', note: e.note, velocity: 0, channel: 0 }, offset);
+          e.active = false;
+        }
+        return;
+      }
       if (ev.type !== 'on' || repeats < 1 || feedback <= 0) return;
       const e = pool.find((x) => !x.active);
       if (!e) return;
@@ -7527,19 +7609,40 @@ registerKernel('midi-echo', (params) => {
   return k;
 });
 
+/**
+ * FAILSAFE: what a hardware MIDI output must send to guarantee silence.
+ * Mirrors the web unit of the same name — see `src/blocks/units.ts` for why it
+ * is belt AND braces AND all sixteen channels.
+ *
+ * **This is the highest-stakes case in the failsafe**: the note left sounding
+ * is on somebody else's instrument, where nothing this app can do — including
+ * quitting — will reach it.
+ */
+function hardwarePanic(send: (bytes: number[]) => void): void {
+  for (let ch = 0; ch < 16; ch++) {
+    send([0xb0 | ch, 123, 0]); // All Notes Off
+    send([0xb0 | ch, 120, 0]); // All Sound Off
+    send([0xb0 | ch, 64, 0]); // sustain up — a held pedal outlives both
+    for (let n = 0; n < 128; n++) send([0x80 | ch, n, 0]);
+  }
+}
+
 registerKernel('midi-out', (params, sv) => {
   let device = str(params.device);
   let channel = Math.max(1, Math.round(num(params.channel, 1))) - 1;
   const send = (bytes: number[]): void => sv.sendMidi?.(device, bytes);
   return {
     out: () => null,
+    // Deleting the block cannot be how a note gets stranded on the instrument.
+    dispose: () => hardwarePanic(send),
     setParam: (id, v) => {
       if (id === 'device') device = str(v);
       else if (id === 'channel') channel = Math.max(1, Math.round(num(v, 1))) - 1;
     },
     midiIn: (ev) => {
       const ch = channel & 0x0f;
-      if (ev.type === 'on') send([0x90 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
+      if (ev.type === 'panic') hardwarePanic(send);
+      else if (ev.type === 'on') send([0x90 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
       else if (ev.type === 'off') send([0x80 | ch, ev.note & 0x7f, 0]);
       else if (ev.type === 'cc') send([0xb0 | ch, ev.note & 0x7f, Math.round(ev.velocity * 127) & 0x7f]);
       else if (ev.type === 'bend') {
@@ -7594,6 +7697,10 @@ registerKernel('synth', (params) => {
         voices.push({ note: ev.note, phase: 0, vel: ev.velocity, env: 0, stage: 'a', t: 0, delay: offset ?? 0 });
       } else if (ev.type === 'off') {
         for (const v of voices) if (v.note === ev.note && v.stage !== 'r') v.stage = 'r';
+      } else if (ev.type === 'panic') {
+        // FAILSAFE: every voice into release, rather than dropping them — a
+        // rescue that ends in a click on every voice at once is its own event.
+        for (const v of voices) v.stage = 'r';
       } else if (ev.type === 'bend') {
         bend = ev.velocity;
       }
@@ -8177,6 +8284,11 @@ registerKernel('sampler', (params, sv) => {
       } else if (ev.type === 'off') {
         // One-shots ignore note-off entirely — that is what makes them hits.
         for (const v of voices) if (v.note === ev.note && v.gated) v.stage = A_REL;
+      } else if (ev.type === 'panic') {
+        // FAILSAFE: **including the one-shots.** "Ignores note-off" and
+        // "cannot be stopped" are not the same promise, and a one-shot on a
+        // long looping take is exactly what a panic is reached for.
+        for (const v of voices) v.stage = A_REL;
       }
     },
     process: (_ins, ctx) => {
@@ -8978,6 +9090,13 @@ registerKernel('midi-recorder', (params, sv) => {
         const h = held.get(ev.note);
         if (h) taken.push({ n: ev.note, t: h.beat, d: Math.max(0.01, head - h.beat), v: h.v });
         held.delete(ev.note);
+      } else if (ev.type === 'panic') {
+        // FAILSAFE: land every open note where the panic found it. **Kept, not
+        // discarded** — what broke was the route, not the performance, and a
+        // recorder that binned a minute of playing because a cable came out
+        // would be a second, worse failure.
+        for (const [n, h] of held) taken.push({ n, t: h.beat, d: Math.max(0.01, head - h.beat), v: h.v });
+        held.clear();
       }
     },
     tapeOut: null,
@@ -9140,6 +9259,14 @@ registerKernel('midi-player', (params) => {
       }
     },
     visualTransport: () => ({ pos: beats > 0 ? pos / beats : -1, state: playing ? 1 : 0 }),
+    // FAILSAFE: a player is a source, so only the user-reachable panic reaches
+    // it. It keeps playing; `allOff` also clears `sounding`, without which the
+    // scheduler's own note-offs would be for notes it no longer thinks it has.
+    midiIn: (ev) => {
+      if (ev.type !== 'panic') return;
+      allOff();
+      k.midiOut?.(ev);
+    },
   };
   function allOff(): void {
     for (const n of sounding.keys()) k.midiOut?.({ type: 'off', note: n, velocity: 0, channel: 1 });

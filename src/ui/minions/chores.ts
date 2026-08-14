@@ -206,12 +206,33 @@ export function scanChores(
      * anything.
      */
     heldWireId?: string | null;
+    /**
+     * Blocks that are in somebody's gripper right now.
+     *
+     * **A block being carried is not a block that is lying somewhere**, and the
+     * document cannot tell the difference: a held block's `pos` genuinely IS
+     * the gripper's position, which is the whole design (`payload.ts`) and is
+     * what lets the rest of the app stay ignorant of carrying. The cost lands
+     * exactly here. A carried block flies across the patch, so it sweeps over
+     * every other block on the way — and each frame of that is a fresh
+     * `overlap` chore reading "X is on top of Y". Gus takes one, walks to it,
+     * and by the time he arrives the block has moved on; the drone hands one
+     * over and he immediately tries to crane it out of the way of whatever it
+     * was set down beside. It is the same class as `heldWireId`: a thing in
+     * transit is not a thing out of place.
+     *
+     * Held blocks are excluded as *either* party to an overlap, and as the
+     * target of any other job — nobody should be reaching for a knob on a block
+     * that is currently flying.
+     */
+    heldBlockIds?: readonly string[];
   },
 ): Chore[] {
   const patience = opts.patienceS ?? 0;
   const g: Graph = doc.graph;
   const out: Chore[] = [];
-  const skip = (id: string): boolean => opts.leaveSelected && id === opts.selectedId;
+  const held = new Set(opts.heldBlockIds ?? []);
+  const skip = (id: string): boolean => held.has(id) || (opts.leaveSelected && id === opts.selectedId);
 
   // ---- clip / hot, per net, from live levels ----
   const seen = new Set<string>();
@@ -314,7 +335,11 @@ export function scanChores(
   }
 
   // ---- overlap: two visible blocks whose boxes intersect meaningfully ----
-  const blocks = g.blocks.filter((b) => b.style.wireLayer !== 'behind');
+  // A block in a gripper is out of this entirely — not just as the one that
+  // would be moved (`skip` covers that) but as the thing being overlapped, or
+  // the drone would have Gus shuffling the whole patch out from under its own
+  // cargo as it flew over.
+  const blocks = g.blocks.filter((b) => b.style.wireLayer !== 'behind' && !held.has(b.id));
   for (let i = 0; i < blocks.length; i++)
     for (let j = i + 1; j < blocks.length; j++) {
       const A = blocks[i];

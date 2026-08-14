@@ -2,7 +2,8 @@
 // Canvas face widgets: knobs, faders, XY pads, toggles, selects, buttons.
 // Pure painting + value math; pointer behavior lives in editor.ts.
 // ============================================================================
-import { ParamSpec } from '../core/registry';
+import { ParamSpec, WidgetKind } from '../core/registry';
+import type { ViralLook } from '../core/virus';
 import { ControlStyle, ParamValue, Theme } from '../core/types';
 import { setFont, uiFont } from './canvastext';
 import { drawPanelGlyph } from './glyphs';
@@ -726,6 +727,68 @@ export function drawSampleView(
 }
 
 /**
+ * The knob's drawn circle inside its box.
+ *
+ * **A knob is not centred in its item.** The box reserves a strip underneath
+ * for the label and value, so the dial sits high in it — and anything drawn at
+ * the box's centre lands low and, on a short item, mostly outside the dial.
+ * Shared with `widgetMarkShape` below so an overlay ringing a knob cannot
+ * drift from the knob it is ringing. (This *was* the bug: the modulation drop
+ * target was a fixed 15 px circle at the item's centre, which on every knob
+ * was both the wrong place and the wrong size.)
+ */
+function knobGeom(r: Rect): { cx: number; cy: number; kr: number } {
+  const kr = Math.min(r.w, r.h - 24) / 2 - 2;
+  return { cx: r.x + r.w / 2, cy: r.y + kr + 4, kr };
+}
+
+/** An outline that traces a widget, for overlays that mark one. */
+export type MarkShape =
+  | { kind: 'circle'; cx: number; cy: number; r: number }
+  | { kind: 'rect'; x: number; y: number; w: number; h: number; r: number };
+
+/** Breathing room between a widget and the outline drawn around it. */
+const MARK_PAD = 5;
+
+/**
+ * The outline of a widget's **drawn control**, in the same space as `r`.
+ *
+ * Takes the *effective* widget kind (post `controlOf`), because a param shown
+ * as a fader and a param shown as a knob occupy completely different parts of
+ * the same box — an overlay keyed off the spec's default kind marks the wrong
+ * shape the moment a control is swapped in Appearance.
+ *
+ * Each case mirrors the geometry its painter below uses, and only the cases
+ * that actually differ are spelled out: a knob is a circle high in its box, a
+ * fader is its track plus the handle's overhang, and everything else fills the
+ * box it was given.
+ */
+export function widgetMarkShape(r: Rect, widget: WidgetKind): MarkShape {
+  if (widget === 'knob') {
+    const k = knobGeom(r);
+    return { kind: 'circle', cx: k.cx, cy: k.cy, r: k.kr + MARK_PAD };
+  }
+  if (widget === 'fader') {
+    // Track: `top = r.y + 6`, `trackH = r.h - 26` (label under it). Half-width
+    // 11 is the widest thing on it — the CV mark bar.
+    const cx = r.x + r.w / 2;
+    return { kind: 'rect', x: cx - 11 - MARK_PAD, y: r.y + 6 - MARK_PAD, w: 22 + MARK_PAD * 2, h: r.h - 26 + MARK_PAD * 2, r: 6 };
+  }
+  if (widget === 'hfader') {
+    const cy = r.y + r.h / 2;
+    return { kind: 'rect', x: r.x + 4 - MARK_PAD, y: cy - 11 - MARK_PAD, w: r.w - 8 + MARK_PAD * 2, h: 22 + MARK_PAD * 2, r: 6 };
+  }
+  return { kind: 'rect', x: r.x - 2, y: r.y - 2, w: r.w + 4, h: r.h + 4, r: 5 };
+}
+
+/** Trace a `MarkShape` into the current path. */
+export function traceMarkShape(g: CanvasRenderingContext2D, s: MarkShape): void {
+  g.beginPath();
+  if (s.kind === 'circle') g.arc(s.cx, s.cy, s.r, 0, Math.PI * 2);
+  else (g as unknown as { roundRect(x: number, y: number, w: number, h: number, r: number): void }).roundRect(s.x, s.y, s.w, s.h, s.r);
+}
+
+/**
  * Paint one widget; `v2` carries the Y value for XY pads. `mod` is the live
  * post-CV value (and `mod2` its Y counterpart) — drawn as a purple marker so
  * the actual applied value is visible on top of the knob/fader base position.
@@ -742,14 +805,82 @@ export function paintWidget(
   mod2?: number | null,
   variant?: string,
   cs?: ControlStyle,
-  modSrc?: 'cv' | 'midi' | null,
+  modSrc?: 'cv' | 'midi' | 'virus' | null,
   /** `xy` only: the Y axis's effective spec, so the pad can draw where Y = 0
    *  falls. `v2` stays normalized — this is the range behind it. */
   ySpec?: ParamSpec,
+  /**
+   * Overrides the indicator colour. Used by the virus, whose shade is per
+   * *strain* rather than per source — hue is the lineage, saturation the
+   * generation — so it cannot come from the theme like the other two.
+   */
+  /** Everything the virus needs drawn, derived from the strain's genome. */
+  look?: ViralLook | null,
 ): void {
-  const accent = cs?.color || theme.selectionColor;
-  // Live marker color follows the binding source (Appearance → Indicators).
-  const cvCol = modSrc === 'midi' ? theme.midiIndicatorColor : theme.cvIndicatorColor;
+  const viral = modSrc === 'virus' && !!look;
+  const vh = Math.max(0, Math.min(1, look?.health ?? 0));
+  /**
+   * **The widget's own colour DRAINS as the infection establishes.**
+   *
+   * A dashed marker in a different colour reads as one more CV indicator —
+   * annotation, not disease. What makes it read as an infection is that the
+   * control is visibly being taken over: its healthy accent bleeds out toward a
+   * dead grey while the strain's shade takes the readings. Done here, on the
+   * one `accent` every knob variant and every other widget already draws from,
+   * so the takeover reaches all of them from one place (golden rule 8).
+   */
+  const drain = (col: string): string => {
+    if (!viral || col[0] !== '#' || col.length < 7) return col;
+    const r0 = parseInt(col.slice(1, 3), 16);
+    const g0 = parseInt(col.slice(3, 5), 16);
+    const b0 = parseInt(col.slice(5, 7), 16);
+    const grey = r0 * 0.3 + g0 * 0.59 + b0 * 0.11;
+    const t = vh * 0.8;
+    const m = (c: number): number => Math.round(c + (grey * 0.55 - c) * t);
+    return `rgb(${m(r0)},${m(g0)},${m(b0)})`;
+  };
+  const accent = drain(cs?.color || theme.selectionColor);
+  // Live marker color follows the binding source (Appearance → Indicators),
+  // unless a caller supplies its own (the virus's per-strain shade).
+  const cvCol = look?.color || (modSrc === 'midi' ? theme.midiIndicatorColor : theme.cvIndicatorColor);
+  /** Deterministic per-widget noise, so the pox does not crawl every frame. */
+  const nz = (i: number): number => {
+    let h = 2166136261 ^ i;
+    for (let k = 0; k < spec.id.length; k++) {
+      h ^= spec.id.charCodeAt(k);
+      h = Math.imul(h, 16777619);
+    }
+    return ((h >>> 0) % 9973) / 9973;
+  };
+  /**
+   * A viral marker is drawn BROKEN and a patched one solid.
+   *
+   * This is the distinction that has to survive, and colour cannot carry it:
+   * the whole point of the feature is a widget that moves with **no cable on
+   * it**, and a user who reads a solid marker will go looking for the wire.
+   * The dash is applied around the marker strokes only, and cleared after —
+   * a stray `setLineDash` leaks into every path drawn afterwards on the shared
+   * context, which shows up as dotted block outlines three widgets away.
+   */
+  // Uneven on purpose. A regular dash reads as a dashed line — a deliberate
+  // graphic convention — where an irregular break reads as something eaten.
+  const markDash = (on: boolean): void => g.setLineDash(on && viral && look ? look.dash : []);
+  /** The fader/slider markers are fills, and a dash pattern does not apply to
+   *  a fill — so the same "broken" reading is cut into the bar itself. */
+  const markBar = (x: number, y: number, w: number, h: number): void => {
+    if (!viral) {
+      g.fillRect(x, y, w, h);
+      return;
+    }
+    const along = h >= w;
+    const n = 3;
+    const len = (along ? h : w) / n;
+    for (let i = 0; i < n; i++) {
+      const o = i * len;
+      if (along) g.fillRect(x, y + o, w, len * 0.6);
+      else g.fillRect(x + o, y, len * 0.6, h);
+    }
+  };
   const dim = theme.portLabelColor;
   const text = theme.blockText;
   const label = cs?.label || spec.name;
@@ -759,9 +890,7 @@ export function paintWidget(
   g.textBaseline = 'middle';
 
   if (spec.widget === 'knob') {
-    const kr = Math.min(r.w, r.h - 24) / 2 - 2;
-    const cx = r.x + r.w / 2;
-    const cy = r.y + kr + 4;
+    const { cx, cy, kr } = knobGeom(r);
     const n = val2norm(spec, typeof value === 'number' ? value : 0);
     const a0 = Math.PI * 0.75;
     const a1 = Math.PI * 2.25;
@@ -824,16 +953,83 @@ export function paintWidget(
       g.lineTo(cx + Math.cos(ang) * (kr - 2), cy + Math.sin(ang) * (kr - 2));
       g.stroke();
     }
+    if (viral && look) {
+      // ── The strain's own motion, wrapped round the rim ──────────────────
+      // The single thing that stops an infected knob being "a knob with a
+      // different coloured marker": you can SEE the shape that has taken it —
+      // a slow swell, a stepped stutter, a hard ramp — and two genomes look
+      // nothing alike because their motion is nothing alike.
+      const t = look.trace;
+      if (t.length > 2) {
+        g.strokeStyle = look.dim;
+        g.lineWidth = 1.4;
+        g.beginPath();
+        for (let i = 0; i < t.length; i++) {
+          const f = i / (t.length - 1);
+          const ta = a0 + (a1 - a0) * f;
+          const tr = kr + look.ringGap + 2.5 + t[i] * 3.4;
+          const px = cx + Math.cos(ta) * tr;
+          const py = cy + Math.sin(ta) * tr;
+          i ? g.lineTo(px, py) : g.moveTo(px, py);
+        }
+        g.stroke();
+      }
+      // ── Generation marks ────────────────────────────────────────────────
+      // One tick per mutation between here and the founder, so how far a
+      // lineage has travelled is countable rather than merely a paler colour.
+      if (look.ticks > 0) {
+        g.strokeStyle = look.dim;
+        g.lineWidth = 1;
+        for (let i = 0; i < Math.min(9, look.ticks); i++) {
+          const ta = a0 - 0.22 - i * 0.16;
+          g.beginPath();
+          g.moveTo(cx + Math.cos(ta) * (kr + 1), cy + Math.sin(ta) * (kr + 1));
+          g.lineTo(cx + Math.cos(ta) * (kr + 4.5), cy + Math.sin(ta) * (kr + 4.5));
+          g.stroke();
+        }
+      }
+      // ── Pox ─────────────────────────────────────────────────────────────
+      // Count from depth and health, clustering from how much drift is in the
+      // mix, and the whole field turns at the strain's own rate. Placed from a
+      // hash rather than at random so they orbit rather than boil — a speckle
+      // field reseeded every frame reads as television snow, not as a growth.
+      g.fillStyle = cvCol;
+      for (let i = 0; i < look.pox; i++) {
+        const even = nz(i) * Math.PI * 2;
+        const clumped = (Math.floor(nz(i) * 3) / 3) * Math.PI * 2 + nz(i + 61) * 0.7;
+        const pa = even + (clumped - even) * look.cluster + look.spin;
+        const pr = kr + look.ringGap + nz(i + 97) * 5;
+        g.beginPath();
+        g.arc(cx + Math.cos(pa) * pr, cy + Math.sin(pa) * pr, 0.7 + nz(i + 233) * 1.3, 0, Math.PI * 2);
+        g.fill();
+      }
+    }
     if (mod != null) {
       // Purple needle + outer tick at the actual (post-CV) value — all variants.
       const mn = val2norm(spec, mod);
       const ma = a0 + (a1 - a0) * Math.max(0, Math.min(1, mn));
+      // An infected knob also carries a broken arc from its base value out to
+      // where the strain has dragged it, so the SIZE of the modulation reads at
+      // a glance and not just its current position. It is the one thing a
+      // still frame of a moving knob cannot otherwise show.
+      if (viral) {
+        const ba = a0 + (a1 - a0) * Math.max(0, Math.min(1, n));
+        g.strokeStyle = cvCol;
+        g.lineWidth = 2;
+        markDash(true);
+        g.beginPath();
+        g.arc(cx, cy, kr + 3, Math.min(ba, ma), Math.max(ba, ma));
+        g.stroke();
+        markDash(false);
+      }
       g.strokeStyle = cvCol;
       g.lineWidth = 2;
+      markDash(true);
       g.beginPath();
       g.moveTo(cx + Math.cos(ma) * kr * 0.45, cy + Math.sin(ma) * kr * 0.45);
       g.lineTo(cx + Math.cos(ma) * (kr + 3), cy + Math.sin(ma) * (kr + 3));
       g.stroke();
+      markDash(false);
     }
     if (showLabel) {
       g.fillStyle = dim;
@@ -884,7 +1080,7 @@ export function paintWidget(
       }
       if (mn != null) {
         g.fillStyle = cvCol;
-        g.fillRect(x0 + trackW * mn - 1.5, cy - 11, 3, 22);
+        markBar(x0 + trackW * mn - 1.5, cy - 11, 3, 22);
       }
     } else {
       const cx = r.x + r.w / 2;
@@ -917,7 +1113,7 @@ export function paintWidget(
       }
       if (mn != null) {
         g.fillStyle = cvCol;
-        g.fillRect(cx - 11, top + trackH * (1 - mn) - 1.5, 22, 3);
+        markBar(cx - 11, top + trackH * (1 - mn) - 1.5, 22, 3);
       }
       if (showLabel) {
         g.fillStyle = dim;
@@ -974,9 +1170,11 @@ export function paintWidget(
       const my = r.y + (1 - clamp01(mod2 ?? ny)) * r.h;
       g.strokeStyle = cvCol;
       g.lineWidth = 2;
+      markDash(true);
       g.beginPath();
       g.arc(mx, my, 6, 0, Math.PI * 2);
       g.stroke();
+      markDash(false);
     }
     return;
   }

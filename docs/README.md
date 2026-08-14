@@ -174,6 +174,36 @@ avoid stepping on the invariants that keep it fast and correct.
     questions, which is why the Roll was uncontrollable and the dock splitters
     ignored touch. [`14-input.md`](14-input.md) is **normative** — read it
     before writing a `pointerdown` handler.
+    Two further rules, both from 2026-08-12, because both produce a control that
+    fights the user rather than one that looks broken: **a wheel gesture is
+    classified once and never changes device mid-stroke** — silence is not
+    evidence of a mouse, and the old 600 ms expiry meant a long fast flick
+    started zooming halfway through itself — and **an incremental pan onto an
+    integer axis goes through `StepPan`**, because a trackpad's 4 px against a
+    16 px row rounds to nothing on every event, which is a *dead axis*, not a
+    rounding error. It was reported as "one axis is locked until you stop".
+
+19. **Nothing may be left sounding with no way to stop it.** A note-on is a
+    promise that a note-off is coming, and the patch is free to break that
+    promise: pull the cable between a keyboard and a synth while a key is down
+    and the note-off has nowhere to go — the thing that would have released it
+    is the connection you just removed. Unplugging the controller, deleting the
+    source block and swapping the graph do the same. It is the only failure in
+    the app with **no recovery from inside the app**, and on a hosted VST or a
+    hardware `midi-out` the stranded note is not even ours to reach.
+    So `MidiEvent` has a `panic` type, and it arrives three ways: both engines
+    **diff their MIDI sinks across every graph swap** and panic the ones whose
+    feed stopped existing (a diff, never a blanket panic — you must be able to
+    edit a patch while holding a chord); a device that disappears panics the
+    blocks that were listening to it; and **Escape** panics everything, because
+    the moment you need it you are not going to look up a shortcut. Every unit
+    and kernel that holds note state handles it, forwards it if it has a MIDI
+    out, and clears the state that tracks the note as well as releasing it —
+    `scripts/midi-panic-test.mjs` fails the build on one that does not.
+    This is the same bug as the CV half beside it in both engines' `applyGraph`
+    (a gate left high by a pulled CV cable), which was fixed years earlier; the
+    MIDI half was never noticed missing, because a stuck knob looks wrong and a
+    stuck note only *sounds* wrong.
 
 ## Document index
 
@@ -196,6 +226,7 @@ avoid stepping on the invariants that keep it fast and correct.
 | 14 | [`14-dynamic-blocks.md`](14-dynamic-blocks.md) | The "alive" blocks — visual rules, per-block specs, and what building all seven taught. **Read before drawing any block face.** |
 | 15 | [`15-minions.md`](15-minions.md) | Characters that live in the patch: the pixel-art rules, the planted-foot walk, and the IK branch that cost 17 units. **Read before touching `src/ui/minions/`.** |
 | 14 | [`14-input.md`](14-input.md) | **Touch / trackpad / mouse / pen — the input standard (normative)** |
+| 16 | [`16-virus.md`](16-virus.md) | Modulation that spreads downstream through the patch: habitat, strains, the fitness function that was wrong twice, and the broken-ring indicator |
 
 ## Keeping this current
 

@@ -1,6 +1,6 @@
 # 15 — Minions: characters that live in the patch
 
-_Last verified: 2026-08-10._
+_Last verified: 2026-08-13._
 
 > **Read §0 before changing anything drawn.** Almost every visual defect in this
 > folder has turned out to be one bug wearing different hats.
@@ -629,6 +629,27 @@ The gestures are symmetrical and there are only three:
 Clicking to take was considered and rejected: it would have to teleport the
 thing to your cursor, and nothing in this folder is allowed to teleport.
 
+> **A port under the pointer outranks a minion standing over it** (fixed
+> 2026-08-13). The wire-end drop checked `minionBodyAt` *before* `portAt`, on
+> the reasoning that a minion hovering over a socket would otherwise lose the
+> gesture to it. That reads well and is wrong in the hand, because the two
+> targets are not the same size: a port is a `portRadius + 8` disc you have to
+> actually hit, and `minionBodyAt` is a **48-unit radius** round the middle of
+> the figure — a soft catchment more than three times wider. A robot merely
+> walking past a socket ate every cable aimed at it.
+>
+> The drag preview had been saying so all along: `overlay.hoverPort` lights
+> whenever a connectable port is under the pointer, and every other preview
+> (modulate, latch, bundle) is suppressed while it is. So the port lit up, you
+> let go, and the cable went into a gripper — the drop contradicting the promise
+> the hover had just made.
+>
+> **Aim beats proximity.** Hit the port and you meant the port; miss it and the
+> robot standing right there is exactly what you meant instead. The block drop
+> keeps the old order deliberately: its rival is a *splice*, whose target is the
+> block's whole overlap with a cable — far vaguer than a 48-unit disc round the
+> pointer — so there the minion is the precise gesture.
+
 ### Station-keeping is one calculation, used twice
 
 A cone projected forward from the pointer along its own velocity, its length and
@@ -662,6 +683,59 @@ the two rules genuinely want opposite things.
 
 The jaws also open a crack as you approach, which is the only warning that it is
 about to let go and the only invitation you need that it will.
+
+### The same contradiction, in the other direction — and the last rule wins
+
+The rule above was written for *taking* and it was stated as "when it is
+**carrying** something". Giving is the mirror image and it broke in exactly the
+same way: hands full, the machine still held station 230 units off the pointer
+and still ran the keep-out corridor, so it backed away as fast as you walked at
+it. Reported as **"a game of cat and mouse while trying to give something to the
+drone"**. So the contract is not about its load, it is about yours:
+
+> **While you are carrying something, or reaching for what it carries, it never
+> increases its distance from you.** It holds still, or it comes to meet you.
+> Never away.
+
+Two traps, and the second one is the general lesson:
+
+- **The freeze has to be decided AFTER the offer, not before.** Freezing first
+  meant the offer was never evaluated while your hands were full, so it could
+  only ever hold still — it would never come to meet you.
+- **A rule enforced early is undone by any later rule in the same chain.** The
+  freeze is at the top of the target chain; `FERRY_KEEPOUT` — *"nothing may come
+  closer than this, ever"* — is at the bottom, after the mode branch, the
+  colleague dodge and before the viewport clamp. The moment an offer started
+  closing, that clamp shoved the target back out to 110 units, so a slow,
+  deliberate hand-over converged on an invisible wall 110 units short and the
+  drop never landed. **The fast lunge worked and the careful approach did not**,
+  which is a horrible failure to diagnose by eye, because the gesture that fails
+  is the one a person actually makes. Hands full now uses `HANDOVER_R` instead,
+  and the two are measured from different points on purpose: personal space is
+  about the point it hovers over, a hand-over is about the aircraft you are
+  aiming at, which is `0.6 × height` further up — and is decided by
+  `minionBodyAt`, so the closing distance is measured where that measures.
+
+Whenever you add a rule to a target chain, ask which earlier rule it silently
+outranks. Three separate reports have now been this one contradiction wearing a
+different hat.
+
+**Meeting you halfway is optional; not backing away is not.** Gating both on the
+`offer` switch was a footgun — that switch reads *"it waits to be handed things
+rather than reaching for them"*, and off it would have gone back to keeping
+station and dodging, so "waits to be handed things" would have described a
+machine you cannot hand anything to. The switch turns off `offering` alone.
+
+**And a press on the machine must not edit the patch behind it.** The snatch
+arms on the press and fires on the first movement, and the press was left to
+fall through to the ordinary hit order on the reasoning that "there is nothing
+under your cursor to pick up". That is only true of an empty canvas: a follower
+flies over your patch, so what is under it is usually somebody's block. Measured
+on the stock scene, a press on its midriff started a widget drag on the block
+below and one on the point it hovers over **unplugged a cable**, because the
+port branch of `pointerDown` detaches on the press itself. A press on the *body*
+returns; a press on the *payload* still falls through, because there the thing
+under your cursor genuinely is what you are reaching for.
 
 ### Three things that read as "janky", none of them the chase
 
@@ -779,8 +853,21 @@ graph.
 When you change level:
 
 - **A follower follows**, through a rift. That is what it is for.
-- **Everybody else stays.** Gus's jobs are in the graph he is standing in, and a
-  subpatch is a different graph. He is where you left him when you come back.
+- **A walker RELOCATES** (`Agent.relocate`, changed 2026-08-13). Gus used to
+  stay behind, on the reasoning that his jobs are in the graph he is standing
+  in. That reasoning is sound and the conclusion was not: a subpatch is a real
+  graph with real mess in it, so a hire who is simply *absent* down there means
+  a whole half of the app has no tidying and no way to ask for any. Reported as
+  *"gus isn't appearing in subblocks"*, which is what it looks like from
+  outside.
+
+  > **Un-placed, not moved.** A surface id belongs to one graph, so carrying
+  > `surfId`/`t` across leaves him standing on a block that does not exist where
+  > he now is. `placed` is defined as "has a surface yet", so clearing it puts
+  > him in exactly the state a freshly-hired minion is in and the layer's
+  > existing per-frame placement pass gives him a perch **and an arrival** for
+  > free. Whatever he was part-way through is abandoned, because the job, the
+  > work mark and the block it is about all belong to the graph he has left.
 - **A cable cannot come through**, because a wire belongs to one graph and there
   is no such thing as one spanning two. Holding a cable end, the machine stays
   behind, still holding it, and says so when you return — the only moment you
@@ -790,6 +877,65 @@ When you change level:
   is otherwise cut-and-paste with its wiring lost. Its own cables are cut on the
   way through — they cannot follow it anywhere — so it is one undo entry and it
   is announced rather than done quietly.
+
+### Arriving is an entrance, not an appearance (`Agent.spawnVia`, 2026-08-13)
+
+A rift is how the *machine* arrives. A man does not tear a hole in space, so
+relocating Gus needed an arrival of his own, and it needed to be one you would
+believe: a character who is simply *standing there* on the frame after you enter
+a subpatch reads as a redraw glitch, not as somebody who came in.
+
+**He uses the two ways in he already has.** `findHatch` — the same search that
+decides which service panel he opens to reach a knob — is run against the block
+he is landing on, **with the whole width of the roof as the target**:
+
+| the block he lands on | how he arrives |
+|---|---|
+| has room for a panel | **up through it**, `climb`, pushing the lid open from underneath, the panel swinging shut behind him |
+| too crowded, or he lands on a cable | **lowered in on the gondola**, `ride` — the existing hire arrival |
+
+Nothing new is drawn. `drawHatch` and `drawHatchShade` already exist for the
+work case, and the shade being painted **over** him is what makes the half of
+him still in the hole genuinely in it.
+
+Three things were wrong in the first build of this, and all three had to go —
+reported together as *"he seems to just appear and then rise on the right side
+of the block, no matter where the hatch is"*:
+
+- **He came up wherever the PERCH was.** `nearestPerch` (nearest to the view
+  centre) and `findHatch` (largest empty rectangle) are unrelated searches, so
+  the lid opened in one place and he rose through the roof in another. `t` is
+  now set from the panel's centre with `topTForX`. Measured on a 420-wide
+  block: hatch centre 210, his x 210 on every frame of the climb.
+- **`side === 'top'` does not mean "at the roof".** The side is decided from
+  where the empty *rectangle* starts, and the trimmed panel is then centred
+  inside it — so a `side: 'top'` panel came back drawn at **y+94.5** on a
+  220-tall block, halfway down the face. Passing the roof as the target windows
+  the search to the top `REACH` band and clamps the panel against it, which
+  makes "at the roof" true by construction instead of a test applied after.
+- **Nothing was hiding him.** This is the one worth remembering: the minion
+  layer draws **on top of the blocks**, so being "inside the block" occludes
+  nothing, and `drawHatchShade` is a shadow painted *within* the panel rect for
+  an arm reaching in — not a mask that could hide a body. He was a whole figure
+  standing below the block sliding up across its face. `AgentPose.emerging` now
+  makes `drawAgent` clip him to the opening. Measured mid-climb with his feet
+  at y 74.8: nothing painted below the lip at y 30 except the panel's own edge
+  at y 32.
+
+And three details that would each break it:
+
+- **`climb`, not `ride`.** `ride` is standing on a platform holding a rail;
+  climbing out of a floor is his own arms on the coaming. Getting those the
+  wrong way round is the whole difference between arriving and being delivered.
+- **The gondola prop is drawn only when he is on it.** A man climbing out of a
+  hatch with a window cart painted round him is two arrivals at once.
+- **`spawnFrom` runs the other way.** One number carries both: the gondola
+  lowers him from 220 above the perch, the hatch raises him from just under the
+  lip — **measured off the opening**, not guessed from his height, or he starts
+  with his head already clear of the hole. The panel then takes `SPAWN_SHUT` to
+  close, because clearing the hatch the instant he lands makes the lid *vanish*
+  rather than shut — and a hatch left set for ever is one the pose keeps drawing
+  on the next block he works on.
 
 ### A hole opens, it does not switch on
 

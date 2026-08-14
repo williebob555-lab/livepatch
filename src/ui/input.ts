@@ -156,43 +156,199 @@ export function release(el: Element, pointerId: number): void {
  * holding. Every surface used to keep its own copy of this heuristic and they
  * disagreed at the edges.
  *
- * Evidence, in order of strength:
- * - `deltaMode !== 0` (lines/pages) is a **mouse**, definitively. Trackpads
- *   always report pixels. This is the only negative signal, and it is trusted
- *   immediately.
- * - A non-zero `deltaX` is a trackpad. Mice with a tilt wheel exist but emit it
- *   in discrete notches, which the magnitude test below filters.
- * - A fractional `deltaY` is a trackpad; wheel notches are whole numbers.
- * - Many small deltas in quick succession is a trackpad; a wheel notch is one
- *   big delta.
+ * ### The verdict never expires, and never changes mid-gesture
  *
- * The verdict is sticky for `TRACKPAD_HOLD` because mid-gesture frames land on
- * round numbers all the time, and flipping to "mouse" for one frame in the
- * middle of a two-finger pan makes the view jump.
+ * Both halves of that sentence are bug fixes, and they are the same bug:
+ * *"the two-finger pan switches between zoom and pan every so often"* (reported
+ * 2026-08-12).
+ *
+ * The old version held a trackpad verdict for 600 ms and re-armed it only from
+ * *fresh* evidence — a fractional delta, a non-zero `deltaX`, or three small
+ * deltas in a row. A **fast** vertical scroll produces none of those: Windows
+ * precision touchpads report whole pixels, a vertical gesture carries no
+ * `deltaX` at all, and every delta in the fast stretch is well over the "small"
+ * threshold, which also *resets* the run counter. So a flick that stayed fast
+ * for longer than the hold ran out of evidence in the middle of itself and the
+ * surface started zooming under the user's fingers; the momentum tail then
+ * produced small deltas again and it flipped back to panning. The faster and
+ * longer the gesture, the more likely it was to break — which is why the Clip
+ * tab, where you flick across a whole file, was the worst of them.
+ *
+ * So:
+ *
+ * - **The device verdict persists** until something contradicts it. Silence is
+ *   not evidence of a mouse.
+ * - **A wheel gesture** — a contiguous run of events less than `GESTURE_GAP`
+ *   apart — is classified once, by its first event, and cannot be demoted while
+ *   it runs. Only a *definitive* signal (`deltaMode`, below) breaks that.
+ *   A gesture that changes its mind halfway is never what the user meant.
+ *
+ * ### What one event is worth
+ *
+ * | signal | verdict | why |
+ * |---|---|---|
+ * | `deltaMode !== 0` (lines/pages) | **mouse**, definitive | trackpads always report pixels |
+ * | non-zero `deltaX` | **trackpad** | a wheel has one axis to spare, a pad has two |
+ * | fractional `deltaY` | trackpad | a notch is a whole number of px |
+ * | `abs(deltaY) < NOTCH_MIN` | trackpad | a notch is a big discrete step; hi-res mice are the `forceZoom` case |
+ * | two equal whole notches, `STREAM_GAP` apart | mouse | a wheel repeats itself exactly and is never a dense stream |
+ * | anything else | *nothing* — keep the standing verdict | ambiguity must not flip a live gesture |
+ *
+ * That last row is the important one. The old code treated "no evidence" as
+ * evidence of a mouse; here it means what it says.
  */
-const TRACKPAD_HOLD = 600;
-let trackpadUntil = 0;
-let lastWheelAt = 0;
-let smallRun = 0;
+type Device = 'pad' | 'wheel';
+
+/** Silence, in ms, that ends one wheel gesture and begins the next. */
+const GESTURE_GAP = 250;
+/** Smallest `|deltaY|` a real wheel notch produces. Below this it is a pad. */
+const NOTCH_MIN = 40;
+/** Events closer together than this are a stream; no wheel notches that fast. */
+const STREAM_GAP = 40;
+
+/** The standing verdict. Starts at `wheel` so a mouse is right from event one. */
+let device: Device = 'wheel';
+/** The verdict frozen for the gesture in flight, or null between gestures. */
+let gestureDevice: Device | null = null;
+let lastWheelAt = -1e9;
+/** Consecutive identical whole-notch events — two of them are a mouse. */
+let notchRun = 0;
+let lastNotch = 0;
+
+interface WheelRow {
+  t: number;
+  dx: number;
+  dy: number;
+  mode: number;
+  mods: string;
+  device: Device;
+  gesture: Device;
+  /** Did this event begin a new gesture? */
+  fresh: boolean;
+}
+
+/**
+ * Optional capture of every wheel event and the verdict it produced.
+ *
+ * Off by default; driven through `wheelDiagnostics`, which is published as
+ * `__lp.wheel` (see `src/main.ts`).
+ */
+export const wheelLog: { on: boolean; rows: WheelRow[] } = { on: false, rows: [] };
+
+/** How many events are kept. A gesture is a few hundred at most. */
+const WHEEL_LOG_MAX = 400;
+
+/** What this one event says about the device, or null if it says nothing. */
+function evidence(e: WheelEvent, gap: number): Device | null {
+  if (e.deltaMode !== 0) return 'wheel';
+  if (e.deltaX !== 0) return 'pad';
+  const dy = Math.abs(e.deltaY);
+  if (dy === 0) return null;
+  if (!Number.isInteger(e.deltaY) || dy < NOTCH_MIN) return 'pad';
+  // A whole, wheel-sized step. It is only a *mouse* if it also arrives like
+  // one: discretely, and repeating the same size. A hard trackpad flick clears
+  // NOTCH_MIN easily, but its deltas are a dense stream and no two are equal.
+  if (gap < STREAM_GAP) return null;
+  const same = dy === lastNotch;
+  lastNotch = dy;
+  notchRun = same ? notchRun + 1 : 1;
+  return notchRun >= 2 ? 'wheel' : null;
+}
 
 function noteWheel(e: WheelEvent): void {
   const now = performance.now();
-  if (e.deltaMode !== 0) {
-    // A line/page wheel is a mouse. Drop the verdict immediately rather than
-    // waiting it out, or one trackpad gesture makes the mouse pan for 600 ms.
-    trackpadUntil = 0;
-    smallRun = 0;
-    lastWheelAt = now;
-    return;
-  }
-  const dy = Math.abs(e.deltaY);
-  smallRun = now - lastWheelAt < 120 && dy < 40 ? smallRun + 1 : 0;
+  const gap = now - lastWheelAt;
   lastWheelAt = now;
-  if (e.deltaX !== 0 || !Number.isInteger(e.deltaY) || smallRun >= 3) trackpadUntil = now + TRACKPAD_HOLD;
+  const fresh = gap > GESTURE_GAP;
+  if (fresh) gestureDevice = null;
+
+  const ev = evidence(e, gap);
+  if (ev === 'pad') notchRun = 0;
+  if (ev) device = ev;
+
+  if (gestureDevice === null) {
+    // The first event of a gesture decides it — *after* its own evidence has
+    // been folded in, so the opening event of the session's first trackpad
+    // scroll is enough to make that scroll a pan.
+    gestureDevice = device;
+  } else if (ev === 'pad' && gestureDevice === 'wheel') {
+    // Promote, never demote. A gesture that turns out to be a trackpad after
+    // all should stop zooming; one that merely runs out of evidence must not
+    // start.
+    gestureDevice = 'pad';
+  } else if (e.deltaMode !== 0) {
+    // The one demotion there is: a line/page wheel is a mouse, definitively,
+    // and must not be left panning behind a stale trackpad verdict.
+    gestureDevice = 'wheel';
+  }
+
+  if (wheelLog.on) {
+    if (wheelLog.rows.length >= WHEEL_LOG_MAX) wheelLog.rows.shift();
+    const mods = `${e.ctrlKey || e.metaKey ? 'C' : '-'}${e.shiftKey ? 'S' : '-'}${e.altKey ? 'A' : '-'}`;
+    wheelLog.rows.push({ t: now, dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, mods, device, gesture: gestureDevice, fresh });
+  }
 }
 
+/**
+ * `__lp.wheel` — record what the pointing device actually sent, and what this
+ * module made of it.
+ *
+ * **Reach for this before theorising about a scroll complaint.** "It zoomed when
+ * I meant to pan" has at least three causes — the verdict flipped mid-gesture,
+ * the surface declared `noPan`, or the OS never sent the second axis at all —
+ * they are indistinguishable from the outside, and telling them apart depends
+ * on delta values that nobody can see without recording them. Two of the three
+ * bugs found on 2026-08-12 were only separable this way.
+ *
+ *     __lp.wheel.watch()   → make the gesture → __lp.wheel.report()
+ *
+ * Recording costs one branch per wheel event and nothing at all when off.
+ */
+export const wheelDiagnostics = {
+  watch(): string {
+    wheelLog.rows.length = 0;
+    wheelLog.on = true;
+    return 'recording wheel events — do the gesture, then __lp.wheel.report()';
+  },
+  stop(): string {
+    wheelLog.on = false;
+    return `stopped, ${wheelLog.rows.length} events held`;
+  },
+  /** One line per gesture. The raw rows also go to the console as a table. */
+  report(quiet = false): string {
+    const rows = wheelLog.rows;
+    if (!rows.length) return 'nothing recorded — call __lp.wheel.watch() first';
+    const gestures: WheelRow[][] = [];
+    for (const r of rows) {
+      if (r.fresh || !gestures.length) gestures.push([]);
+      gestures[gestures.length - 1].push(r);
+    }
+    const num = (v: number): string => (Number.isInteger(v) ? String(v) : v.toFixed(2));
+    const lines = gestures.map((g, i) => {
+      const both = g.filter((r) => r.dx !== 0 && r.dy !== 0).length;
+      const xOnly = g.filter((r) => r.dx !== 0 && r.dy === 0).length;
+      const yOnly = g.filter((r) => r.dx === 0 && r.dy !== 0).length;
+      const flips = g.filter((r, j) => j > 0 && r.gesture !== g[j - 1].gesture).length;
+      const ms = Math.round(g[g.length - 1].t - g[0].t);
+      let peak = 0;
+      for (const r of g) peak = Math.max(peak, Math.abs(r.dx), Math.abs(r.dy));
+      return (
+        `#${i + 1} ${String(g.length).padStart(3)} ev /${String(ms).padStart(6)} ms  ` +
+        `${g[0].gesture === 'pad' ? 'trackpad→pan' : 'mouse→zoom  '}  ` +
+        `${flips ? `*** ${flips} MID-GESTURE FLIP *** ` : ''}` +
+        `both-axes ${both}, x-only ${xOnly}, y-only ${yOnly}, peak ${num(peak)}, mods ${g[0].mods}`
+      );
+    });
+    if (!quiet) {
+      // eslint-disable-next-line no-console
+      console.table(rows.map((r) => ({ dx: r.dx, dy: r.dy, mode: r.mode, mods: r.mods, verdict: r.gesture, newGesture: r.fresh })));
+    }
+    return `${rows.length} events in ${gestures.length} gesture(s)\n${lines.join('\n')}`;
+  },
+};
+
 /** The current verdict. Call `wheelIntent` instead unless you have a reason. */
-export const isTrackpad = (): boolean => performance.now() < trackpadUntil;
+export const isTrackpad = (): boolean => (gestureDevice ?? device) === 'pad';
 
 // ---------------------------------------------------------------------------
 // Wheel → intent
@@ -301,6 +457,50 @@ export function wheelIntent(e: WheelEvent, opts: WheelOptions = {}): WheelIntent
     return { kind: 'zoom', axis: 'both', factor: Math.pow(1 + rate, -(dy || dx)) };
   }
   return { kind: 'pan', dx, dy };
+}
+
+// ---------------------------------------------------------------------------
+// Panning an axis that is an integer
+// ---------------------------------------------------------------------------
+
+/**
+ * Accumulator for panning a view axis whose value must stay a whole number.
+ *
+ * **Every incremental pan onto an integer axis needs one of these.** A trackpad
+ * and a two-finger drag both deliver a *stream of small deltas* — 3-6 px per
+ * event — where a mouse delivers one big one. If a step of that axis is 12-20
+ * px, then rounding each event on its own produces the same value every time
+ * and the axis **does not move at all, ever**, however long the user scrolls.
+ * It is not a rounding inaccuracy, it is a dead axis: `round(lo - 0.25) === lo`.
+ *
+ * The piano roll's pitch is the axis that had this (found 2026-08-12). Its time
+ * axis is a float and always worked, so one gesture moved smoothly in x and was
+ * frozen in y — reported as *"when you start going in one axis the other axis
+ * is locked"*, which is exactly what it looks like from outside. It only came
+ * alive on a fast flick, whose deltas finally cleared half a row each.
+ *
+ * The remainder is what ROUNDING dropped, never what the clamp dropped — so it
+ * is inherently within ±½ a step and pushing against the end of the axis cannot
+ * bank up travel that the user would then have to scroll back out before
+ * anything moved. (Keeping `want - clamped` instead looks equivalent and is
+ * not: it parks the remainder at ±½ for as long as you hold against the end,
+ * and the first step back off it goes nowhere.)
+ */
+export class StepPan {
+  private rest = 0;
+
+  /** `value` advanced by `delta` whole-and-fractional steps, rounded, clamped. */
+  step(value: number, delta: number, min: number, max: number): number {
+    const want = value + this.rest + delta;
+    const rounded = Math.round(want);
+    this.rest = want - rounded;
+    return Math.max(min, Math.min(max, rounded));
+  }
+
+  /** Drop the remainder — for a jump that is not a continuation of a pan. */
+  reset(): void {
+    this.rest = 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
