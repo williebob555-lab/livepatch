@@ -67,6 +67,30 @@ export const grabSlop = (mousePx: number, e: { pointerType?: string }): number =
   isCoarse(e) ? mousePx * COARSE_SLOP : mousePx;
 
 /**
+ * Was the most recent pointer input a finger or a pen?
+ *
+ * Pooled module-wide for the same reason the trackpad verdict is: it is a
+ * property of how the machine is being *used right now*, and a convertible
+ * reports both `pointer: coarse` and a mouse, so a media query cannot answer it.
+ *
+ * **What it is for: not putting the caret in a text box on a touchscreen.**
+ * Focusing an `<input>` raises the on-screen keyboard, which covers half the
+ * screen — so a side effect that is a convenience with a hardware keyboard is an
+ * ambush without one. Tapping a loose cable end arms the Library's quick-add and
+ * used to focus its search box, and the report was simply *"the on screen
+ * keyboard keeps coming up during regular use"*, with no obvious cause: nothing
+ * the user touched looked like a text field.
+ *
+ * Recorded from `Editor.pointerDown`, which every canvas gesture goes through.
+ */
+let coarseLast = false;
+export const notePointer = (e: { pointerType?: string }): void => {
+  coarseLast = isCoarse(e);
+};
+/** True when the last pointer gesture came from touch or pen. */
+export const lastPointerWasCoarse = (): boolean => coarseLast;
+
+/**
  * Movement, in px, that turns a press into a drag. Bigger for touch because a
  * fingertip rolls a few px during any deliberate press — a 3 px threshold makes
  * every tap a micro-drag.
@@ -590,11 +614,15 @@ export class TwoPointerGesture {
   /**
    * Was this a two-finger *tap* rather than a pan/zoom?
    *
-   * Touch has no right-click. Long-press is the usual stand-in, but it is
-   * deliberately disabled over live widgets (holding a note button must play
-   * the note, not open a menu), so a two-finger tap is the escape hatch that
-   * always works. Keep the window short — a slow two-finger press that the user
-   * abandoned should not surprise them with a menu.
+   * **Nothing calls this** (2026-08-14). It was how touch reached the context
+   * menu over a widget that owns its press, and it was removed because the
+   * measurement it makes cannot tell a tap from an *abandoned* navigation: a
+   * pinch that never cleared `ZOOM_DEADZONE` and a pan under `TAP_SLOP` are
+   * both "still and quick", so changing your mind about moving the view dropped
+   * a menu on the canvas. See rule 12 of `docs/14-input.md`.
+   *
+   * Kept because the arithmetic is right and a future surface may want a real
+   * two-finger tap for something it *asks* for; do not wire it back to a menu.
    */
   isTap(maxMs = 350): boolean {
     return !this.moved && performance.now() - this.startedAt < maxMs;

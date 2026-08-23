@@ -2053,8 +2053,19 @@ function build(body: HTMLElement): DockTabHandle {
       // vertical half there is no way to zoom pitch by touch at all — rows sit
       // at whatever `rows` happens to be, often near the 5 px floor, and a note
       // row that small cannot be hit however generous the slop is.
-      const beats = Math.max(0.5, Math.min(256, v.beats * f.zoomX));
-      const rows = Math.max(6, Math.min(96, Math.round(v.rows * f.zoomY)));
+      //
+      // **DIVIDED, not multiplied** (fixed 2026-08-14). `zoomX`/`zoomY` are
+      // *finger separation* ratios: spreading gives a ratio above 1. `beats` and
+      // `rows` are how much of the score is ON SCREEN, so they are the
+      // reciprocal — spreading your fingers must show FEWER beats, not more.
+      // Multiplied, every pinch ran the wrong way, and it was the one gesture
+      // where that is easy to miss in code and impossible to miss in the hand:
+      // the wheel path (`PianoRoll.zoomAt`) already divides by its factor and
+      // the waveform below divides by `f.zoom`, so the roll's pinch was the
+      // single surface in the app that zoomed backwards. Reported as, simply,
+      // "zooming is backwards".
+      const beats = Math.max(0.5, Math.min(256, v.beats / f.zoomX));
+      const rows = Math.max(6, Math.min(96, Math.round(v.rows / f.zoomY)));
       // Anchor the beat under the midpoint through the zoom, then pan by the
       // midpoint's own travel.
       const frac = (f.mid.x - rr.x) / Math.max(1, rr.w);
@@ -2110,9 +2121,15 @@ function build(body: HTMLElement): DockTabHandle {
     if (isCoarse(e)) {
       gesture.add(e.pointerId, p);
       if (gesture.count >= 2) {
-        // A gesture supersedes any single-finger drag in progress.
+        // A gesture supersedes any single-finger drag in progress — and
+        // **un-does what that drag already did**, which on the roll is a whole
+        // note: Draw mode creates one on the press itself, so the first finger
+        // of every two-finger pan had already written to the score before the
+        // second one landed. See `PianoRoll.cancelDrag`.
         drag = { kind: 'none' };
-        roll.cancelDrag();
+        const rid = rollAssetOf(b) ?? null;
+        roll.cancelDrag(rid ? getRollData(rid) ?? null : null, rid);
+        invalidate();
         return;
       }
     }

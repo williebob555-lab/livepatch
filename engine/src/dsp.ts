@@ -9337,6 +9337,359 @@ registerKernel('scope', tapKernel);
 registerKernel('spectrum', tapKernel);
 registerKernel('spectrogram', tapKernel);
 
+/**
+ * Tuner — what note is going through here, and how far off it is.
+ *
+ * Def in `src/blocks/defs.ts`; the face is `Renderer.drawTunerFace`; the note
+ * arithmetic it shares with the renderer is `src/core/pitch.ts`.
+ *
+ * **The engine publishes exactly one number: the measured frequency.** Note
+ * name, octave, cents and the whole picture are derived in the renderer from
+ * that plus the `ref`/`transpose` knobs, so changing the reference re-labels
+ * the reading on the same frame instead of waiting for the next analysis pass,
+ * and there is only one place that decides what a cent is.
+ *
+ * Detection is YIN (de Cheveigne & Kawahara), in four steps, shaped the same
+ * way `tempo-follow` is shaped and for the same reason — the expensive part
+ * must never sit on the audio deadline:
+ *
+ * 1. **Decimate to ~24 kHz** behind a two-pole anti-alias filter. A tuner's top
+ *    note is ~2.4 kHz; running the search at 96 kHz would cost four times as
+ *    much for lags four times as long and buy no accuracy at all.
+ * 2. **Difference function, spread over quanta.** `d(t) = sum (x[i] - x[i+t])^2`
+ *    for lags up to 1000 (a 24 Hz floor — below the bottom of a piano) over a
+ *    1024-sample window: ~1 M multiplies, which is nothing per *second* and
+ *    unthinkable in one callback. The sweep walks a few dozen lags per quantum,
+ *    sized from `ctx.n / ctx.sr` so the share of the callback it takes is the
+ *    same at every buffer size, and comes round about eight times a second.
+ *    It reads a **snapshot** of the ring taken when the sweep started, so every
+ *    lag it compares is from one moment of audio.
+ * 3. **Cumulative mean normalisation + the absolute threshold.** This is the
+ *    step that separates YIN from plain autocorrelation, and it is the whole
+ *    reason to use it: autocorrelation peaks exactly as hard at half the true
+ *    frequency, so a naive detector reads a guitar's low E an octave down about
+ *    whenever the player digs in. Taking the FIRST dip under the threshold
+ *    rather than the deepest one is what prefers the fundamental.
+ * 4. **Refine on a late period.** Parabolic interpolation on the chosen dip
+ *    gets to ~2-3 cents, which is not good enough to tune with — the block
+ *    would disagree with itself about where "in tune" is by more than the
+ *    default +/-5 ct window. So the dip near `k` periods out (k <= 8) is
+ *    interpolated as well and divided by `k`, which divides the interpolation
+ *    error by `k` too and costs three lags that are already computed. It is
+ *    accepted only if it agrees with the coarse estimate to 3 %, so an
+ *    inharmonic string (a piano's stretched partials) falls back rather than
+ *    locking onto a wrong multiple.
+ *
+ * Silence costs nothing: below the noise gate no sweep is started at all, which
+ * is the state a tuner left in a patch spends most of its life in.
+ */
+registerKernel('tuner', (params) => {
+  // ---- audio pass-through (width-transparent: a tuner in a surround chain
+  // must not silence the channels above the front pair — golden rule 15) ----
+  let winIn = 2;
+  let winOut = 2;
+  let width = 2;
+  let buf = allocBuf(width);
+  const bufPitch = stereo();
+  const bufCents = stereo();
+  const bufLock = stereo();
+  const [pchL, pchR] = bufPitch;
+  const [cntL, cntR] = bufCents;
+  const [lckL, lckR] = bufLock;
+  const p: Record<string, ParamValue> = { ...params };
+
+  // ---- analysis constants (mirrored by the web unit in src/blocks/units.ts)
+  const WIN = 2048; // decimated samples held for analysis (power of two: mask)
+  const MASK = WIN - 1;
+  const TERMS = 1024; // comparison window of the difference function
+  const MAXLAG = 1000; // 24 kHz / 1000 = 24 Hz floor. TERMS + MAXLAG <= WIN.
+  const MINLAG = 10; // 24 kHz / 10 = 2.4 kHz ceiling
+  const THRESH = 0.12; // YIN's absolute threshold
+  const DEC_TARGET = 24000; // working rate, Hz
+  const GATE = 1.5e-4; // below this there is nothing to analyse
+
+  const ring = new Float32Array(WIN);
+  const work = new Float32Array(WIN); // snapshot the sweep runs against
+  const dif = new Float32Array(MAXLAG + 1);
+  const cmn = new Float32Array(MAXLAG + 1);
+
+  /**
+   * Everything `process` writes at audio rate, in a Float64Array rather than
+   * as closure `let`s. **This is not style — it is the allocation rule.**
+   *
+   * A `let` captured by a closure lives in a context slot, which is TAGGED. A
+   * loop local seeded from one (`let fa = lpA`) inherits that representation,
+   * so V8 keeps it boxed and every `fa += …` in the sample loop allocates a
+   * heap number. Measured on this block: ~46 bytes per SAMPLE, about 2 MB of
+   * garbage a second, a scavenge every 4 ms. Seeding the same locals from a
+   * Float64Array — where the value is known to be a double — is exactly zero.
+   *
+   * `scripts/audio-alloc-test.cjs` cannot see this: `heapUsed` before/after is
+   * dominated by where the collector happens to be in its sawtooth, and it
+   * reads the same for a kernel allocating megabytes as for one allocating
+   * nothing. `--trace-gc --max-semi-space-size=1` counts it directly (one
+   * scavenge ≈ 1 MB), which is how it was found here. See docs/10.
+   */
+  const K_LPA = 0; // anti-alias one-pole, stage A
+  const K_LPB = 1; // stage B — what the decimated ring is fed
+  const K_LEVEL = 2; // slow |x| average: the noise gate
+  const K_HEAD = 3; // ring write cursor
+  const K_DPOS = 4; // decimation counter
+  const K_DEC = 5; // decimation factor
+  const K_LPK = 6; // one-pole coefficient
+  const K_PCH = 7; // last quantum's pitch CV (the first-order hold)
+  const K_CNT = 8; // last quantum's cents CV
+  const K_PCHT = 9; // this quantum's pitch CV target
+  const K_CNTT = 10; // this quantum's cents CV target
+  const ST = new Float64Array(11);
+  ST[K_DEC] = 2;
+
+  // Low-rate state stays readable: these are written at most a few times per
+  // quantum (and `lag` only ever holds a small integer, which is never boxed),
+  // so the context-slot cost is a rounding error rather than the sample loop.
+  let lag = 1;
+  let sweeping = false;
+  let ratesFor = -1;
+  let wsr = DEC_TARGET;
+  let freq = 0; // the published estimate, Hz
+  let conf = 0;
+
+  /** Decimation rate + the anti-alias coefficient. Sample-rate dependent, so
+   *  never a constant (golden rule 14) and never recomputed per quantum. */
+  const retune = (sr: number): void => {
+    const d = Math.max(1, Math.min(8, Math.round(sr / DEC_TARGET)));
+    ST[K_DEC] = d;
+    ST[K_DPOS] = 0;
+    wsr = sr / d;
+    // Two one-poles at 0.2x the working rate: keeps two harmonics of the top
+    // detectable note and puts the fold-back band ~17 dB down.
+    ST[K_LPK] = 1 - Math.exp((-2 * Math.PI * (wsr * 0.2)) / sr);
+    ratesFor = sr;
+  };
+
+  /** In-place clear of everything that carries state across quanta. Runs from
+   *  the audio path on a non-finite trip, so it allocates nothing. */
+  const purge = (): void => {
+    ring.fill(0);
+    work.fill(0);
+    dif.fill(0);
+    cmn.fill(0);
+    const d = ST[K_DEC];
+    const k = ST[K_LPK];
+    ST.fill(0);
+    ST[K_DEC] = d;
+    ST[K_LPK] = k;
+    lag = 1;
+    sweeping = false;
+    freq = 0;
+    conf = 0;
+  };
+
+  /** `d(lag)` over the snapshot. The inner loop is the whole cost of the block. */
+  const diffAt = (L: number): number => {
+    let s = 0;
+    for (let i = 0; i < TERMS; i++) {
+      const d = work[i] - work[i + L];
+      s += d * d;
+    }
+    return s;
+  };
+
+  /** Sub-sample position of a minimum, by parabola through its neighbours. */
+  const parab = (arr: Float32Array, L: number): number => {
+    if (L <= 0 || L >= MAXLAG) return L;
+    const a = arr[L - 1];
+    const b = arr[L];
+    const c = arr[L + 1];
+    const den = a - 2 * b + c;
+    if (!(Math.abs(den) > 1e-12)) return L;
+    const off = (0.5 * (a - c)) / den;
+    return off > -1 && off < 1 ? L + off : L;
+  };
+
+  /** One completed sweep: normalise, pick the period, rate it, publish. */
+  const finishPass = (): void => {
+    let run = 0;
+    cmn[0] = 1;
+    for (let L = 1; L <= MAXLAG; L++) {
+      run += dif[L];
+      cmn[L] = run > 1e-12 ? (dif[L] * L) / run : 1;
+    }
+    // The first dip under the threshold, followed down to its bottom. NOT the
+    // deepest dip: the deepest one is as likely as not to be an octave down.
+    let best = -1;
+    for (let L = MINLAG; L <= MAXLAG; L++) {
+      if (cmn[L] >= THRESH) continue;
+      while (L + 1 <= MAXLAG && cmn[L + 1] < cmn[L]) L++;
+      best = L;
+      break;
+    }
+    if (best < 0) {
+      // Nothing convincing: take the shallowest dip there is and let the
+      // confidence figure say how little it means.
+      let m = Infinity;
+      for (let L = MINLAG; L <= MAXLAG; L++)
+        if (cmn[L] < m) {
+          m = cmn[L];
+          best = L;
+        }
+    }
+    const q = best >= MINLAG ? cmn[best] : 1;
+    const c = q >= 0.55 ? 0 : q <= 0.1 ? 1 : (0.55 - q) / 0.45;
+    conf = conf * 0.5 + c * 0.5;
+    if (best < MINLAG || c < 0.1) return;
+
+    let period = parab(cmn, best);
+    // Late-period refinement: the same dip k periods out, which carries k times
+    // the phase and so k times the resolution.
+    const k = period > 0 ? Math.min(8, Math.floor(MAXLAG / period)) : 0;
+    if (k >= 2) {
+      let L = Math.round(period * k);
+      if (L > 1 && L < MAXLAG) {
+        // Settle onto the actual local minimum first — the coarse estimate is
+        // a sample or two out, and a parabola fitted off the bottom leans.
+        for (let s = -2; s <= 2; s++) {
+          const j = L + s;
+          if (j > 1 && j < MAXLAG && dif[j] < dif[L]) L = j;
+        }
+        const cand = parab(dif, L) / k;
+        if (cand > 0 && Math.abs(cand - period) < period * 0.03) period = cand;
+      }
+    }
+    const f = period > 0 ? wsr / period : 0;
+    if (!(f > 0) || !Number.isFinite(f)) return;
+    // Response: a big jump is a new note, not drift — take it whole rather
+    // than sliding through every pitch in between.
+    const a = 0.08 + 0.85 * Math.max(0, Math.min(1, num(p.avg, 0.5)));
+    if (!freq || Math.abs(f - freq) > freq * 0.15) freq = f;
+    else freq += (f - freq) * a;
+  };
+
+  return {
+    out: (port) =>
+      port === 'pitch' ? bufPitch : port === 'cents' ? bufCents : port === 'lock' ? bufLock : buf,
+    setWidth: (port, w) => {
+      if (port === 'in') winIn = Math.max(2, Math.min(MAXCH, w));
+      else if (port === 'out') winOut = Math.max(2, Math.min(MAXCH, w));
+      else return; // the CV outs are stereo whatever they are wired into
+      const nw = winIn > winOut ? winIn : winOut;
+      if (nw === width) return;
+      width = nw;
+      buf = allocBuf(width);
+    },
+    setParam: (id, v) => {
+      p[id] = v;
+    },
+    visualText: () => (freq > 0 ? freq.toFixed(4) + '\n' + conf.toFixed(3) : '0\n' + conf.toFixed(3)),
+    process: (ins, ctx) => {
+      const n = ctx.n;
+      if (ratesFor !== ctx.sr) retune(ctx.sr);
+      copy(buf, ins.in, n);
+      const src = ins['in'];
+      const a0 = src ? src[0] : null;
+      const a1 = src ? src[1] ?? src[0] : null;
+      // Seeded from ST, not from closure `let`s — see the note on ST above.
+      let fa = ST[K_LPA];
+      let fb = ST[K_LPB];
+      let lv = ST[K_LEVEL];
+      let hd = ST[K_HEAD] | 0;
+      let dp = ST[K_DPOS] | 0;
+      const dv = ST[K_DEC] | 0;
+      const kf = ST[K_LPK];
+      for (let i = 0; i < n; i++) {
+        const x = a0 && a1 ? (a1 === a0 ? a0[i] : (a0[i] + a1[i]) * 0.5) : 0;
+        fa += (x - fa) * kf;
+        fb += (fa - fb) * kf;
+        const ax = x < 0 ? -x : x;
+        lv += (ax - lv) * 0.0004;
+        if (++dp >= dv) {
+          dp = 0;
+          ring[hd] = fb;
+          hd = (hd + 1) & MASK;
+        }
+      }
+      ST[K_LPA] = fa;
+      ST[K_LPB] = fb;
+      ST[K_LEVEL] = lv;
+      ST[K_HEAD] = hd;
+      ST[K_DPOS] = dp;
+      // A NaN in the filter pair or the level would sit there for ever, and
+      // every estimate after it would be drawn from a ring full of NaN
+      // (golden rule 13). The audio itself is trapped at the end.
+      if (!Number.isFinite(fb) || !Number.isFinite(lv)) purge();
+
+      // ---- the sweep, a slice at a time ----
+      if (!sweeping) {
+        if (ST[K_LEVEL] > GATE) {
+          const h = ST[K_HEAD] | 0;
+          for (let i = 0; i < WIN; i++) work[i] = ring[(h + i) & MASK];
+          lag = 1;
+          sweeping = true;
+        } else {
+          // Nothing playing. Let the confidence fall away; the last note stays
+          // on the face until it does, which is what you want when you have
+          // just stopped bowing in order to look at it.
+          conf *= 0.9;
+          if (conf < 0.02) {
+            conf = 0;
+            freq = 0;
+          }
+        }
+      }
+      if (sweeping) {
+        // ~8 sweeps a second whatever the buffer size — a fixed lag count per
+        // quantum would take four times the share of a 512-frame callback.
+        const per = Math.max(4, Math.ceil((MAXLAG * 8 * n) / ctx.sr));
+        const end = lag + per - 1 < MAXLAG ? lag + per - 1 : MAXLAG;
+        for (; lag <= end; lag++) dif[lag] = diffAt(lag);
+        if (lag > MAXLAG) {
+          finishPass();
+          sweeping = false;
+        }
+      }
+
+      // ---- CV outs ----
+      const ref = Math.max(300, Math.min(600, num(p.ref, 440)));
+      const tol = Math.max(0.5, Math.min(50, num(p.tol, 5)));
+      let lk = 0;
+      ST[K_PCHT] = 0;
+      ST[K_CNTT] = 0;
+      if (freq > 0) {
+        // 1 V/oct against C4 — `midi-cv`'s convention (docs/02).
+        const pv = Math.log2(freq / 261.6255653);
+        // Mirrors `centsOff` in src/core/pitch.ts. Change one, change both.
+        const m = 69 + 12 * Math.log2(freq / ref);
+        const cents = (m - Math.round(m)) * 100;
+        const cv = cents < -50 ? -1 : cents > 50 ? 1 : cents / 50;
+        ST[K_PCHT] = Number.isFinite(pv) ? pv : 0;
+        ST[K_CNTT] = Number.isFinite(cv) ? cv : 0;
+        lk = conf >= 0.35 && Math.abs(cents) <= tol ? 1 : 0;
+      }
+      // First-order hold across the quantum: the estimate lands ~8 times a
+      // second and a step into a 1 V/oct input is a click (golden rule 10).
+      const p0 = ST[K_PCH];
+      const p1 = ST[K_PCHT];
+      const c0 = ST[K_CNT];
+      const c1 = ST[K_CNTT];
+      const pd = (p1 - p0) / n;
+      const cd = (c1 - c0) / n;
+      for (let i = 0; i < n; i++) {
+        const pv = p0 + pd * (i + 1);
+        const cv = c0 + cd * (i + 1);
+        pchL[i] = pv;
+        pchR[i] = pv;
+        cntL[i] = cv;
+        cntR[i] = cv;
+        lckL[i] = lk;
+        lckR[i] = lk;
+      }
+      ST[K_PCH] = p1;
+      ST[K_CNT] = c1;
+      trapNonFinite(buf, n, purge);
+    },
+  };
+});
+
 // ---------------------------------------------------------------- keyboard --
 //
 // The two blocks that cross the boundary out of this app. Both are shaped so

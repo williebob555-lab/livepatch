@@ -187,10 +187,22 @@ let focusLibrarySearch: () => void = () => {};
  * **Checks the intent is still armed.** Between the arming and this call the
  * user may already have cancelled; showing the panel then would be a leftover
  * of a mode that no longer exists.
+ *
+ * **`focus` is false on a touchscreen, and that is the whole point** (2026-08-14).
+ * Focusing an `<input>` raises the on-screen keyboard over half the display. On
+ * a desktop, putting the caret in the search box is a courtesy — you armed this
+ * to type a block name. On a phone it is an ambush, and it arrives with no
+ * visible cause: the gesture that arms a placement most often is **tapping a
+ * loose cable end**, which is a thing you do to a *cable*, so the report was
+ * "the on-screen keyboard keeps coming up during regular use… I'm not sure if
+ * I'm accidentally hitting a text box". The panel still opens, the banner still
+ * says what it is waiting for, and the search box is one tap away if typing is
+ * what you wanted.
  */
-export function revealLibraryForPlacement(): void {
+export function revealLibraryForPlacement(focus = true): void {
   if (!pendingPlacementIntent()) return;
   dock.show('library');
+  if (!focus) return;
   // After the panel has been placed/rebuilt, or the focus lands on an input
   // that is about to be replaced.
   setTimeout(() => {
@@ -422,13 +434,54 @@ function dropLibraryKey(key: string, clientX: number, clientY: number): boolean 
  * canvas follows (docs/14-input.md, Rule 9): a menu on top of a live drag is
  * wrong, and a hold that has not moved is not a drag yet.
  */
-/** How long a motionless press must last before the tile lifts for dragging. */
-const LIFT_MS = 300;
+/**
+ * How long a motionless press must last before the tile lifts for dragging.
+ *
+ * **220 ms, down from 300 (2026-08-14).** The hold is a race against the
+ * browser: until the tile lifts, the touch still belongs to the scroller, and
+ * the moment the compositor commits the gesture to a scroll every pointer on
+ * the page gets a `pointercancel` — which kills the pending lift outright, even
+ * if the finger then stops dead. A fingertip rolls a few px during any
+ * deliberate press (that is why `dragThreshold` is 10 px for touch), so a
+ * meaningful share of honest presses were losing that race before they got
+ * anywhere. That is the "it often takes several drags before it figures out I'm
+ * trying to take a block" report. 220 ms is still far longer than a tap and
+ * still nothing like a scroll flick, and it is under Android's own ~250 ms
+ * gesture-recogniser window for the same decision.
+ */
+const LIFT_MS = 220;
+
+/**
+ * How much more vertical than horizontal a pre-lift move has to be before it is
+ * handed back to the scroller.
+ *
+ * It used to be simply `|dy| > |dx|`, i.e. a 45° cone — so a drag aimed at a
+ * canvas that is diagonally away from the panel (which it is, for most of the
+ * dock layouts) was thrown to the scroller for being one degree off. The
+ * scroll gesture people actually make is near-vertical; 2:1 leaves it entirely
+ * intact and gives the drag-out everything within ~63° of horizontal.
+ */
+const SCROLL_CONE = 2;
+
+/**
+ * The nearest ancestor that can actually scroll vertically.
+ *
+ * Used to answer "would handing this gesture back to the scroller do anything at
+ * all?" — see `onMove`. A list with nothing to scroll must never refuse a drag.
+ */
+function scrollParentOf(el: HTMLElement): HTMLElement | null {
+  for (let n = el.parentElement; n; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+  }
+  return null;
+}
 
 function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent): void {
   const startX = down.clientX;
   const startY = down.clientY;
   const id = down.pointerId;
+  const scroller = scrollParentOf(tile);
   let ghost: HTMLElement | null = null;
   let active = false;
   let dead = false;
@@ -477,6 +530,21 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     if (lifted || active) ev.preventDefault();
   }
 
+  /**
+   * Could the list still scroll the way this finger is going?
+   *
+   * A finger moving **down** (`dy > 0`) drags the content down, which means
+   * `scrollTop` going *up* toward 0 — so it is only a scroll if there is
+   * anything above. At either end stop the answer is no, and the gesture is a
+   * drag-out instead of being thrown away.
+   */
+  function canScroll(dy: number): boolean {
+    if (!scroller) return false;
+    const max = scroller.scrollHeight - scroller.clientHeight;
+    if (max <= 1) return false;
+    return dy > 0 ? scroller.scrollTop > 0 : scroller.scrollTop < max;
+  }
+
   const lift = (): void => {
     if (dead || active) return;
     lifted = true;
@@ -512,9 +580,17 @@ function beginTouchDrag(entry: LibEntry, tile: HTMLElement, down: PointerEvent):
     if (!active) {
       if (!lifted) {
         if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) return;
-        // Moved before the tile lifted. Predominantly vertical is a scroll —
-        // bow out entirely so the list flicks normally, exactly as before.
-        if (Math.abs(dy) > Math.abs(dx)) {
+        // Moved before the tile lifted. Strongly vertical is a scroll — bow out
+        // entirely so the list flicks normally.
+        //
+        // **Unless the scroller has nowhere to go.** Handing the gesture back
+        // then is handing it to nobody: the list does not move, the tile does
+        // not lift, and the press simply does nothing — which is the same class
+        // of defect as "no drag on the canvas may do nothing" (docs/07-ui.md).
+        // It is not a rare case either: filter the Library down to a handful of
+        // tiles, or open it in a tall dock zone, and there is nothing to scroll
+        // at all, so *every* downward drag-out was being discarded.
+        if (Math.abs(dy) > Math.abs(dx) * SCROLL_CONE && canScroll(dy)) {
           dead = true;
           cleanup();
           return;
@@ -2756,6 +2832,11 @@ const THEME_SCHEMA: ThemeField[] = [
   { key: 'blockShadow', label: 'Shadow', type: 'bool', section: 'Blocks' },
 
   { key: 'portRadius', label: 'Node size', type: 'number', min: 3, max: 10, step: 0.5, section: 'Ports' },
+  // CONNECT RANGE: how far from a port a cable still connects. A hit tolerance,
+  // not a drawing — see `Theme.connectRange`. Touch multiplies whatever this is
+  // by `COARSE_SLOP` on top, so the same setting means "a bit more generous" on
+  // every device rather than being a per-platform constant nobody can reach.
+  { key: 'connectRange', label: 'Connect range', type: 'number', min: 0, max: 40, step: 1, section: 'Ports' },
   { key: 'portAudioColor', label: 'Audio', type: 'color', section: 'Ports' },
   { key: 'portControlColor', label: 'CV', type: 'color', section: 'Ports' },
   { key: 'portMidiColor', label: 'MIDI', type: 'color', section: 'Ports' },

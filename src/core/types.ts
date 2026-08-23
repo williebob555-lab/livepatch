@@ -413,6 +413,21 @@ export interface Theme {
   blockShadow: boolean;
 
   portRadius: number;
+  /**
+   * Extra px of catchment around a port for **wiring** — starting a cable,
+   * previewing where one would land, and dropping it. Purely a hit tolerance:
+   * nothing about the drawing changes, and it never widens the *selection* of a
+   * block or a widget.
+   *
+   * It exists because the right number is genuinely personal and genuinely
+   * per-device. A fingertip is ~10 mm across and hides what it is aiming at, so
+   * touch already gets `COARSE_SLOP` on top of this; but a dense patch on a
+   * phone still wants more, and a user doing fine work with a mouse on a 4K
+   * screen wants a different number again. It is one setting rather than a
+   * hidden per-platform constant so that every version — desktop, tablet,
+   * phone — is tuned the same way, by the person using it.
+   */
+  connectRange: number;
   portAudioColor: string;
   portControlColor: string;
   portMidiColor: string;
@@ -494,6 +509,8 @@ export const defaultTheme = (): Theme => ({
   blockShadow: true,
 
   portRadius: 5,
+  // 0 = the tolerances this app shipped with; the slider only ever adds.
+  connectRange: 0,
   portAudioColor: '#5fb2ff',
   portControlColor: '#c9a2ff',
   portMidiColor: '#7ee08a',

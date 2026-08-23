@@ -629,12 +629,47 @@ export class PianoRoll {
     }
   }
 
-  /** Abandon the current gesture without committing — used when a second
-   *  finger promotes the interaction to a pinch. */
-  cancelDrag(): void {
+  /**
+   * Abandon the current gesture **and put back what it already changed** — used
+   * when a second finger promotes the interaction to a pinch.
+   *
+   * This is docs/14-input.md rule 8, and it was only half implemented: the drag
+   * state was dropped but the edit it had already made was left standing. On
+   * this surface that is not a subtlety, it is the loudest bug in the roll,
+   * because in Draw mode `down()` creates the note **on the press itself** —
+   * there is no threshold to cross and nothing to wait for, since tap-to-add is
+   * the whole gesture. So every two-finger pan and every pinch began by dropping
+   * a note wherever the first finger happened to land, and the user's second
+   * finger arrived too late to stop it: *"zooming/panning almost always creates
+   * an unwanted note"*. The same applies, less visibly, to a move or a
+   * length-stretch already under way — both mutate live.
+   *
+   * It takes the roll data because the state it reverts lives there. Passing
+   * `null` (no roll resolved) still clears the drag, which is all the old
+   * version did.
+   */
+  cancelDrag(d: RollData | null, id: string | null): void {
+    const was = this.drag;
     this.drag = { kind: 'none' };
     this.edited = false;
     this.stopPreview();
+    if (!d) return;
+    if (was.kind === 'draw') {
+      // The note this gesture invented. Removed by index, which is still valid:
+      // nothing re-sorts between the press and the second finger landing.
+      if (was.idx >= 0 && was.idx < d.notes.length) d.notes.splice(was.idx, 1);
+      this.sel.clear();
+    } else if (was.kind === 'move') {
+      d.notes = was.orig.map((q) => ({ ...q }));
+    } else if (was.kind === 'len') {
+      if (was.idx >= 0 && was.idx < d.notes.length) d.notes[was.idx] = { ...was.orig };
+    } else {
+      return; // pans, marquees, bars and seeks changed no notes
+    }
+    if (id) {
+      pokeRollData(id, d);
+      void setRollData(id, d);
+    }
   }
 
   up(d: RollData, id: string): void {

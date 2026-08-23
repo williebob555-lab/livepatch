@@ -1,6 +1,6 @@
 # 15 — Minions: characters that live in the patch
 
-_Last verified: 2026-08-13._
+_Last verified: 2026-08-14._
 
 > **Read §0 before changing anything drawn.** Almost every visual defect in this
 > folder has turned out to be one bug wearing different hats.
@@ -22,7 +22,7 @@ the folder. Nothing else imports it and nothing in it is load-bearing.
 | `payload.ts` | what a minion is carrying, and how it is put back |
 | `roster.ts` | who exists, who is hired, per-minion options |
 | `pixel.ts` | the pixel-art buffer: sprites, the form pass, the keyline |
-| `tab.ts` | the Minions dock tab and its cards |
+| `tab.ts` | the Minions dock tab and its cards — its rail **icon must be a glyph the platform's text font has** (`☻`). `🛠` is outside the BMP, no UI font carries it, and Chromium fell back to the colour emoji font: one full-colour tab on a rail of line art. The emoji *property* is not the test — `⚙` is an emoji code point and draws as line art — font coverage is. |
 | `gus.ts` | Gus's skeleton and behaviour |
 | `gusart.ts` | Gus's **drawing** — the sprite maps, as text |
 
@@ -524,7 +524,7 @@ oscillator produced four jobs, and he walked between them turning each one down
 — adjusting four things to fix one, flattening the balance of the patch, and
 leaving the block that was actually too loud exactly as it was.
 
-`clipCulprit` walks upstream on one local test that needs no idea of what a
+`clipChain` walks upstream on one local test that needs no idea of what a
 block "is":
 
 - what arrives is **already** clipping → this block is a victim, keep walking;
@@ -538,6 +538,106 @@ came back under (0.70 and 0.67).
 
 The walk is bounded by a visited set and a hop limit because **feedback loops
 are legal here** — the Feedback block is a supported thing to patch.
+
+### …but finding the culprit is only half of it (2026-08-14)
+
+Reported as *"he sucks at quickly levelling blocks that are clipping"*, then
+sharpened to *"he can't identify them"*. Three separate faults, and the second
+two are the reason the first one looked like laziness.
+
+**1. The list of things he could turn was six exact ids** — `gain, level, out,
+amp, drive, vol` — and a block with none of them dropped the whole chore on the
+floor: no job, no clipboard line, nothing. Measured against the registry, **51
+of the 80 block types with an audio output failed it.** Two of those were pure
+vocabulary (the EQ Curve's output trim is `output`, the Feedback block's is
+`ceiling`); the rest — Upmix, Pan, Distance, Delay, Reverb, a hosted VST —
+genuinely have no output control at all.
+
+So `levelTarget` runs the chain: start at the culprit and walk back
+**downstream** to the first block that has a level control. That is what a
+person does — there is no knob on the Upmix, so you pull the next fader after
+it. Only if nothing along the whole path can be turned is there no job, and that
+is the honest answer rather than a silent one. `LEVEL_IDS` is a closed, ranked
+list on purpose: a regex over "anything with gain in the name" reaches the EQ
+Curve's sixteen band gains, and a minion that answers a clip by pulling your
+mids down has done something you cannot guess at.
+
+**2. The arithmetic assumed every level control is linear.** It was
+`to = cur × 0.62`, floored at `def × 0.05` — and the app's own Gain block is in
+**decibels**:
+
+- at 0 dB, where a Gain block sits by default, `0 × 0.62 = 0`. He walked over,
+  opened the panel, put his hand on the knob, moved it **nowhere**, shook his
+  head and left. The clip was still there.
+- at −6 dB, `−6 × 0.62 = −3.7`, and the floor then clamped that to **0 dB**.
+  Asked to fix a clip, he turned the gain *up*.
+
+`quieterValue` takes a cut in **decibels** — the unit "quieter" is measured in —
+and converts once, against the spec's own `unit`. The floor is the spec's `min`,
+not a fraction of a default that is usually 0. A target that cannot move the
+control is not offered at all, which is what stops him crossing the patch to
+visibly do nothing.
+
+**3. One bite is not always enough, and the meter cannot say.** A peak pinned at
+full scale looks the same 4 dB over as 20 dB over, so a ~4 dB cut fixes some
+clips and not others — and the ones it missed cost a whole second journey. He
+keeps his hand on the knob now, waits for the meter, and takes another bite if
+it is still pinned. Bounded three ways: `CLIP_BITES` (3, about 12 dB), the
+control's own `min`, and a settle measured in **wall-clock** milliseconds —
+`step` scales his `dt` by `pace` *and* by the hurry below, so a paced timer would
+get shorter exactly when he is hurrying and he would cut again on a stale
+reading. That is the difference between "he fixes it" and "he turned my gain to
+nothing".
+
+Measured end to end in the running app, with the meter stubbed to stay pinned:
+claim at 2.3 s, panel open at 3.6 s, then **0 → −4.2 → −8.4 → −12.6 dB** with a
+settle between each, and he **stops at three** rather than winding it to the
+floor.
+
+### Some faults are audible while you wait for him
+
+A clip is ruining what you are listening to *this second*; two blocks sitting on
+each other will still be true in a minute. Nothing in the agent had ever drawn
+that distinction, so a clip waited out his rest and was strolled to.
+
+- **`URGENT_RANK`** (100 — only `clip`) is the line, and it now decides one
+  thing only: how fast he does it.
+- **Everything interrupts his rest, and `restIn` is gone entirely.** It was the
+  gap he left between jobs — 0.8–3 s after a fix, up to 7.5 s after deciding to
+  stand about — and it gated the claim, so anything that went wrong during it
+  was left alone until the timer ran out. The first attempt at this narrowed the
+  gate to let a *clip* through, on the reasoning that some faults are audible and
+  some are not. The user's answer was better: **all actions should interrupt his
+  rest.** A pause nothing may interrupt is not a character trait, it is a delay
+  before work with a story attached, and it is invisible as a cause — from
+  outside there is nothing to distinguish "he is three seconds into a pause" from
+  "he has not noticed", and it reads as the second every time.
+  What is left is real and is enough: `nextScan` (a 0.35 s poll), `coolDown` on a
+  job just finished or failed, the `patience` grudge, and the `pace` switch. He
+  is unhurried because he *walks* slowly, not because he waits before starting.
+  Nothing else read the field, so it was deleted rather than left as state that
+  looks like it means something.
+- **Hurrying is two numbers, not one** (`HURRY_WALK` 1.35, `HURRY_WORK` 2.0),
+  and the gait is why. Gus's step frequency is *derived* — `speed · DUTY /
+  STRIDE` — so speed is cadence, and this folder already records 46 units/s
+  being tried and rejected as "correct arithmetic, ridiculous little man". One
+  1.9× multiplier would put him at 65 units/s: five footfalls a second, a
+  cartoon. The walk gets the brisk end; the panel, the knob and the head-shake —
+  which have no gait to look silly and hold most of the ceremony — get double.
+
+### His reach for a loose cable was four pixels
+
+`LOOSE_DIST` was 22 world units, which at the zoom people actually patch at is
+about four pixels of screen. The duty was on, he was willing, and he almost
+never found anything: a cable dropped *near* a port was outside his notice
+unless you had all but plugged it in yourself.
+
+The default is 48 — the same distance the editor uses for `END_SNAP` and for
+`minionBodyAt`, because "near this port" should mean one thing in this app — and
+it is a switch on his card (**Cable reach**, 12–160). One scan serves everybody,
+so it runs at the longest reach on the payroll and `Chore.dist` lets
+`jobAllowed` drop what is out of *this* minion's arms. Measured: an end 40 units
+from a port is invisible at 22 and a job at 48.
 
 ## The grudge is a cooldown, not a life sentence
 
@@ -757,6 +857,34 @@ chased.** However careful you are about making a target continuous, mode changes
 can still step it, and a single filter turns a step into a visible dart. Two
 filters make every one of them a curve. It is the cheapest possible insurance
 against the next discontinuity somebody adds.
+
+### The standoff is measured to the LOAD, not to the airframe (2026-08-14)
+
+`FERRY_NEAR` is the distance at which the *machine* is companionable. A cable in
+the gripper is a point and that is the whole story — but a block is not. It
+hangs from the gripper (`holdAt`: centred horizontally, `size.h` **below**), and
+blocks in this app run from a 60 px gain to a 300 px panel. One fixed radius put
+a small block politely to one side and drew a Speaker Rig straight across the
+pointer and the patch under it: the bigger the thing you asked it to carry, the
+more completely it covered what you were carrying it *to*. Reported as "the
+drone needs to include the height in the block for how much distance it keeps
+when holding a block".
+
+`Agent.loadExtent()` is the one fact the follow rules need — `{ halfW, below }`,
+zeroes for a cable, so every caller applies it unconditionally. Two rules use
+it:
+
+- **The resting standoff** adds the load's own reach *back along the line to
+  you*: `|nx| · halfW + max(0, −ny) · below`. Projected, not added flat, or a
+  tall block would shove the machine a block's height sideways as well as up.
+- **The viewport clamp** keeps the load inside the margin, not the aircraft —
+  otherwise a tall block hangs off the bottom edge and a wide one off the side,
+  which defeats the point of carrying it in the open.
+
+Read live rather than cached at pickup: a block can be resized, or re-laid-out
+by its own contents, while it is in the air. `openRift` already sized the hole
+from the load for the same reason; this is the same fact reaching the two rules
+that had not been told.
 
 ### A follower follows always, not only when it is loaded
 

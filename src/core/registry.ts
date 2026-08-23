@@ -189,7 +189,8 @@ export type VisualKind =
   | 'speakers'
   | 'path'
   | 'matrix'
-  | 'tempo';
+  | 'tempo'
+  | 'tuner';
 
 export interface BlockDef {
   type: string;

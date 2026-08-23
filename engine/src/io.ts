@@ -890,6 +890,85 @@ interface SweepState {
  *  would stall a synchronous stdout write. See `SpeakerSweepMsg`. */
 const CAP_CHUNK = 8192;
 
+/**
+ * Depth of the ASIO master's output queue, in quanta — i.e. the standing
+ * output latency the duplex ASIO path is carrying. See `IoManager.asioPump`
+ * for why the queue exists and why it must be bounded here.
+ *
+ * **This is a class, not three fields on `IoManager`, because the bug it
+ * guards against was a stray statement rather than wrong logic.** The three
+ * transitions below are the *entire* model of the queue, and they are only
+ * correct as a set:
+ *
+ *   - `step()` subtracts what the audio thread consumed since the previous
+ *     callback. Wall clock is the honest source: the audio thread pops exactly
+ *     one buffer per quantum-duration of real time, whatever the event loop is
+ *     doing.
+ *   - `wrote()` adds the one buffer a successful `write()` enqueued.
+ *   - **Skipping a write does nothing at all** — it is the *absence* of
+ *     `wrote()`, and that is the whole of it.
+ *
+ * The regression (shipped, and reported as "a simple ASIO in to ASIO out has
+ * 800 ms of delay") was an extra `depth -= 1` on the skip path, which counted
+ * the same pop twice. The estimate then fell at 2 quanta per callback while
+ * the real queue fell at 1, so skipping stopped while the driver still held
+ * half the backlog. Worst in the startup burst it exists to clean up: N
+ * callbacks posted during an event-loop stall arrive in one tick with
+ * `elapsed ≈ 0` between them, so rather than saturating and skipping all N,
+ * the estimate oscillated write→2, skip→1, write→2 … and wrote every *other*
+ * one. Writes and pops are 1:1 forever, so nothing ever drained those, and the
+ * stream came up carrying **half the stall as permanent delay**, independent
+ * of buffer size. Asserted by `scripts/asio-queue-test.cjs`.
+ *
+ * Allocation-free: one long-lived instance per `IoManager`, plain number and
+ * bigint fields, no object returned from the hot path (golden rule 1).
+ */
+export class AsioQueue {
+  /** Quanta of output lead the ASIO duplex path is allowed to carry. Two
+   *  absorbs ordinary event-loop jitter; anything more is pure delay. */
+  static readonly MAX_LEAD = 2;
+
+  /** Estimated buffers sitting in RtAudio's output queue. */
+  depth = 0;
+  private lastNs = 0n;
+  /** Whether `lastNs` holds a real reading yet. A separate flag rather than
+   *  `lastNs === 0n`: that sentinel is indistinguishable from a genuine
+   *  timestamp of zero, which costs the first quantum after a reset its drain
+   *  and leaves the estimate permanently one buffer above the truth. Harmless
+   *  against `process.hrtime.bigint()` (its origin is never zero) and exactly
+   *  the kind of latent off-by-one this class exists to make impossible. */
+  private primed = false;
+
+  /** A fresh stream starts with an empty output queue and no history. */
+  reset(): void {
+    this.depth = 0;
+    this.lastNs = 0n;
+    this.primed = false;
+  }
+
+  /**
+   * Account for what the audio thread consumed since the previous callback,
+   * and report whether this callback's write must be **skipped** to pay the
+   * backlog down. Called once at the top of the pump, before anything can
+   * throw; nothing between there and the write touches `depth`, so deciding
+   * early is equivalent and keeps the bookkeeping unconditional.
+   */
+  step(nowNs: bigint, qDurSec: number): boolean {
+    if (this.primed) {
+      const elapsed = Number(nowNs - this.lastNs) / 1e9;
+      this.depth = Math.max(0, this.depth - elapsed / qDurSec);
+    }
+    this.lastNs = nowNs;
+    this.primed = true;
+    return this.depth >= AsioQueue.MAX_LEAD;
+  }
+
+  /** Exactly one buffer was enqueued by a successful `write()`. */
+  wrote(): void {
+    this.depth += 1;
+  }
+}
+
 export class IoManager {
   /** The audio pump: graph render for one quantum. */
   onQuantum: ((n: number, sr: number) => void) | null = null;
@@ -957,14 +1036,10 @@ export class IoManager {
   private asioIn: Float32Array[] = [];
   private asioOut: Float32Array[] = [];
   /**
-   * Estimated depth of the ASIO master's output queue, in quanta — i.e. the
-   * standing output latency this path is carrying. See `asioPump`.
+   * Depth of the ASIO master's output queue, in quanta — i.e. the standing
+   * output latency this path is carrying. See `AsioQueue` and `asioPump`.
    */
-  private asioQueue = 0;
-  private asioLastPumpNs = 0n;
-  /** Quanta of output lead the ASIO duplex path is allowed to carry. Two
-   *  absorbs ordinary event-loop jitter; anything more is pure delay. */
-  private static readonly ASIO_MAX_LEAD = 2;
+  private readonly asioQ = new AsioQueue();
   /** Warned once per stream open, so a trim storm can't flood the log. */
   private asioTrimmed = false;
   /** Quanta whose write was skipped to drain the ASIO output queue, since the
@@ -1297,8 +1372,7 @@ export class IoManager {
       this.asioIn = Array.from({ length: Math.max(1, inSpan) }, () => new Float32Array(MAXQ));
       this.asioOut = Array.from({ length: outSpan }, () => new Float32Array(MAXQ));
       // A fresh stream starts with an empty output queue and no history.
-      this.asioQueue = 0;
-      this.asioLastPumpNs = 0n;
+      this.asioQ.reset();
       this.asioTrimmed = false;
       this.allocScratch(outSpan);
       this.master = rt;
@@ -1832,15 +1906,11 @@ export class IoManager {
     this.markCallback();
     const n = this.frames;
     this.quantumId++;
-    // Depth bookkeeping, before anything can throw.
-    const nowNs = process.hrtime.bigint();
-    if (this.asioLastPumpNs !== 0n) {
-      const elapsed = Number(nowNs - this.asioLastPumpNs) / 1e9;
-      const qDur = n / Math.max(1, this.sampleRate);
-      // Real time is the honest clock for what the audio thread has consumed.
-      this.asioQueue = Math.max(0, this.asioQueue - elapsed / qDur);
-    }
-    this.asioLastPumpNs = nowNs;
+    // Depth bookkeeping, before anything can throw. `step` also decides
+    // whether this quantum's write has to be skipped; nothing between here and
+    // the write touches the depth, so deciding now is equivalent to deciding
+    // there — and it keeps the whole queue model inside `AsioQueue`.
+    const backlogged = this.asioQ.step(process.hrtime.bigint(), n / Math.max(1, this.sampleRate));
     if (input && inSpan > 0) {
       // Cached view — `new Float32Array(input.buffer, …)` here was a heap
       // allocation on every callback (~375/s at 128 frames), in the audio pump,
@@ -1864,12 +1934,17 @@ export class IoManager {
     }
     this.runProbe(n); // adds a click / reads input if a measurement is active
     this.runSweep(n); // plays / records a calibration sweep, if one is running
-    if (this.asioQueue >= IoManager.ASIO_MAX_LEAD) {
+    if (backlogged) {
       // Backlogged: the queue already holds more audio than the allowed lead,
       // so dropping this quantum is what pays the delay back. The graph has
       // already run, so nothing downstream (recorders, sequencers, the input
       // ring) skips a beat — only the write does.
-      this.asioQueue -= 1;
+      //
+      // **Skipping is the absence of `asioQ.wrote()` and nothing else** — no
+      // decrement belongs here; `step` already subtracted this quantum's pop.
+      // An extra one shipped once and cost 800 ms of standing delay; the whole
+      // account of that is on `AsioQueue`.
+      //
       // A skipped write is a whole quantum of audio the DAC never hears — an
       // audible discontinuity, not a bookkeeping detail. The one-shot `info`
       // below is deliberately once per stream open (a trim storm must not flood
@@ -1899,7 +1974,7 @@ export class IoManager {
       for (let c = 0; c < outSpan; c++) f[i * outSpan + c] = clip(this.asioOut[c][i]);
     try {
       this.master?.write(useA ? this.outWriteA : this.outWriteB);
-      this.asioQueue += 1;
+      this.asioQ.wrote();
     } catch {
       /* torn down */
     }
@@ -2178,15 +2253,24 @@ export class IoManager {
 
   /**
    * Estimated MIDI→DAC latency in ms: sub-quantum note starts make the event
-   * wait a constant one quantum, plus the primed output lead (1, or 2 after a
-   * re-arm), plus whatever the driver reports. Not a measurement — the
-   * loopback probe is — but tracks every code-side contributor, so the status
-   * bar shows regressions the day they happen.
+   * wait a constant one quantum, plus the output lead, plus whatever the
+   * driver reports. Not a measurement — the loopback probe is — but tracks
+   * every code-side contributor, so the status bar shows regressions the day
+   * they happen.
+   *
+   * **The lead is not always the primed one.** A duplex ASIO master is
+   * callback-fed and never calls `primeMaster`, so `masterWriteMode` is false
+   * there and this used to return a hardcoded 0 — on the single path that can
+   * accumulate *hundreds* of quanta in `asioPump`'s output queue. An 800 ms
+   * backlog therefore read out as one quantum, and since `late`, `jitterQ` and
+   * `xruns` are all genuinely clean while it happens (the pump is on time; the
+   * audio is just old), nothing in the status said anything at all. Report the
+   * queue estimate for that path so the standing delay is visible.
    */
   midiToDacMs(): number {
     if (!this.running || !this.sampleRate) return 0;
     const q = (this.frames / this.sampleRate) * 1000;
-    const lead = this.masterWriteMode ? (this.masterTopped ? 2 : 1) : 0;
+    const lead = this.masterWriteMode ? (this.masterTopped ? 2 : 1) : this.masterIsAsio ? this.asioQ.depth : 0;
     const drv = this.latencyFrames > 0 ? (this.latencyFrames / this.sampleRate) * 1000 : 0;
     return Math.round((q + lead * q + drv) * 10) / 10;
   }

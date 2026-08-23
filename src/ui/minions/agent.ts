@@ -29,7 +29,7 @@ import { runtime } from '../../engine/runtime';
 import type { Act, ActFrame, Gesture, KitFrame, MinionBody } from './body';
 import { hash01 } from './clock';
 import { CRANE_HOOK_TO_LOAD, CRANE_JIB_Y, craneRiseFor, craneTrolleyFor, type CraneFrame } from './gustools';
-import type { Chore } from './chores';
+import { type Chore, nextClipStep, stillClipping } from './chores';
 import { asMinion, noteMinionParam } from './marks';
 import { holdAt, type Payload, payloadAlive, payloadLabel, payloadLoad, restore } from './payload';
 import { minionDef, minionFlag, minionNum } from './roster';
@@ -176,6 +176,75 @@ const WALK_SPEED = 34;
  *  not a mile long at a very zoomed-out view. */
 const GONDOLA_DROP = 240;
 
+// ---------------------------------------------------------------------------
+// Urgency — some faults are audible while you wait for him
+// ---------------------------------------------------------------------------
+
+/**
+ * `Chore.rank` at or above which a job is **urgent**: it is making a noise right
+ * now. Only `clip` qualifies (100); hot is 60, a loose cable 45, an overlap 30.
+ *
+ * It decides **how fast he does it**, and nothing else. It briefly also decided
+ * whether a job could interrupt his rest, and that turned out to be a
+ * distinction not worth drawing — *everything* interrupts his rest now, because
+ * a pause nothing may interrupt is indistinguishable from not having noticed.
+ * See `doIdle`.
+ *
+ * What is left is the honest half: a block clipping is ruining what you are
+ * listening to *this second*, and two blocks sitting on each other will still be
+ * true in a minute. He strolls to the second and gets a move on for the first.
+ */
+const URGENT_RANK = 100;
+
+/**
+ * How much faster he runs while he is on an urgent job — **two numbers, because
+ * the walk and the work have different ceilings.**
+ *
+ * It was tempting to use one, applied to the frame time, on the grounds that a
+ * man in a hurry does all of it faster. The gait is what stops that. Gus's walk
+ * is derived, not authored: the foot is planted and the step frequency falls out
+ * as `speed · DUTY / STRIDE` (`gus.ts`), so speed *is* cadence. At `WALK_SPEED`
+ * 34 that is a shade under three footfalls a second; the folder's own history
+ * records 46 being tried and rejected as *"correct arithmetic, ridiculous little
+ * man"*. A single 1.9× would put him at 65 units a second — five footfalls a
+ * second, a cartoon.
+ *
+ * So the walk gets 1.35 (34 → 46: the brisk end, visibly shorter and faster
+ * steps, which is exactly the case the gait comment anticipates and which reads
+ * as hurrying rather than as scurrying) and everything with no gait in it — the
+ * panel, the hand on the knob, the head-shake — gets 2.0, where there is nothing
+ * to look silly. Most of the ceremony is in the second group anyway: 1.65 s of
+ * lid and verdict around a 0.7 s fix.
+ *
+ * Both compose with the `pace` switch, so anyone who wants him faster still has
+ * that lever.
+ */
+const HURRY_WALK = 1.35;
+const HURRY_WORK = 2;
+/** Phases with a gait (or a rope) in them, which is what caps `HURRY_WALK`. */
+const MOVING_PHASES: ReadonlySet<Phase> = new Set<Phase>(['travel', 'gondola', 'seek']);
+
+/** Is this the kind of job you can hear? */
+const isUrgent = (c: Chore | null): boolean => !!c && c.rank >= URGENT_RANK;
+
+/**
+ * How many ~4 dB bites he may take at one clip in a single visit, and how long
+ * he waits between them for the meter to tell him whether it worked.
+ *
+ * **The wait is in wall-clock milliseconds, not in his own scaled time.** The
+ * peak meter decays on real seconds (the web engine multiplies it by 0.9 per
+ * poll — about 0.4 s to fall 20 dB), and `step` scales his `dt` by `pace` and
+ * again by `HURRY`. A settle counted in agent-time would therefore get *shorter*
+ * exactly when he is hurrying, and he would read a peak from before his own last
+ * change and cut again on the strength of it. That is the failure mode that
+ * turns "he fixes it" into "he turned my gain to nothing".
+ *
+ * Three bites is ~12 dB, which covers everything short of a genuine mistake; a
+ * fourth would be him deciding your patch is wrong rather than fixing a fault.
+ */
+const CLIP_BITES = 3;
+const CLIP_SETTLE_MS = 520;
+
 export class Agent {
   readonly id: string;
   private body: MinionBody;
@@ -200,7 +269,6 @@ export class Agent {
   private gestureLen = 1;
   private mood = -0.15;
   private boxLid = 0;
-  private restIn = 0;
   private nextScan = 0;
   private spawnFrom = -220; // world y the gondola drops from
   /**
@@ -337,7 +405,12 @@ export class Agent {
    */
   step(dt: number, w: WalkWorld, graph: Graph, theme: Theme, ctx: AgentCtx): AgentPose | null {
     const pace = Math.max(0.3, minionNum(this.id, 'pace'));
-    dt = Math.min(0.05, dt) * pace;
+    // URGENCY: on a job you can hear, he gets a move on — see `HURRY_WALK` /
+    // `HURRY_WORK`. Applied to the frame time rather than to `WALK_SPEED`, so
+    // the gait, the hop timing and the value ramp all stay in step with each
+    // other; only the ceiling differs between moving and working.
+    const hurry = !isUrgent(this.job) ? 1 : MOVING_PHASES.has(this.phase) ? HURRY_WALK : HURRY_WORK;
+    dt = Math.min(0.05, dt) * pace * hurry;
     this.phaseT += dt;
     this.recoil = Math.max(0, this.recoil - dt * 3.5);
     this.riftT = Math.max(0, this.riftT - dt);
@@ -385,7 +458,6 @@ export class Agent {
     } else if (!this.load && this.phase === 'ferry') {
       this.phase = 'idle';
       this.phaseT = 0;
-      this.restIn = 0.5;
       // Back onto whatever it is over, so the surface-relative machinery has
       // somewhere to resume from.
       const perch = nearestPerch(w, graph, this.world);
@@ -523,7 +595,6 @@ export class Agent {
         this.abandon();
         this.phase = 'idle';
         this.phaseT = 0;
-        this.restIn = 0.6;
       }
     } else {
       this.stalled = 0;
@@ -557,19 +628,38 @@ export class Agent {
     }
     this.phase = 'idle';
     this.phaseT = 0;
-    this.restIn = 0.4;
     this.hatch = null;
     this.spawnShut = 0;
   }
 
   private doIdle(dt: number, w: WalkWorld, graph: Graph, theme: Theme, ctx: AgentCtx, quiet: boolean): void {
     this.mood = approach(this.mood, -0.12, dt, 0.6);
-    this.restIn -= dt;
     this.nextScan -= dt;
     this.looseEnd += dt;
-    if (quiet || this.restIn > 0 || this.nextScan > 0) return;
+    if (quiet || this.nextScan > 0) return;
     this.nextScan = 0.35;
 
+    // **WORK ALWAYS WINS OVER STANDING ABOUT** (2026-08-14).
+    //
+    // There used to be a `restIn` timer here — the gap he left between jobs,
+    // 0.8–3 s after a fix and up to 7.5 s after deciding to stand about — and it
+    // gated this claim, so anything that went wrong during it was left alone
+    // until the timer ran out. It was first narrowed to let a *clip* through, on
+    // the reasoning that some faults are audible and some are not, and the
+    // user's answer settles it better than the distinction did: **all actions
+    // should interrupt his rest.**
+    //
+    // Which is right, because a "rest" nothing may interrupt is not a character
+    // trait, it is a delay before work with a story attached — and it is
+    // invisible as a cause. From outside there is nothing to distinguish "he is
+    // three seconds into a pause" from "he has not noticed", and the second is
+    // what it reads as every time.
+    //
+    // What remains is real and is enough: `nextScan` (a 0.35 s poll, so this
+    // costs the same as it did), `coolDown` on a job he has just failed or
+    // finished, the `patience` grudge on a control you took back, and the `pace`
+    // switch. He is unhurried because he walks and opens panels slowly, not
+    // because he waits before starting.
     const job = ctx.claim(this);
     if (job) {
       this.job = job;
@@ -621,7 +711,6 @@ export class Agent {
     this.idleN++;
     const r = hash01(this.idleN * 7.7 + this.world.x * 0.013);
     this.phaseT = 0;
-    this.restIn = 0.8 + r * 2.2;
 
     // **What it picks FROM is the character's, not this file's.** See
     // `MinionDef.idle`: the vocabulary below is generic, the repertoire is not,
@@ -661,14 +750,12 @@ export class Agent {
         // is the state a body is free to fill with idling of its own, and it is
         // the only one ORDERLY 7 can perform in — its tricks fire from a
         // settled hover and are cancelled by any act at all.
-        this.restIn = 2.5 + r * 5;
         return;
       default:
         this.playGesture(pick as Gesture, 1.4 + r * 1.3);
         return;
     }
     // The settled behaviour it wanted is not unlocked yet; stand about instead.
-    this.restIn = 1.5 + r * 2.5;
   }
   private afterSeek: 'idle' | 'sit' | 'lunch' = 'idle';
 
@@ -1166,6 +1253,13 @@ export class Agent {
       this.phase = 'fix';
       this.phaseT = 0;
       this.done = false;
+      // One visit's worth of bookkeeping for the multi-bite clip fix below.
+      // `fixFrom` is where the control stood when he put his hand on it, and it
+      // is what the work mark is measured from however many bites follow.
+      this.bites = 0;
+      this.settleUntil = 0;
+      this.lastFixV = NaN;
+      this.fixFrom = this.job?.from ?? 0;
     }
   }
 
@@ -1176,17 +1270,28 @@ export class Agent {
     return 0.7;
   }
 
+  /** Multi-bite clip fix — see the block comment in `doFix`. */
+  private bites = 0;
+  private settleUntil = 0;
+  private fixFrom = 0;
+  /** Last value actually sent, so the settle does not re-send it every frame. */
+  private lastFixV = NaN;
+
   private doFix(dt: number, graph: Graph): void {
     // The value moves only while his hand is on it, so a gain visibly slides
     // rather than jumping.
     const u = Math.min(1, this.phaseT / this.fixDur());
     if (this.job && this.job.paramId && this.job.from != null && this.job.to != null) {
       const b = doc.block(this.job.blockId);
-      if (b) {
-        const v = this.job.from + (this.job.to - this.job.from) * (u * u * (3 - 2 * u));
+      const v = round2(this.job.from + (this.job.to - this.job.from) * (u * u * (3 - 2 * u)));
+      // Skipped when the value has not moved — the settle below holds him at
+      // `u >= 1` for half a second, and re-sending the same number 30 times is
+      // 30 engine messages and 30 repaints for no change at all.
+      if (b && v !== this.lastFixV) {
+        this.lastFixV = v;
         asMinion(() => {
-          b.params[this.job!.paramId!] = round2(v);
-          runtime.sendParam(runtime.nodeId(b.id), this.job!.paramId!, round2(v));
+          b.params[this.job!.paramId!] = v;
+          runtime.sendParam(runtime.nodeId(b.id), this.job!.paramId!, v);
         });
         doc.touch('param');
       }
@@ -1195,9 +1300,46 @@ export class Agent {
       this.done = true;
     }
     if (u >= 1) {
+      // A CLIP GETS AS MANY BITES AS IT TAKES, IN ONE VISIT.
+      //
+      // The cut is ~4 dB (`CLIP_CUT_DB`), and the meter cannot say how far over
+      // the top a signal is — it reports a peak that is pinned at full scale, so
+      // 4 dB over and 20 dB over look identical from here. One bite therefore
+      // fixes some clips and not others, and the ones it does not fix used to
+      // cost a whole second journey: close the panel, shake his head, walk off,
+      // wait out the scan, walk back. Several of those in a row is precisely
+      // what "he sucks at quickly levelling blocks that are clipping" feels
+      // like from the outside.
+      //
+      // So he keeps his hand on the knob, waits for the meter to catch up, and
+      // takes another 4 dB if it is still pinned. Bounded three ways, because a
+      // loop that turns somebody's gain down on its own has to be: a bite
+      // count, the control's own `min` (in `quieterValue`), and a settle that
+      // is measured in WALL-CLOCK time — the meter decays on real seconds and
+      // his `dt` is scaled by `pace` and `HURRY`, so a paced timer would let a
+      // hurrying man read a stale peak and cut again on the strength of it.
+      if (isUrgent(this.job) && this.job?.paramId) {
+        if (this.settleUntil === 0) this.settleUntil = performance.now() + CLIP_SETTLE_MS;
+        if (performance.now() < this.settleUntil) return;
+        this.settleUntil = 0;
+        const b = doc.block(this.job.blockId);
+        const next =
+          b && this.bites < CLIP_BITES - 1 && stillClipping(this.job.blockId)
+            ? nextClipStep(b, this.job.paramId)
+            : null;
+        if (next !== null && b) {
+          this.bites++;
+          this.job.from = Number(b.params[this.job.paramId]) || 0;
+          this.job.to = next;
+          this.phaseT = 0;
+          if (this.bites === 1) this.say('STILL PINNED.', 2);
+          return;
+        }
+      }
       if (this.job?.paramId && !this.done) {
-        // Register the work mark once, at the end, with the true from/to.
-        noteMinionParam(this.job.blockId, this.job.paramId, this.job.from!, this.job.to!);
+        // Register the work mark once, at the end — from where the value stood
+        // when he arrived to where it ended up, however many bites that took.
+        noteMinionParam(this.job.blockId, this.job.paramId, this.fixFrom, this.job.to!);
         this.done = true;
       }
       this.phase = 'close';
@@ -1248,7 +1390,6 @@ export class Agent {
       } else {
         this.phase = 'idle';
         this.phaseT = 0;
-        this.restIn = 1 + Math.random() * 2;
       }
       this.afterSeek = 'idle';
       return;
@@ -1543,6 +1684,24 @@ export class Agent {
   }
 
   /**
+   * How far the load sticks out from the gripper, in world units.
+   *
+   * The one fact the follow rules need about what it is carrying, and the one
+   * they used to ignore: `holdAt` centres a block on the gripper horizontally
+   * and hangs it **below**, so its footprint is `size.w / 2` each side and
+   * `size.h` down. A cable end is a point and returns zeroes, which is why
+   * every caller can apply this unconditionally.
+   *
+   * Read live rather than cached at pickup: a block can be resized, or
+   * re-laid-out by its own contents, while it is in the air.
+   */
+  private loadExtent(): { halfW: number; below: number } {
+    const b = this.load?.kind === 'block' ? doc.block(this.load.blockId) : null;
+    if (!b) return { halfW: 0, below: 0 };
+    return { halfW: b.size.w / 2, below: b.size.h };
+  }
+
+  /**
    * Hand it something. Returns false if it already has a block — **it declines
    * rather than swapping**, because silently putting down the thing you gave it
    * a moment ago is the worst possible answer.
@@ -1748,14 +1907,33 @@ export class Agent {
       tx = (this.world.x + p.x) / 2;
       ty = (this.world.y + p.y) / 2;
     } else {
-      const rest = this.load ? FERRY_NEAR : FERRY_FAR;
       // Blended, not branched: at rest it sits up and to one side, and as you
       // pick up speed that slides continuously into your wake.
       const bx = -ux * hot + 0.5 * (1 - hot);
       const by = -uy * hot - 0.86 * (1 - hot);
       const bl = Math.hypot(bx, by) || 1;
-      tx = p.x + (bx / bl) * rest;
-      ty = p.y + (by / bl) * rest;
+      const nx = bx / bl;
+      const ny = by / bl;
+      // **The standoff is measured to the LOAD, not to the airframe.**
+      //
+      // `FERRY_NEAR` is the distance at which the *machine* is companionable.
+      // A cable in the gripper is a point and that is the whole story, but a
+      // block is not: it hangs from the gripper, `size.h` deep and `size.w`
+      // wide, and blocks in this app run from a 60 px gain to a 300 px panel.
+      // So one fixed radius put a small block politely to one side and drew a
+      // Speaker Rig straight over the pointer and the patch under it — the
+      // bigger the thing you asked it to carry, the more completely it covered
+      // what you were carrying it *to*.
+      //
+      // The extra is the load's own reach back along the line to you: its
+      // half-width for the sideways part of that line, and its full height for
+      // the downward part, because it hangs *below* the gripper (`holdAt`) and
+      // at rest the machine sits above you. Projected rather than added flat, or
+      // a tall block would shove it a block's height sideways as well.
+      const ld = this.loadExtent();
+      const rest = (this.load ? FERRY_NEAR : FERRY_FAR) + Math.abs(nx) * ld.halfW + Math.max(0, -ny) * ld.below;
+      tx = p.x + nx * rest;
+      ty = p.y + ny * rest;
       const cone = this.coneEscape(tx, ty, p, ux, uy, hot);
       tx += cone.x;
       ty += cone.y;
@@ -1820,9 +1998,17 @@ export class Agent {
     // The margin is measured from the top of the airframe rather than the point
     // it hovers over, or it clips through the top edge by its own height every
     // time you work near the top of the screen.
+    //
+    // And from the far side of the LOAD, for the same reason and the same one
+    // as the standoff above: the block hangs below the gripper and sticks out
+    // each side of it, so keeping the *aircraft* inside the margin let a tall
+    // block hang off the bottom of the screen and a wide one off the side. What
+    // has to stay visible is the thing being carried — that is the whole point
+    // of carrying it in the open (`payload.ts`).
     const m = VIEW_MARGIN;
-    tx = Math.max(v.x + m, Math.min(v.x + v.w - m, tx));
-    ty = Math.max(v.y + m + this.body.height, Math.min(v.y + v.h - m, ty));
+    const lo = this.loadExtent();
+    tx = Math.max(v.x + m + lo.halfW, Math.min(v.x + v.w - m - lo.halfW, tx));
+    ty = Math.max(v.y + m + this.body.height, Math.min(v.y + v.h - m - lo.below, ty));
 
     // ---- fly there, through TWO filters ----
     // The target is smoothed before it is chased. One filter is not enough:
@@ -1893,7 +2079,6 @@ export class Agent {
     if (ctx.anyWork(this) || ctx.crowded(this.world.x, this.world.y) || this.phaseT > 26) {
       this.phase = 'idle';
       this.phaseT = 0;
-      this.restIn = 0.4;
     }
   }
 
@@ -1911,7 +2096,6 @@ export class Agent {
         this.phase = 'idle';
         this.phaseT = 0;
         this.boxLid = 0;
-        this.restIn = 0;
         this.looseEnd = 0;
       }
     }
@@ -1959,7 +2143,6 @@ export class Agent {
     this.looseEnd = 0;
     this.phase = 'idle';
     this.phaseT = 0;
-    this.restIn = 0.6 + Math.random() * 1.2;
   }
 
   private abandon(): void {

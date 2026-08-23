@@ -322,7 +322,14 @@ function esc(s: string): string {
 registerDockTab({
   id: 'minions',
   title: 'Minions',
-  icon: '🛠',
+  // A dock icon has to match its neighbours (⚙ ◫ ◎ ⊞), and that means a glyph
+  // the platform's TEXT font can draw. `🛠` is outside the BMP and no UI font
+  // carries it, so Chromium fell back to the colour emoji font and it rendered
+  // as the one full-colour thing on the rail — reported exactly that way. The
+  // emoji *property* is not the test (⚙ is an emoji code point and renders as
+  // line art); font coverage is. U+263B is in Miscellaneous Symbols, is not in
+  // emoji-data at all, and is old enough to be in essentially every font.
+  icon: '☻',
   hint: 'Minions — hire a little character to keep your patch in order',
   order: 25,
   build,

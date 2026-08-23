@@ -295,6 +295,22 @@ function drawVisualGlyph(g: CanvasRenderingContext2D, r: { x: number; y: number;
   } else if (kind === 'midimon') {
     // Text-log glyph: a few left-aligned bars of varying length.
     for (let i = 0; i < 4; i++) g.fillRect(r.x + 3, r.y + 3 + i * (r.h / 4), r.w * (0.4 + 0.4 * ((i * 7) % 3) / 2), 2);
+  } else if (kind === 'tuner') {
+    // A meter movement: the arc, the centre mark, and a needle sitting a
+    // little off it — a needle ON zero reads as a dead pointer, not a tuner.
+    const cy2 = r.y + r.h - 3;
+    const rr = Math.min(r.w / 2 - 3, r.h - 6);
+    g.beginPath();
+    g.arc(r.x + r.w / 2, cy2, rr, Math.PI + 0.5, Math.PI * 2 - 0.5);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(r.x + r.w / 2, cy2);
+    g.lineTo(r.x + r.w / 2 + Math.cos(-1.05) * rr * 0.9, cy2 + Math.sin(-1.05) * rr * 0.9);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(r.x + r.w / 2, cy2 - rr * 0.78);
+    g.lineTo(r.x + r.w / 2, cy2 - rr);
+    g.stroke();
   } else if (kind === 'path') {
     // Trajectory: a looping curve inside a ring, evoking the plan-view editor.
     const cx = r.x + r.w / 2;

@@ -1435,7 +1435,7 @@ registerMinion({
     {
       id: 'pace',
       label: 'Pace',
-      hint: 'How fast he works and how long he leaves between jobs. Lower is a man who has seen it all before.',
+      hint: 'How fast he walks and works. Lower is a man who has seen it all before. He no longer waits before starting — anything that goes wrong gets his attention within a third of a second.',
       group: 'terms',
       type: 'range',
       def: 1,
@@ -1443,6 +1443,18 @@ registerMinion({
       max: 2,
       step: 0.1,
       unit: '×',
+    },
+    {
+      id: 'reach',
+      label: 'Cable reach',
+      hint: 'How near a dropped cable end has to be to a port before he counts it as one to push home. The old fixed 22 units was about four pixels on screen at a normal zoom, so he almost never found one.',
+      group: 'terms',
+      type: 'range',
+      def: 48,
+      min: 12,
+      max: 160,
+      step: 4,
+      unit: ' px',
     },
     {
       id: 'quiet',

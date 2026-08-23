@@ -1,6 +1,6 @@
 # 12 — Testing Checklist
 
-_Last verified: 2026-08-13._
+_Last verified: 2026-08-20._
 
 Run the items relevant to your change before committing. Many are scriptable
 against the running app or the engine process — prefer measurement over "looks
@@ -442,14 +442,23 @@ OS-level gestures that cause most of these.
       onto the canvas: a ghost chip follows the finger, highlights over the
       workspace, and drops a block. HTML5 DnD is mouse-only, so this is a
       separate code path (`beginTouchDrag`) and mouse drag must keep working too.
-- [ ] **Library drag-out by touch, straight DOWN.** Press a tile, *hold ~300 ms
+- [ ] **Library drag-out by touch, straight DOWN.** Press a tile, *hold ~220 ms
       until it lifts*, then drag straight down (and again straight up) onto the
       canvas. Both must drop a block. This is the axis the scroller owns, and it
       is only free because the hold came first — see Rule 10 in 14-input.md.
+- [ ] **Library drag-out, DIAGONALLY, with no hold.** Press a tile and go
+      straight for the canvas at ~45°. It must drag out immediately: the cone
+      that hands a gesture to the scroller is 2:1, not 1:1 (`SCROLL_CONE`).
 - [ ] **Library scrolls by touch.** A predominantly *vertical* drag on a tile,
-      started *without* waiting for the lift, scrolls the list and does NOT drag
-      a block out. Run this one right after the test above: they are the same
-      gesture and only the hold separates them.
+      started *without* waiting for the lift **and with somewhere to scroll**,
+      scrolls the list and does NOT drag a block out. Run this one right after
+      the test above: they are the same gesture and only the hold separates them.
+      Then scroll to the very top and drag *down* from a tile with no hold — with
+      nothing left to scroll, that one must drag the block out instead of doing
+      nothing at all.
+- [ ] **Ten drag-outs in a row all work.** This is the actual regression: the old
+      timings failed roughly half of them and each individual failure looks like
+      you fumbled it. Count them.
 - [ ] **A lifted tile still gives its context menu.** Hold a tile past the lift
       and keep holding *without moving*: the tile menu (Pin / Rename / Delete)
       must still open. Lifting arms a drag; it does not consume the press.
@@ -466,7 +475,20 @@ OS-level gestures that cause most of these.
       all grabbable with a finger (tolerances widen ~2.6× for touch/pen).
       Verify mouse precision is *unchanged*.
 - [ ] Piano roll pinch zooms **both** axes — spread horizontally for time,
-      vertically for pitch.
+      vertically for pitch — and **spreading zooms IN** on both. A view span is
+      the reciprocal of a finger-separation ratio; the roll multiplied instead of
+      dividing and every pinch on it ran backwards.
+- [ ] **Two fingers on the piano roll create no note.** In Draw mode, put one
+      finger on empty grid and land the second: the note the first one made must
+      **disappear**, not stay. Then pan and pinch freely — the score must be
+      unchanged when you lift. (`PianoRoll.cancelDrag` reverts; the press itself
+      is the edit on this surface.)
+- [ ] **Nothing raises the on-screen keyboard except tapping a text field.** Tap
+      a loose cable end (which arms quick-add and opens the Library) and patch
+      normally for a minute. The keyboard must never appear on its own.
+- [ ] **Appearance ▸ Ports ▸ Connect range** widens where a cable connects, on
+      mouse and on touch, and 0 leaves the old feel exactly as it was. Check the
+      *drop*, not just the hover: they used to be different radii.
 
 ### The input standard ([`14-input.md`](14-input.md)) — run for any UI change
 
@@ -518,11 +540,17 @@ tab:**
 - [ ] Spreading past ~24 px starts zooming, and there is **no jump** at the
       moment it engages.
 - [ ] A third finger landing (and lifting) mid-gesture does not throw the view.
-- [ ] Two-finger **tap** opens the context menu, including over a live widget
-      where long-press is deliberately suppressed.
+- [ ] Two-finger **tap** opens **nothing** (removed 2026-08-14, rule 12). Put two
+      fingers down, think better of it, lift: no menu. The long-press menu is
+      unaffected — check that too, on empty canvas and on a block title.
+- [ ] **A hold over a keyboard/button/XY pad opens its menu in `Mode: Edit`, and
+      does NOT in patch mode.** Both halves: in patch mode the note must sound
+      and no menu appear; press `E` and the same hold must open the widget's own
+      menu (Set value…, Control ▸, Add CV input). This is the touch route to
+      those items now that the two-finger tap is gone.
 - [ ] Two fingers cancel whatever one finger had started (a knob stops taking
-      values, a held button releases), and a lone remaining finger does **not**
-      resume it.
+      values, a held button releases, a note just drawn on the roll is **taken
+      back**), and a lone remaining finger does **not** resume it.
 
 **Trackpad, all surfaces:**
 
@@ -621,6 +649,10 @@ mid-gesture flips, and how many events carried both axes.
       kernel latches. **Required for any new or edited kernel that carries state
       across quanta**, and for anything touching `trapNonFinite` or
       `VstKernel.scrub`. See "Non-finite recovery across every kernel" below.
+- [ ] Tuner: `npm run build:engine && node --expose-gc scripts/tuner-kernel-test.cjs`
+      — accuracy inside a cent, no octave errors, `ref`/`tol`/`lock` agree, and
+      **zero** garbage. Required for any change to the `tuner` kernel, the web
+      unit that mirrors it, or `src/core/pitch.ts`. See "Tuner probe" below.
 - [ ] `status.late == 0` and `status.xruns` stable during a soak (watch the
       status bar or the smoke output).
 - [ ] `status.loadMax` did not materially rise vs. before.
@@ -631,6 +663,15 @@ mid-gesture flips, and how many events carried both axes.
       bridge).
 - [ ] HF transparency of any resampler change: 15 kHz ripple < ~0.5 dB.
 - [ ] `asio-in → asio-out` still adds no latency (bypasses the ring).
+- [ ] ASIO output queue: `node scripts/asio-queue-test.cjs` — no standing
+      backlog after a stall, and the estimate tracks the real queue **exactly**.
+      (Any change to `AsioQueue`, `asioPump`, or the priming/lead logic.)
+- [ ] **A latency complaint is not disproved by clean counters.** A standing
+      ASIO output backlog leaves `late` 0, `jitterQ` ~1, `xruns` 0 and `load`
+      low — the pump is on time, the audio is just old. Measure the round trip
+      (Options → *Measure round-trip latency…*, over a real loopback) and read
+      its quantum / capture-buffer / driver-reported breakdown before
+      concluding anything from the status line.
 - [ ] MIDI path: `node scripts/midi-latency.cjs` — offset accuracy OK, output
       lead still 1 buffer on a healthy stream, `midiToDacMs` did not rise, and
       the status bar's `midi ~Xms` matches. (Any change to the MIDI path,
@@ -835,6 +876,27 @@ by a number or a picture. See [`15-minions.md`](15-minions.md).
       `align` and `space` were each correct alone and together had no fixed
       point, and one frame of the resulting oscillation looks exactly like one
       frame of a machine doing its job.
+- [ ] **He turns down a clipping GAIN BLOCK**, which is the one to test because
+      its control is in **dB**: the old linear `× 0.62` made 0 dB stay at 0 dB
+      (he crossed the patch and moved nothing) and −6 dB go *up*. Watch the
+      number: it must fall by about 4 dB per bite.
+- [ ] **He finds a clip whose culprit has no knob.** Patch something with no
+      output control — Upmix, Pan, a hosted VST — between a source and the
+      output and drive it into clipping. He must fix it at the nearest control
+      **downstream**, not stand there. This was "he can't identify them": 51 of
+      80 block types failed the old level-param test and every one of them was
+      a chore silently dropped.
+- [ ] **A clip that needs more than one bite gets it in one visit**, with a
+      pause between bites, and he **stops at three** rather than winding the
+      control to its floor. Turn something up hard, not just over the line.
+- [ ] **Anything wrong interrupts his rest** — a clip, a loose cable, an overlap
+      alike. Let him settle, then break something: he must set off within about a
+      third of a second, not when some pause runs out. (`restIn` is gone; if a
+      wait ever comes back, this is the line that catches it.) On a *clip* he
+      must also visibly get a move on: shorter, faster steps, quicker panel.
+- [ ] **Cable reach.** Drop a cable end about half a block's width from a free
+      port. He must take it. Then wind **Cable reach** down on his card and check
+      the same drop is now ignored — the switch has to do something.
 - [ ] **Carrying** (`payload.ts`): give it a block, drag it about, snatch it
       back, and check the block's own cables followed it the whole way. Then
       give it a block and **wire something to the block while it is held** —
@@ -1594,6 +1656,27 @@ crosspoints keep their gains, new ones start closed, short/missing grid rows pad
 with zeros), the one-quantum ramp when a crosspoint opens (a step there is a
 click — docs/10 rule 10), the truncation rules for a narrow source on a wide
 output, and zero allocation in `process`.
+
+## Tuner probe
+
+```
+npm run build:engine && node --expose-gc scripts/tuner-kernel-test.cjs
+```
+
+A tuner is only worth having if you can believe the number, so every assertion
+here is in **cents** and none of them is loose: sub-cent accuracy on sines from
+41 Hz to 1.6 kHz, within two cents on harmonic-rich tones (the case that catches
+the classic octave-down error of every autocorrelation detector), `ref` moving
+the cents/lock outputs without moving the reported Hz, `lock` respecting `tol`,
+silence releasing rather than latching, the audio passing through at full width,
+and the note NAMING in `src/core/pitch.ts` — which is the half of the reading no
+engine ever sees, and where an octave slip is invisible to everything else.
+
+The allocation check is the one to copy. It re-runs itself as a child under
+`--trace-gc --max-semi-space-size=1` and counts scavenges, because `heapUsed`
+before/after — what `scripts/audio-alloc-test.cjs` reads — cannot distinguish a
+kernel throwing away 2 MB a second from one allocating nothing. See the
+closure-`let` entry in [`10-performance.md`](10-performance.md).
 
 ## Tempo Follow probe (reusable)
 

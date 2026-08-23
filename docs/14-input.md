@@ -1,6 +1,6 @@
 # 14 — Input Standard: Touch, Trackpad, Mouse and Pen
 
-_Last verified: 2026-08-12. Files: `src/ui/input.ts` (the implementation), `electron/keys.cjs`, `src/ui/keylearn.ts`,
+_Last verified: 2026-08-14. Files: `src/ui/input.ts` (the implementation), `electron/keys.cjs`, `src/ui/keylearn.ts`,
 every `src/ui/*.ts` that owns a canvas or a drag handle, `src/styles.css`._
 
 > **This document is normative.** Any new interactive surface — a canvas, a deep
@@ -42,8 +42,8 @@ them.
 | **click/tap a loose cable end** | select it: ask the Library for a block to finish it (`ui/placement.ts`) |
 | one finger **held, then dragged** | drag an item out of a scrolling list (the Library) |
 | **two fingers** | **pan the view** — always, on every surface that has a view |
-| two fingers, spread past the deadzone | *additionally* zoom |
-| two-finger **tap** | context menu (touch's right-click over widgets that own a held press) |
+| two fingers, spread past the deadzone | *additionally* zoom — **spreading zooms IN**, on every surface |
+| two-finger **tap** | **nothing** (removed 2026-08-14 — see rule 11) |
 | one-finger **long-press** (500 ms) | context menu — anywhere except a widget whose press *is* the interaction |
 
 ### Mouse and trackpad
@@ -253,6 +253,53 @@ a surface that gains panning later must not keep zooming on a trackpad by
 accident. A gesture that resolves to "pan" on a surface with nothing to pan is a
 dead gesture, and no gesture may silently do nothing (docs/07-ui.md).
 
+### A pinch ratio is a SEPARATION, and a view span is its reciprocal
+
+`TwoPointerGesture` reports `zoom`, `zoomX` and `zoomY` as *how much further
+apart the fingers are than they were*. Anything above 1 means spreading, and
+spreading means **zoom in**.
+
+So what you do with it depends on which way your view state runs:
+
+| the view variable is… | apply | example |
+|---|---|---|
+| a **scale** (px per unit) — bigger is closer | `× ratio` | the workspace canvas's `view.scale` |
+| a **span** (how much is on screen) — bigger is *further away* | `÷ ratio` | the Roll's `beats` and `rows`, the waveform's `t1 - t0` |
+
+Getting it the wrong way round does not look like a bug in code review — it is
+one character — and it is unmissable in the hand: the Roll's per-axis pinch
+multiplied its spans instead of dividing them, so **every pinch on the piano
+roll ran backwards** while every other surface in the app was right. Reported as
+"zooming is backwards". It survived as long as it did because the roll's *wheel*
+zoom (`PianoRoll.zoomAt`) divides correctly, so the two paths on the same
+surface disagreed and only the touch one was wrong.
+
+Verified 2026-08-14 by measurement rather than by eye, because "backwards" is
+the one property that a screenshot cannot settle: tap the grid at a fixed x to
+read what beat is there, spread the fingers, tap again. The beat at x = 250 went
+**6.25 → 4.5** — less score across the same pixels, i.e. zoomed in.
+
+### The gesture must undo what the first finger already did
+
+Rule 8 (below) says two fingers cancel the single-finger interaction *without
+committing it*. On a surface where the press **is** an edit, "cancel" has to
+mean **revert**, not merely "stop".
+
+The piano roll is that surface: in Draw mode `PianoRoll.down` creates a note on
+`pointerdown` itself — no threshold, no wait, because tap-to-add is the whole
+gesture. `cancelDrag` dropped the drag state and left the note. So every
+two-finger pan and every pinch began by writing a note wherever the first finger
+landed, and there was no way to put two fingers on the grid without editing the
+score: *"zooming/panning almost always creates an unwanted note"*.
+
+`cancelDrag` now takes the roll data and puts back what the gesture had already
+done — the created note removed, a move or a length-stretch restored from the
+baseline it snapshotted. Before writing a two-finger handler on a new surface,
+ask what the *first* finger has already changed, and whether you can undo it.
+
+Verified 2026-08-14 in the running app with synthetic touch pointers: one finger
+on the grid → 1 note; second finger down → **0 notes**; release → 0.
+
 ## Rule 3 — Hit targets scale with the pointer
 
 **A cursor is one pixel and you can see what is under it. A fingertip is ~10 mm
@@ -292,6 +339,26 @@ is, in part, a request for a bigger target.
 It is capped just under `BRANCH_DEADZONE`, because the end-grab and the
 branch-spawn live on the same cable a few px apart and the deadzone is the only
 thing keeping them separable.
+
+### …and the range that connects a cable is the USER's number
+
+`theme.connectRange` (Appearance ▸ Ports ▸ **Connect range**, 0–40 px) is added
+to every port hit test for wiring, on every platform, and `COARSE_SLOP` still
+multiplies the result for a finger. Two things about it are deliberate:
+
+- **It is one setting, not a per-platform constant.** How much catchment a port
+  wants depends on the patch density, the zoom, the screen and the hand, and no
+  constant we pick is right for a phone and a 4K monitor at once. Shipping a
+  different hidden number per build is how the desktop and the Android versions
+  end up feeling like different apps. Default 0 — the slider only ever adds, so
+  nobody's existing feel changes.
+- **Every wiring hit test goes through `Editor.portGrab`.** There were four
+  literals (`portRadius + 6 / + 7 / + 8`) and **two of them never widened for
+  touch at all** — the ones on the drag and on the drop. So a fingertip lit a
+  port up (the *press* had used the generous radius), and then the release asked
+  the mouse-sized question and dropped the cable on the floor. A preview and a
+  drop that disagree are worse than a target that is merely small: the app
+  promises the connection one frame before refusing it.
 
 ## Rule 4 — `setPointerCapture` always goes through `capture()`
 
@@ -426,8 +493,12 @@ Suppress only where the press *is* the interaction (`HOLD_WIDGETS` in
 `editor.ts`): `keys` sounds while held, `button` is momentary, `select` opens a
 modal, and `toggle`/`xy`/`wavedraw`/`seqgrid`/`sampleview` commit at the point
 touched before anyone knows it is a hold. Same for the three visuals that act on
-press (`eq`, `matrix`, `speakers`); an inert visual is holdable. Two-finger tap
-stays the escape hatch for the rest.
+press (`eq`, `matrix`, `speakers`); an inert visual is holdable.
+
+Two escape hatches for the rest, and neither is a new gesture: the block's
+**title band** (never a widget, so a hold there always reaches the block's menu)
+and **arrange mode**, where no widget owns its press at all and a hold over one
+opens its own menu. See rule 12.
 
 Verified 2026-08-03 in the running renderer with synthetic touch pointers: hold
 on empty canvas, on a block title, on a block title with 1 px of jitter, and on a
@@ -466,6 +537,92 @@ Three things this depends on:
   the context menu — same principle as Rule 9 in reverse. Keep holding without
   moving and the menu still arrives.
 
+### The hold is a race against the compositor, and it was losing (2026-08-14)
+
+Reported as *"dragging blocks out of the library works like half of the time —
+it often takes several drags before it figures out that I'm trying to take a
+block"*. Three separate causes, all of them the same shape: the gesture had to
+declare itself before the browser claimed it, and the rules were too strict to
+let an ordinary hand do that.
+
+1. **`LIFT_MS` was 300 ms.** Until the tile lifts, the touch belongs to the
+   scroller, and the moment the compositor commits to a scroll **every pointer
+   on the page gets `pointercancel`** — which kills the pending lift outright,
+   even if the finger then stops dead. A fingertip rolls a few px during any
+   deliberate press (that is the entire reason `dragThreshold` is 10 px for
+   touch), so a fair share of honest presses lost that race. Now 220 ms, which
+   is still nothing like a tap and is inside Android's own gesture-recogniser
+   window for the same decision.
+2. **The direction test was a 45° cone** (`|dy| > |dx|` = scroll). The canvas is
+   diagonally away from the panel in most dock layouts, so a drag aimed straight
+   at it was thrown to the scroller for being one degree off. `SCROLL_CONE` is
+   2:1 now: the near-vertical flick that scrolls is untouched, and everything
+   within ~63° of horizontal drags out.
+3. **It handed the gesture back even when the list had nowhere to go.** At the
+   top of the list a downward drag cannot scroll, so the hand-back went to
+   nobody: the list did not move, the tile did not lift, the press did nothing.
+   Same class of defect as "no drag on the canvas may do nothing"
+   ([`07-ui.md`](07-ui.md)) and not a rare case — filter the Library to a handful
+   of tiles and there is nothing to scroll at all. `canScroll(dy)` asks the
+   scroll container before refusing.
+
+Verified 2026-08-14 with synthetic touch pointers: hold-then-drag-down lifts and
+ghosts; a 45° drag ghosts immediately; a vertical flick **with** somewhere to
+scroll still goes to the scroller, in both directions.
+
+## Rule 11 — Never take focus into a text box on a touchscreen
+
+Focusing an `<input>` raises the on-screen keyboard over half the display. On a
+desktop, dropping the caret into a search box is a courtesy; on a phone it is an
+ambush, and — because the user did not touch anything that looks like a text
+field — it arrives with no visible cause at all. It was reported exactly that
+way: *"the on-screen keyboard keeps coming up during regular use… I'm not sure
+if I'm accidentally hitting a text box"*, and the culprit turned out to be
+**tapping the end of a wire**, which arms quick-add and used to focus the
+Library's search (`revealLibraryForPlacement`).
+
+- `notePointer(e)` / `lastPointerWasCoarse()` in `input.ts` record what the last
+  gesture was driven by. A media query cannot answer this — a convertible
+  reports `any-pointer: coarse` while a mouse is plugged in.
+- Anything that focuses an input as a *side effect* of a gesture defaults to
+  "only if the last pointer was not coarse". A route that is inherently a
+  keyboard one (`Ctrl+K`) overrides it to true: someone who typed a shortcut has
+  a keyboard, and typing is the point of that path.
+- The panel still opens and still says what it is waiting for. The search box is
+  one tap away for anyone who wants it.
+
+## Rule 12 — A two-finger tap opens nothing
+
+Removed 2026-08-14 on the user's report: *"tapping with two fingers should not
+bring up the right click menu"*.
+
+It was touch's right-click, for the widgets whose press is the interaction and
+where long-press is therefore suppressed. In the hand it mostly fired on a
+**failed navigation**: a pinch that never cleared `ZOOM_DEADZONE` and a pan
+under `TAP_SLOP` both measure as "a tap", so putting two fingers down to move
+the view and thinking better of it dropped a menu on the canvas. A gesture the
+user abandons has to do nothing — which is the mirror of "no drag may silently
+do nothing", and the same principle: the outcome must be the one that was asked
+for.
+
+**Arrange mode is what replaced it, and it needed no new gesture.** Over a
+`HOLD_WIDGETS` control (`keys`, `button`, `select`, `toggle`, `xy`, `wavedraw`,
+`seqgrid`, `sampleview`) a hold cannot open a menu in patch mode, because the
+press is the interaction — the note sounds. **Mode: Edit** already exists to
+*stop widgets working* so their layout can be edited: `pointerDown` returns at
+`editModeDown`, `widgetDown` never runs, and nothing sounds, latches or commits.
+So in that mode nothing owns the press, `ownsHeldPress` returns false for
+everything, and a hold opens the same widget menu it always did.
+
+That is the general principle worth keeping: **when a gesture is taken by an
+interaction, look for the mode that already turns that interaction off** before
+inventing a gesture to work around it. Every free gesture on a widget is free
+precisely because the widget is using the others.
+
+In patch mode the block's **title band** remains the hold that reaches every
+block-level item — it is never a widget. `TwoPointerGesture.isTap()` is left in
+place; it is correct, and nothing calls it.
+
 ---
 
 ## Checklist for a new interactive surface
@@ -488,8 +645,15 @@ actually shipped.
 - [ ] Every value wheel has a touch equivalent.
 - [ ] Hit tolerances go through `grabSlop()`.
 - [ ] Long-press context menu, suppressed **only** over widgets whose press is
-      itself the interaction (`HOLD_WIDGETS`); two-finger tap as the escape
-      hatch there. A hold on a knob or fader DOES open it.
+      itself the interaction (`HOLD_WIDGETS`). A hold on a knob or fader DOES
+      open it, and a hold on a block's title always does. A two-finger tap opens
+      **nothing** (rule 12).
+- [ ] A pinch that spreads zooms **in** — check the sign against rule 2's
+      scale-vs-span table, by measurement, not by eye.
+- [ ] Whatever the first finger already changed is **reverted** when the second
+      lands, not merely stopped (rule 2's cancel section).
+- [ ] Nothing focuses a text input as a side effect of a gesture on a coarse
+      pointer (rule 11).
 - [ ] The long-press anchor is recorded **after** any `clearLongPress()`, and a
       slow drag that stays inside `LONGPRESS_SLOP` does **not** get a menu
       (Rule 9). Test by dragging deliberately slowly, not quickly.
@@ -511,7 +675,7 @@ actually shipped.
 
 | surface | one finger | two fingers | wheel |
 |---|---|---|---|
-| Workspace canvas (`editor.ts`) | drag/marquee/wire; **block onto a wire = splice**, **cable onto a widget = modulate** | pan + pinch, tap = menu | pan or uniform zoom |
+| Workspace canvas (`editor.ts`) | drag/marquee/wire; **block onto a wire = splice**, **cable onto a widget = modulate** | pan + pinch | pan or uniform zoom |
 | Clip tab — waveform (`clipview.ts`) | scrub / select / pan | pan + pinch (time) | pan or zoom time |
 | Clip tab — Roll (`clipview.ts`, `pianoroll.ts`) | notes / bars | pan + per-axis pinch | pan; Ctrl = time, Shift = pitch |
 | Widgets tab (`widgetdock.ts`) | operate / arrange | scroll the field | native scroll |

@@ -481,7 +481,13 @@ body.dock-window #topbar { padding: 3px 6px; gap: 4px; }
   width: 54px; padding: 7px 2px 6px; border: 1px solid transparent; border-radius: 5px;
   background: none; color: var(--text-dim); cursor: pointer; font: inherit; line-height: 1.1;
 }
-.dock-rail-btn .ic { font-size: 15px; }
+/* The rail icons are line art (⚙ ◫ ◎ ⊞ ☻) and have to stay that way. Several
+   of those code points are also emoji, so a platform that has a colour glyph
+   and no text one renders one tab in full colour and the rest in the UI's ink —
+   which is what `🛠` did on Android. `font-variant-emoji` asks for the text
+   presentation explicitly; the glyphs themselves are chosen for text-font
+   coverage, which is the half that works everywhere. */
+.dock-rail-btn .ic { font-size: 15px; font-variant-emoji: text; }
 .dock-rail-btn .lb { font-size: 10px; letter-spacing: 0.2px; }
 .dock-rail-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
 .dock-rail-btn.on { color: var(--accent); background: var(--panel); border-color: var(--border); }

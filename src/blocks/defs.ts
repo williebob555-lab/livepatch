@@ -2454,6 +2454,65 @@ registerBlock({
   visual: 'meter',
 });
 
+// The Tuner. Detection lives in the kernel / the web unit (a YIN sweep spread
+// over quanta, `docs/08-extending.md`); everything the face draws is derived in
+// the renderer from the ONE number an engine publishes — the measured frequency
+// — plus `ref` and `transpose`. That split is deliberate: turning the A4 knob
+// or switching to a Bb instrument re-labels the reading instantly, with no
+// round trip through an engine and no second opinion about what a cent is
+// (`src/core/pitch.ts`).
+//
+// `display` and `readout` are separate on purpose. The picture answers "which
+// way, and how far" at a glance while your hands are on the instrument; the
+// number answers "how far exactly" when you look down at it. A tuner that makes
+// you choose between them is two thirds of a tuner.
+registerBlock({
+  type: 'tuner',
+  title: 'Tuner',
+  category: 'Visual',
+  group: 'Analysis',
+  alsoIn: [{ category: 'Control & CV', group: 'Generators' }],
+  desc: 'Chromatic tuner — note, cents and Hz, five displays, pitch/cents/lock CV out; passes audio through',
+  inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
+  outputs: [
+    { id: 'out', name: 'out', kind: 'audio', dir: 'out' },
+    // 1 V/oct against C4, the convention every `cvLaw: '1v/oct'` input expects
+    // (docs/02, "Control-voltage conventions") — so the thing you just tuned by
+    // ear can play a VCO, or a Sample & Hold can capture the note you sang.
+    { id: 'pitch', name: 'pitch', kind: 'audio', role: 'cv', dir: 'out' },
+    // Signed error, ±1 = ±50 cents. Bipolar so it can drive a fine-tune or a
+    // meter directly, and so the sign says which side of the note you are on.
+    { id: 'cents', name: 'cents', kind: 'audio', role: 'cv', dir: 'out' },
+    // Gate: high while the reading is inside `tol` and worth believing.
+    { id: 'lock', name: 'lock', kind: 'audio', role: 'cv', dir: 'out' },
+  ],
+  params: [
+    // A=440 is a convention, not a constant: baroque pitch is ~415, plenty of
+    // orchestras sit at 442–444, and a tuner that cannot follow the room is
+    // only usable in one room.
+    knob('ref', 'A4', 410, 470, 440, { unit: 'Hz', step: 0.5, mark: 'fork' }),
+    // How close counts as in tune — the green zone, and the `lock` gate.
+    knob('tol', 'In tune', 1, 25, 5, { unit: 'ct', step: 1, mark: 'window' }),
+    { id: 'display', name: 'Display', type: 'enum', def: 'Needle', widget: 'select',
+      options: ['Needle', 'Strobe', 'Bars', 'Ring', 'History'] },
+    { id: 'readout', name: 'Readout', type: 'enum', def: 'Note + cents', widget: 'select',
+      options: ['Note + cents', 'Note + Hz', 'Note', 'Cents', 'Hz', 'MIDI'] },
+    { id: 'spell', name: 'Accidentals', type: 'enum', def: 'Sharps', widget: 'select',
+      options: ['Sharps', 'Flats'] },
+    // Transposing instruments: a Bb trumpet sounding a concert Bb is reading a
+    // C, so this renames the note and leaves the measured error alone.
+    { id: 'transpose', name: 'Transpose', type: 'int', min: -12, max: 12, def: 0,
+      widget: 'knob', step: 1, unit: 'st', face: false },
+    // Slow it down for a steady number on a wobbling note, or speed it up to
+    // watch a bend. The CV outs follow it too.
+    knob('avg', 'Response', 0, 1, 0.5, { face: false }),
+  ],
+  visual: 'tuner',
+  minW: 190,
+  minH: 130,
+  style: { shape: 'chamfer', fill: '#2a3140', stroke: '#7fb4ff' },
+});
+
 // ---------- Structure & Custom blocks ----------
 // The Library shows the three "builders" (Custom Block + the two Portals) at the
 // top of the Structure & Custom tab, then everything else filed here grouped

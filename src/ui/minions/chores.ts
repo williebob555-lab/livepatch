@@ -57,6 +57,16 @@ export interface Chore {
   wireId?: string;
   wireEnd?: 'a' | 'b';
   portId?: string;
+  /**
+   * For 'loose': how far the end actually is from that port, in world units.
+   *
+   * Carried on the chore because **one scan serves everybody** and reach is a
+   * per-minion switch: the scan runs at the longest reach on the payroll, and
+   * `jobAllowed` then drops the ones that are out of *this* minion's arms. Same
+   * shape as `patienceS` — the scan is the loosest answer and the claim is the
+   * strict one.
+   */
+  dist?: number;
   /** For 'overlap': the other block, the one that gets craned aside. */
   otherId?: string;
   moveBy?: { x: number; y: number };
@@ -72,24 +82,125 @@ const HOT_HOLD_S = 2.5;
 /** dBFS-ish: the engine's level is linear 0..1; these are on that scale. */
 const CLIP_AT = 0.999;
 const HOT_AT = 0.92;
-/** How near a floating cable end must be to a port to count as "nearly plugged
- *  in". Comfortably inside a deliberate drop, well outside a general area. */
-const LOOSE_DIST = 22;
+/**
+ * How much he takes off, in **decibels** — the unit "quieter" is actually
+ * measured in. See `quieterValue` for why the old linear ratio was wrong on
+ * exactly the block most people reach for.
+ *
+ * ~4 dB for a clip: enough headroom that the same transient does not re-clip the
+ * moment he walks away, small enough that one pass does not gut the balance you
+ * set. ~1.7 dB for a hot line, which is a trim, not a fix.
+ */
+const CLIP_CUT_DB = 4.2;
+const HOT_CUT_DB = 1.7;
+/**
+ * How near a floating cable end must be to a port before he counts it as
+ * "nearly plugged in" — the **default**; the real number is his `reach` switch,
+ * passed in per scan.
+ *
+ * It was a constant 22, and 22 world units is about four pixels of screen at the
+ * zoom people actually patch at. So the duty was on, he was willing, and he
+ * almost never had anything to do: a cable you dropped *near* a port was outside
+ * his notice unless you had all but plugged it in yourself. Reported as "his
+ * wire connection range needs to be bigger".
+ *
+ * 48 is the same distance the editor itself uses for `END_SNAP` — the radius
+ * inside which a block placed near a loose end takes the cable (docs/07-ui.md) —
+ * and for `minionBodyAt`, the catchment for handing something to a minion. That
+ * agreement is the point: "near this port" should mean one thing in this app,
+ * not three.
+ */
+const LOOSE_DIST = 48;
 
 interface Persist {
   hotSince: number;
 }
 const hotSince = new Map<string, number>();
 
-/** A gain-ish param on a block whose level he can actually bring down. Returns
- *  the param id and a target that pulls the measured peak under the ceiling. */
+/**
+ * The control on this block that makes it quieter, if it has one.
+ *
+ * **This list is why "he can't identify blocks that are clipping".** It was
+ * `gain, level, out, amp, drive, vol` — exact ids, and if a block had none of
+ * them the whole chore was dropped on the floor: no job, no clipboard line,
+ * nothing to see. Measured against the registry, **51 of the 80 block types with
+ * an audio output failed it.** Two of those failures were pure vocabulary — the
+ * EQ Curve's output trim is called `output` and the Feedback block's is called
+ * `ceiling`, both real, both invisible to a list that only knew `out`. The rest
+ * genuinely have no level control at all (Upmix, Pan, Distance, Delay, Reverb,
+ * a hosted VST), which is what `clipChain` below is for.
+ *
+ * Ranked, not "first match in `b.params`", because a block can have several and
+ * the answer should be the same every time he looks. Order is the app's own
+ * convention first (`gain`, `level` — see the registry), then the words other
+ * software uses.
+ *
+ * **Deliberately a closed list.** A regex over "anything with gain in the name"
+ * reaches the EQ Curve's sixteen band gains and the 3-band's `lowGain`, and a
+ * minion that answers a clip by pulling the mids down has done something you did
+ * not ask for and cannot guess at. He edits your patch: predictable and
+ * occasionally useless beats clever and occasionally baffling.
+ */
+const LEVEL_IDS = [
+  'gain',
+  'level',
+  'output',
+  'out',
+  'outGain',
+  'volume',
+  'vol',
+  'master',
+  'amp',
+  'amplitude',
+  'trim',
+  'makeup',
+  'ceiling',
+  'drive',
+];
+
 function levelParam(b: Block): { id: string; def: number } | null {
-  // Named outputs first — a dedicated level/gain is what he reaches for.
-  for (const id of ['gain', 'level', 'out', 'amp', 'drive', 'vol']) {
+  for (const id of LEVEL_IDS) {
     const s = paramSpec(b, id);
     if (s && (s.type === 'float' || s.type === 'int') && s.widget !== 'button') return { id, def: Number(s.def) || 0 };
   }
   return null;
+}
+
+/**
+ * Where to put that control so the block is `cutDb` quieter — **in the units the
+ * control is actually in.**
+ *
+ * The old arithmetic was one multiply: `to = cur * 0.62`, floored at
+ * `def * 0.05`. That is right for a linear amplitude and **wrong in both
+ * directions for a dB control**, which is what the app's own Gain block uses
+ * (`gain/dB`), along with the EQ Curve's `output`:
+ *
+ *   * at 0 dB — where a Gain block sits by default — `0 × 0.62 = 0`. He walks
+ *     across the patch, opens the panel, puts his hand on the knob, moves it
+ *     **nowhere**, shakes his head and leaves. The clip is still there and the
+ *     only evidence anything happened is a work mark on an unchanged value.
+ *   * at −6 dB, `−6 × 0.62 = −3.7`, and the floor `Math.max(def * 0.05, …)`
+ *     with a default of 0 dB then clamps that to **0 dB**. Asked to fix a clip,
+ *     he turns the gain *up*, twice over.
+ *
+ * So the cut is expressed in decibels — which is what "quieter" means — and the
+ * conversion happens once, here, against the spec's own `unit`. The floor is the
+ * spec's `min`, not a fraction of the default: a default of 0 makes that
+ * fraction 0, which is either "silence" or "no change" depending on the scale,
+ * and neither is a floor.
+ */
+function quieterValue(b: Block, id: string, cutDb: number): number | null {
+  const s = paramSpec(b, id);
+  if (!s) return null;
+  const cur = Number(b.params[id]);
+  if (!Number.isFinite(cur)) return null;
+  const min = typeof s.min === 'number' ? s.min : 0;
+  const want = s.unit === 'dB' ? cur - cutDb : cur * Math.pow(10, -cutDb / 20);
+  const to = round(Math.max(min, want));
+  // A control already at the bottom, or a value the rounding cannot move, is
+  // not a job. Offering one is how he comes over and visibly does nothing —
+  // which reads as the feature being broken, not as the knob being at its end.
+  return Math.abs(to - cur) < 0.005 ? null : to;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,14 +256,16 @@ function netPeak(net: { wires: { id: string }[] }): number | null {
  * visited set and a hop limit, because feedback loops are legal here — the
  * Feedback block exists.
  */
-function clipCulprit(startId: string): Block | null {
+function clipChain(startId: string): Block[] {
   const seen = new Set<string>();
+  const chain: Block[] = [];
   let id = startId;
   for (let hop = 0; hop < 24; hop++) {
     if (seen.has(id)) break;
     seen.add(id);
     const here = doc.block(id);
-    if (!here) return null;
+    if (!here) break;
+    chain.push(here);
     // The hottest audio net arriving at this block.
     let worst: { peak: number; from: string } | null = null;
     for (const net of doc.nets()) {
@@ -166,11 +279,42 @@ function clipCulprit(startId: string): Block | null {
       }
     }
     // Nothing feeding it, or what feeds it is clean: the gain is added here.
-    if (!worst || worst.peak < CLIP_AT) return here;
+    if (!worst || worst.peak < CLIP_AT) break;
     // Otherwise it is passing on someone else's problem.
     id = worst.from;
   }
-  return doc.block(id) ?? null;
+  return chain;
+}
+
+/**
+ * **Who he can actually turn down about this clip**, and it is not always the
+ * block to blame.
+ *
+ * `clipChain` finds where the level was added; `levelParam` says whether that
+ * block has anything to turn. The two disagree constantly, because most of the
+ * blocks that can overdrive something have no output control at all — Upmix,
+ * Pan, Distance, Delay, Reverb, a hosted VST. When they did, the whole chore was
+ * discarded and **nothing appeared on his clipboard at all**: the patch was
+ * audibly clipping, the duty was switched on, and he stood there. From outside
+ * that is not "he has nothing to turn", it is *"he can't identify them"*.
+ *
+ * So the search runs the chain: start at the culprit and walk back **downstream**
+ * — the way the signal is already going — to the first block that has a level
+ * control. That is what a person does. There is no knob on the Upmix, so you
+ * pull the next fader after it; you do not shrug and leave it clipping.
+ *
+ * Returns null only when nothing anywhere along the path can be turned down, in
+ * which case there is genuinely no job — offering one he cannot perform is worse
+ * than silence.
+ */
+function levelTarget(
+  chain: Block[],
+): { block: Block; param: { id: string; def: number } } | null {
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const lp = levelParam(chain[i]);
+    if (lp) return { block: chain[i], param: lp };
+  }
+  return null;
 }
 
 /**
@@ -190,6 +334,10 @@ export function scanChores(
      *  units. ORDERLY 7's `tolerance` switch; loosest on the payroll, for the
      *  same reason `patienceS` is the most patient. */
     tolerance?: number;
+    /** How far a floating cable end may be from a port and still count as one
+     *  he could push home — Gus's `reach` switch. Longest on the payroll, and
+     *  filtered back to each minion's own at claim time via `Chore.dist`. */
+    looseDist?: number;
     /**
      * The wire whose end is in the user's hand right now, if any.
      *
@@ -254,19 +402,28 @@ export function scanChores(
     for (const s of net.sources) {
       const reporter = doc.block(s.blockId);
       if (!reporter) continue;
-      // **Fix it where the level was added, not where it showed up.** See
-      // `clipCulprit`: a block reading full-scale is usually passing on
-      // somebody else's problem, and turning it down adjusts a symptom.
-      const b = peak >= CLIP_AT ? clipCulprit(s.blockId) : reporter;
-      if (!b || skip(b.id)) continue;
-      const lp = levelParam(b);
-      if (!lp) continue;
+      // **Fix it where the level was added, not where it showed up** — and
+      // failing that, at the first thing downstream that has a knob at all. See
+      // `clipChain` (a block reading full-scale is usually passing on somebody
+      // else's problem) and `levelTarget` (most of the blocks that can overdrive
+      // something have no output control, and dropping the job there is what
+      // made him look blind to clipping).
+      const chain = peak >= CLIP_AT ? clipChain(s.blockId) : [reporter];
+      const pick = levelTarget(chain);
+      if (!pick) continue;
+      const b = pick.block;
+      if (skip(b.id)) continue;
+      const lp = pick.param;
       const cur = Number(b.params[lp.id]);
       if (!Number.isFinite(cur)) continue;
       if (peak >= CLIP_AT && !hasGrudge(b.id, lp.id, patience)) {
         // Land ~4 dB under unity: enough that the same transient does not
-        // re-clip the moment he walks away.
-        const to = Math.max(lp.def * 0.05, cur * (0.62 / Math.max(0.6, peak)));
+        // re-clip the moment he walks away. Expressed in dB and converted per
+        // control (`quieterValue`) — the meter is over by however much it is
+        // over, so a peak the analyser reports above 1.0 takes proportionally
+        // more off, exactly as the old ratio did.
+        const to = quieterValue(b, lp.id, CLIP_CUT_DB + 20 * Math.log10(Math.max(0.6, peak)));
+        if (to === null) continue;
         // Several clipping nets in one chain resolve to the SAME culprit, and
         // that is the point — one job, not one per victim. Keyed on the block
         // he will actually touch, so the duplicates collapse.
@@ -278,7 +435,7 @@ export function scanChores(
             blockId: b.id,
             paramId: lp.id,
             from: cur,
-            to: round(to),
+            to,
             rank: 100,
             label:
               b.id === reporter.id
@@ -291,14 +448,18 @@ export function scanChores(
         const since = hotSince.get(key) ?? now;
         if (!hotSince.has(key)) hotSince.set(key, now);
         if (now - since >= HOT_HOLD_S && !hasGrudge(b.id, lp.id, patience)) {
-          const to = cur * 0.82;
+          // A little off, not a cut — and through the same unit-aware
+          // conversion, or a dB control gets the same "×0.82 makes it louder"
+          // treatment described in `quieterValue`.
+          const to = quieterValue(b, lp.id, HOT_CUT_DB);
+          if (to === null) continue;
           out.push({
             kind: 'hot',
             id: `hot:${b.id}:${lp.id}`,
             blockId: b.id,
             paramId: lp.id,
             from: cur,
-            to: round(to),
+            to,
             rank: 60,
             label: `${b.name} is running hot`,
           });
@@ -318,7 +479,14 @@ export function scanChores(
       if (!end.float) continue;
       const other = which === 'a' ? w.b : w.a;
       const otherKind = other.port ? doc.port(other.port.blockId, other.port.portId)?.port : null;
-      const cand = nearestOpenPort(g, end.float, otherKind ? otherKind.dir : null, otherKind ? otherKind.kind : null, w);
+      const cand = nearestOpenPort(
+        g,
+        end.float,
+        otherKind ? otherKind.dir : null,
+        otherKind ? otherKind.kind : null,
+        w,
+        Math.max(2, opts.looseDist ?? LOOSE_DIST),
+      );
       if (!cand) continue;
       if (skip(cand.blockId)) continue;
       out.push({
@@ -328,6 +496,7 @@ export function scanChores(
         wireId: w.id,
         wireEnd: which,
         portId: cand.portId,
+        dist: cand.dist,
         rank: 45,
         label: 'Loose cable',
       });
@@ -413,6 +582,42 @@ export function clearChores(): void {
   hotSince.clear();
 }
 
+/**
+ * Is anything this block **sends out** still pinned at full scale?
+ *
+ * Asked by the agent while its hand is still on the knob, so one visit can take
+ * a second bite instead of walking away and being re-tasked from scratch. It has
+ * to be a live measurement rather than a re-run of `scanChores`: the chore list
+ * is rebuilt once a frame for everybody, and what this needs to know is much
+ * narrower — *this* block, right now, after the change I just made.
+ *
+ * The culprit's own output is the right thing to look at. `clipCulprit` walks
+ * upstream until what *arrives* is clean, so by construction the block it
+ * returns is the one whose output net is over the top.
+ */
+/**
+ * The next value for a control he already has his hand on — another `CLIP_CUT_DB`
+ * off, or null when there is nothing left to give (at the stop, or too small to
+ * round to a different number).
+ *
+ * Exported for the multi-bite fix in `agent.ts`. It goes through the same
+ * `quieterValue` as the scan, so a second bite and a first are the same size in
+ * the same units, and neither of them can push a dB control the wrong way.
+ */
+export function nextClipStep(b: Block, paramId: string): number | null {
+  return quieterValue(b, paramId, CLIP_CUT_DB);
+}
+
+export function stillClipping(blockId: string): boolean {
+  for (const net of doc.nets()) {
+    if (net.kind !== 'audio' || netIsCv(net)) continue;
+    if (!net.sources.some((s) => s.blockId === blockId)) continue;
+    const p = netPeak(net);
+    if (p !== null && p >= CLIP_AT) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 
 function nearestOpenPort(
@@ -421,9 +626,10 @@ function nearestOpenPort(
   needDir: 'in' | 'out' | null,
   needKind: string | null,
   wire: { id: string },
-): { blockId: string; portId: string } | null {
-  let best: { blockId: string; portId: string } | null = null;
-  let bestD = LOOSE_DIST;
+  maxDist: number,
+): { blockId: string; portId: string; dist: number } | null {
+  let best: { blockId: string; portId: string; dist: number } | null = null;
+  let bestD = maxDist;
   for (const b of g.blocks) {
     if (b.style.wireLayer === 'behind') continue;
     for (const port of b.ports) {
@@ -436,7 +642,7 @@ function nearestOpenPort(
       const d = Math.hypot(pp.x - p.x, pp.y - p.y);
       if (d < bestD) {
         bestD = d;
-        best = { blockId: b.id, portId: port.id };
+        best = { blockId: b.id, portId: port.id, dist: d };
       }
     }
   }

@@ -787,7 +787,27 @@ export function updateStatus(): void {
       const glitch =
         (s.xruns ? ` · <span class="dirty">xruns ${s.xruns}</span>` : '') +
         (s.late ? ` · <span class="dirty">late ${s.late}</span>` : '');
-      const midi = s.midiMs ? ` · midi ~${s.midiMs}ms` : '';
+      // Latency, SPLIT BY OWNER — the single number was unanswerable.
+      //
+      // "ASIO in to ASIO out has 800 ms of delay" has two possible causes with
+      // nothing in common: the engine carrying a standing output lead, or the
+      // driver/routing being slow before the engine gets a say (ASIO4ALL wraps
+      // WASAPI and inherits its buffering; Voicemeeter / VB-Matrix virtual ASIO
+      // add their own on top of the size you ask for). Splitting the total the
+      // engine already computes tells them apart at a glance, and a standing
+      // backlog moves NOTHING else in this bar — `late`, `xruns`, `jitterQ` and
+      // `load` all stay clean while it happens, because the pump really is on
+      // time and the audio is merely old.
+      const drvMs = s.latencyFrames && s.sampleRate ? (s.latencyFrames / s.sampleRate) * 1000 : 0;
+      const engMs = Math.max(0, (s.midiMs ?? 0) - drvMs);
+      const qMs = s.frames && s.sampleRate ? (s.frames / s.sampleRate) * 1000 : 0;
+      // The engine's own share is one quantum plus the output lead it carries
+      // (1–2 quanta when healthy). Several times the quantum is a backlog.
+      const backlog = qMs > 0 && engMs > qMs * 4;
+      const split = `engine ${engMs.toFixed(0)} · driver ${drvMs.toFixed(0)}`;
+      const midi = s.midiMs
+        ? ` · lat ~${s.midiMs}ms (${backlog ? `<span class="dirty">${split}</span>` : split})`
+        : '';
       hw = ` &nbsp;|&nbsp; ${escapeHtml(s.api)} · ${s.sampleRate ?? '?'} Hz · ${s.frames ?? '?'}f · load ${Math.round((s.load ?? 0) * 100)}%${midi}${glitch}`;
     }
     else if (s.error) hw = ` &nbsp;|&nbsp; <span class="dirty">${escapeHtml(s.error.slice(0, 80))}</span>`;
