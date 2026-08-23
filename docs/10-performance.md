@@ -1,6 +1,6 @@
 # 10 — Performance: What Makes It Fast, What Makes It Slow
 
-_Last verified: 2026-07-31._
+_Last verified: 2026-08-20._
 
 > Read this before changing anything in an audio path, a render loop, or an IO
 > stream. Every rule below traces to a measured regression. "Do not make it
@@ -310,6 +310,58 @@ depending on device.
   at 200 ms, and its timer was itself one of the things being throttled. Both
   halves are load-bearing: the switches without the pump lose the loop when
   minimized, the pump without the switches never runs.
+
+### A closure `let` holding a double is an allocation per sample (2026-08-20)
+
+Found while adding the Tuner. Its analysis loop was ordinary-looking code:
+
+```ts
+let lpA = 0, lpB = 0, level = 0;          // captured by purge(), so: closure
+const purge = () => { lpA = 0; lpB = 0; level = 0; /* … */ };
+process: (ins, ctx) => {
+  let fa = lpA, fb = lpB, lv = level;      // hoisted into locals for the loop
+  for (let i = 0; i < ctx.n; i++) { fa += (x - fa) * k; /* … */ }
+  lpA = fa; lpB = fb; level = lv;          // written back once per quantum
+}
+```
+
+That threw away **~46 bytes per SAMPLE** — about 2 MB of garbage a second, a
+scavenge every 4 ms. A `let` captured by another closure lives in a **tagged**
+context slot, and a loop local seeded from one inherits that representation, so
+V8 keeps `fa` boxed and every `fa += …` allocates a heap number. Hoisting into
+locals — the `Biquad.process` idiom, which is right for *speed* — does not fix
+it, and neither does removing the write-back: it is the READ that decides the
+representation.
+
+**Seed the loop from a `Float64Array` instead.** Measured on the same kernel,
+with the same loop, that is exactly zero:
+
+```ts
+const ST = new Float64Array(11);           // one slot per scalar, named indices
+let fa = ST[K_LPA];                        // known to be a double
+```
+
+Low-rate state can stay a readable `let`: a value written a few times per
+quantum costs a few 16-byte heap numbers, and integers are Smis and never box.
+It is the **sample loop** that must not read one.
+
+**`heapUsed` before/after cannot see this**, which is why it survived review:
+`scripts/audio-alloc-test.cjs` reported ~1.9 MB for the leaking version and
+~0.7 MB for `gain`, which allocates nothing at all — the figure is dominated by
+wherever the collector happens to sit in its sawtooth. What measures it is a
+scavenge count with a small young generation:
+
+```
+node --expose-gc --trace-gc --max-semi-space-size=1 <probe>
+```
+
+One scavenge is then ≈ 1 MB of garbage and a clean kernel scores a flat **0**.
+`scripts/tuner-kernel-test.cjs` runs exactly that as a child process and fails
+on anything above zero; use it as the pattern for the next analysis kernel.
+
+**`tempo-follow` has the same bug** — 1562 scavenges over 200 k quanta against
+the Tuner's 0 — and is left as found here rather than fixed blind in a change
+about something else.
 
 ## The non-negotiable rules
 

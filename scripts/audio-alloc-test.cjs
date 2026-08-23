@@ -70,6 +70,11 @@ const TYPES = [
   // Tempo Follow runs a correlation sweep on the audio path — the one place in
   // the library that does real analysis there.
   ['tempo-follow', {}],
+  // The Tuner runs the other analysis sweep on the audio path, and its state
+  // is deliberately in a Float64Array rather than closure lets — see the note
+  // on ST in the kernel for what that costs when it is not, and why the
+  // heap-growth measurement below could not have found it.
+  ['tuner', {}],
   // The dynamic blocks (docs/14). Every one holds a long ring or a bank of
   // recursive filters and resolves geometry per quantum, which is exactly the
   // shape that grows an accidental array literal — and Sympathy takes a STRING

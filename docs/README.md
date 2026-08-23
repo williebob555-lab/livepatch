@@ -182,6 +182,20 @@ avoid stepping on the invariants that keep it fast and correct.
     integer axis goes through `StepPan`**, because a trackpad's 4 px against a
     16 px row rounds to nothing on every event, which is a *dead axis*, not a
     rounding error. It was reported as "one axis is locked until you stop".
+    And three from 2026-08-14, all of them one idea — **a gesture may only do
+    what it was asked for**: a pinch ratio is a finger *separation*, so a view
+    **span** divides by it and only a **scale** multiplies (the Roll multiplied,
+    and every pinch on it ran backwards); a second finger must **revert** what
+    the first already did, which on a surface where the press *is* the edit
+    means deleting the note it just wrote, not merely stopping; and a gesture the
+    user **abandons** must do nothing at all, which is why the two-finger tap no
+    longer opens a menu — an under-deadzone pinch and an under-slop pan both
+    measure as a "tap". Two more from the same day, about not surprising
+    somebody: **nothing focuses a text input as a side effect on a touchscreen**
+    (that is the on-screen keyboard, over half the display, with no visible
+    cause), and **how far a cable reaches a port is a user setting**
+    (`theme.connectRange`), because no constant is right for a phone and a 4K
+    monitor at once.
 
 19. **Nothing may be left sounding with no way to stop it.** A note-on is a
     promise that a note-off is coming, and the patch is free to break that

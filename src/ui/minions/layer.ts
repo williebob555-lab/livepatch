@@ -389,16 +389,23 @@ export function drawMinions(
   // stricter character can only ever ADD jobs to what a loose scan found, and
   // taking the minimum would hand a fussy machine's work to everybody.
   let tolerance = 0;
+  // And the same for cable reach — the scan runs at the longest pair of arms on
+  // the payroll and `jobAllowed` drops what is out of range for whoever is
+  // claiming. A `dist` on the chore is what makes that filter possible; taking
+  // the minimum here would hide a cable from the one who could reach it.
+  let looseDist = 0;
   for (const l of agents.values()) {
     patienceS = Math.max(patienceS, minionNum(l.agent.id, 'patience') * 60);
     const t = minionNum(l.agent.id, 'tolerance');
     if (t > 0) tolerance = Math.max(tolerance, t);
+    looseDist = Math.max(looseDist, reachOf(l.agent.id));
   }
   chores = scanChores(performance.now() / 1000, {
     selectedId: sel?.id ?? null,
     leaveSelected: true, // per-minion `leaveSelected` is applied at claim time
     patienceS,
     tolerance: tolerance || undefined,
+    looseDist: looseDist || undefined,
     heldWireId: ui?.heldWireId ?? null,
     heldBlockIds: heldBlocks,
   });
@@ -530,8 +537,18 @@ function otherAt(self: Agent, x: number, y: number): Vec2 | null {
   return null;
 }
 
+/** This minion's own cable reach. 0 means the character has no such switch, in
+ *  which case the scan's default stands. */
+function reachOf(minionId: string): number {
+  return Math.max(0, minionNum(minionId, 'reach'));
+}
+
 function jobAllowed(minionId: string, c: Chore): boolean {
   if (!choreEnabled(minionId, c.kind)) return false;
+  // Out of *this* minion's arms, even though a longer-armed colleague put it on
+  // the board. See `Chore.dist`.
+  const reach = reachOf(minionId);
+  if (c.kind === 'loose' && c.dist != null && reach > 0 && c.dist > reach) return false;
   // The per-minion "never touch the selected block" term.
   if (minionFlag(minionId, 'leaveSelected')) {
     const sel = doc.graph.blocks.find((b) => b.selected);

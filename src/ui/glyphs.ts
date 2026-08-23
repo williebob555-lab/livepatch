@@ -227,6 +227,33 @@ const PATHS: Record<string, number[][][]> = {
     [[0.24, 0.06], [0.24, 0.94]],
   ],
 
+  // --- tuning ---------------------------------------------------------------
+  /**
+   * A tuning fork, ringing: what "A4" means, in one shape.
+   *
+   * The fork itself is kept in the MIDDLE fifth of the box and the sound
+   * arcs fill the rest. The mark strip is roughly 26 x 9 and the unit box is
+   * stretched onto it without preserving aspect (see `drawPanelGlyph`), so
+   * tines spread across the full width come out as a wide shallow U with no
+   * fork left in it — the arcs are what makes the width earn its place.
+   */
+  fork: [
+    [[0.42, 0.04], [0.42, 0.5]],
+    [[0.58, 0.04], [0.58, 0.5]],
+    [[0.42, 0.5], [0.46, 0.62], [0.54, 0.62], [0.58, 0.5]],
+    [[0.5, 0.62], [0.5, 0.98]],
+    [[0.28, 0.12], [0.18, 0.44], [0.28, 0.76]],
+    [[0.72, 0.12], [0.82, 0.44], [0.72, 0.76]],
+  ],
+  /** A tolerance window: a centre line with a gate either side of it. Not
+   *  `range` (which is a span with arrows at both ends) — this one is about
+   *  what counts as *the middle*, so the middle is the part that is drawn. */
+  window: [
+    [[0.5, 0.06], [0.5, 0.94]],
+    [[0.3, 0.1], [0.18, 0.1], [0.18, 0.9], [0.3, 0.9]],
+    [[0.7, 0.1], [0.82, 0.1], [0.82, 0.9], [0.7, 0.9]],
+  ],
+
   /** A line pivoting about its centre. */
   tilt: [
     [[0.08, 0.5], [0.34, 0.5]],

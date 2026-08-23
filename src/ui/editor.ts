@@ -107,7 +107,17 @@ import {
 } from './widgets';
 import { toggleSpeakerMute } from '../core/rig';
 import { crossIndex, matrixPorts, parseMatrix, setCrosspoint, toggledCrosspoint } from '../core/matrix';
-import { LONGPRESS_NUDGE, LONGPRESS_SLOP, TwoPointerGesture, capture, dragThreshold, grabSlop, wheelIntent } from './input';
+import {
+  LONGPRESS_NUDGE,
+  LONGPRESS_SLOP,
+  TwoPointerGesture,
+  capture,
+  dragThreshold,
+  grabSlop,
+  lastPointerWasCoarse,
+  notePointer,
+  wheelIntent,
+} from './input';
 // QUICK ADD: the pending-placement state is its own module precisely so this
 // file can reach it **synchronously** — a click on the canvas cancels a pending
 // placement inside `pointerDown`, and arming one must not lag behind the
@@ -1063,9 +1073,25 @@ export class Editor {
    *   - `select` opens a prompt modal; a canvas menu behind a modal is wrong.
    *   - `toggle`, `xy`, `wavedraw`, `seqgrid`, `sampleview` all commit on
    *     press, at the point touched, before anyone knows it will be a hold.
-   * Two-finger tap stays the documented way to reach the menu over those.
+   *
+   * **ARRANGE MODE IS THE TOUCH ROUTE TO THOSE WIDGETS' OWN MENU** (2026-08-14).
+   *
+   * Removing the two-finger tap left them with none: hold a note keyboard and
+   * the note sounds, so the menu that carries *Set value…*, *Add CV input* and
+   * the styling lists could not be opened over one at all. The answer was
+   * already in the app and needed no gesture invented for it — **Mode: Edit**
+   * (`E`, or the toolbar) exists precisely to *stop widgets working* so their
+   * layout can be edited. `pointerDown` returns at `editModeDown` in that mode,
+   * so `widgetDown` never runs: nothing sounds, nothing latches, nothing commits
+   * where you touched. A press there owns nothing, so a hold is free, and
+   * `contextMenu` builds the same widget menu it always does.
+   *
+   * In patch mode the block's **title band** remains the hold that reaches every
+   * block-level item (delete, duplicate, Advanced, enter) — it is never a
+   * widget.
    */
   private ownsHeldPress(p: Vec2): boolean {
+    if (this.overlay.mode === 'edit') return false;
     const b = blockAt(doc.graph, p);
     if (!b) return false;
     const item = this.tangibleItemAt(b, p);
@@ -1080,12 +1106,6 @@ export class Editor {
     // other, all three of which are relative, so the override cannot change the
     // answer and does not need resolving here.
     return !!w && HOLD_WIDGETS.has(w.spec.widget);
-  }
-
-  /** Open the context menu at a client point (two-finger tap has no MouseEvent). */
-  private openCtxAt(clientX: number, clientY: number): void {
-    this.suppressNativeCtxUntil = performance.now() + 800;
-    this.contextMenu({ clientX, clientY, preventDefault() {} } as unknown as MouseEvent);
   }
 
   /**
@@ -1186,6 +1206,10 @@ export class Editor {
     // Every other canvas in the app already wraps this (clipview, widgetdock,
     // rigview); this one was the outlier.
     capture(this.renderer.canvas, e.pointerId);
+    // Remembered for anything that has to know whether this session is being
+    // driven by a finger — chiefly whether the Library may put the caret in its
+    // search box, which raises the on-screen keyboard. See `notePointer`.
+    notePointer(e);
     this.gesture.add(e.pointerId, this.localPt(e));
     const p = this.pt(e);
 
@@ -1201,8 +1225,8 @@ export class Editor {
     // menu — everywhere except on a widget whose press is itself the
     // interaction (a key, a momentary button, anything that commits where you
     // touched). Holding a knob or fader DOES open it: those change nothing
-    // until the finger moves. See `ownsHeldPress`. Two-finger tap reaches the
-    // menu over the rest.
+    // until the finger moves. See `ownsHeldPress` — over one of those, hold the
+    // block's title band instead.
     if (e.pointerType === 'touch' && !this.ownsHeldPress(p)) {
       // ORDER MATTERS, and getting it wrong is invisible.
       //
@@ -1363,7 +1387,7 @@ export class Editor {
     if (this.pendingSnatchPull) return;
 
     // 1. Ports: grab existing wire end (single-link unbind) or start a new wire.
-    const ph = portAt(doc.graph, p, (theme.portRadius + 6) * grab);
+    const ph = portAt(doc.graph, p, this.portGrab(theme, 6, grab));
     if (ph) {
       doc.pushHistory();
       const occupied = doc.wireAtPort(ph.block.id, ph.port.id);
@@ -1546,7 +1570,30 @@ export class Editor {
    */
   private endGrab(theme: Theme, grab: number): number {
     const r = Math.min(BASE_END_GRAB + theme.arrowSize * END_GRAB_PER_ARROW, BRANCH_DEADZONE - 2);
-    return (r / this.renderer.view.scale) * grab;
+    return ((r + theme.connectRange) / this.renderer.view.scale) * grab;
+  }
+
+  /**
+   * CONNECT RANGE: how close counts as "on that port", in world units.
+   *
+   * **Every wiring hit test goes through here** — the press that starts a cable,
+   * the hover that lights a port up while one is in the air, and the release
+   * that decides where it lands. They were four separate literals (`portRadius +
+   * 6`, `+ 7`, `+ 8`) and two of them, the ones on the *drag* and on the *drop*,
+   * were never widened for touch at all: the port lit up under a fingertip
+   * because the press had used the generous radius, and then the drop asked the
+   * mouse-sized question and the cable fell on the floor. A preview and a drop
+   * that disagree is the worst version of this, because the app promised the
+   * connection a frame before refusing it.
+   *
+   * `base` keeps the small differences that were deliberate (the press is
+   * slightly tighter than the drop, so a press *between* two ports is less
+   * likely to steal one). `theme.connectRange` is the user's own addition on
+   * top, and `grab` is `grabSlop`, which is 1 for a mouse and `COARSE_SLOP` for
+   * a finger.
+   */
+  private portGrab(theme: Theme, base: number, grab = 1): number {
+    return (theme.portRadius + base + theme.connectRange) * grab;
   }
 
   /**
@@ -1695,7 +1742,23 @@ export class Editor {
    * keeps that spot, which is the whole reason a placement can end up somewhere
    * other than `at`, and therefore the reason `snapsToEnd` exists.
    */
-  quickAdd(at: Vec2, opts: { snap?: PlacementIntent['snap']; hint: string; onPlaced?: (b: Block) => void }): void {
+  quickAdd(
+    at: Vec2,
+    opts: {
+      snap?: PlacementIntent['snap'];
+      hint: string;
+      onPlaced?: (b: Block) => void;
+      /**
+       * Put the caret in the Library's search box. Defaults to "only if this
+       * session is not being driven by a finger", because focusing an input on
+       * a touchscreen raises the on-screen keyboard over half the screen —
+       * see `notePointer` in `input.ts`. `Ctrl+K` overrides it to true: someone
+       * who reached this with a keyboard shortcut has a keyboard, and typing is
+       * the entire point of that route.
+       */
+      focusSearch?: boolean;
+    },
+  ): void {
     // **Armed synchronously, revealed asynchronously**, and the order matters.
     // This used to arm inside the dynamic import's `.then`, which left a window
     // — one microtask, but a real one — in which the intent did not exist yet.
@@ -1710,7 +1773,8 @@ export class Editor {
       hint: opts.hint,
       onPlaced: (b) => opts.onPlaced?.(b),
     });
-    void import('./panels').then(({ revealLibraryForPlacement }) => revealLibraryForPlacement());
+    const focus = opts.focusSearch ?? !lastPointerWasCoarse();
+    void import('./panels').then(({ revealLibraryForPlacement }) => revealLibraryForPlacement(focus));
   }
 
   /**
@@ -2480,7 +2544,7 @@ export class Editor {
 
     if (d.kind === 'none') {
       // Hover feedback only.
-      const ph = portAt(doc.graph, p, theme.portRadius + 6);
+      const ph = portAt(doc.graph, p, this.portGrab(theme, 6, grabSlop(1, e)));
       this.overlay.hoverPort = ph ? { blockId: ph.block.id, portId: ph.port.id } : null;
       const hoverBlock = blockAt(doc.graph, p);
       // The branch dot and the `copy` cursor have to appear over a block the
@@ -2641,7 +2705,7 @@ export class Editor {
       // you are holding straightens out under your hand instead of staying
       // dressed into a lane until you let go.
       if (this.breakBundleIfPulledAway(d.wire, p)) doc.touch('layout');
-      const ph = portAt(doc.graph, p, theme.portRadius + 8);
+      const ph = portAt(doc.graph, p, this.portGrab(theme, 8, grabSlop(1, e)));
       this.overlay.hoverPort = ph && this.canConnect(d.wire, d.end, ph.block, ph.port) ? { blockId: ph.block.id, portId: ph.port.id } : null;
       // MODULATE: ring the widget this cable would land on. Resolved by the
       // same function the drop uses, so the preview and the result cannot
@@ -2931,18 +2995,25 @@ export class Editor {
     const wasGesture = this.gesture.active;
     if (this.drag.kind !== 'none' || wasGesture) this.dragEndedAt = performance.now();
     if (wasGesture) {
-      // A quick, still two-finger press = tap → context menu. This is touch's
-      // only right-click over a live widget, where long-press is deliberately
-      // disabled so holding a note button plays the note.
-      const tap = this.gesture.isTap();
-      const mid = this.gesture.startMid;
+      // **A two-finger tap opens nothing** (2026-08-14). It used to be touch's
+      // right-click — the escape hatch for widgets whose press is the
+      // interaction, where long-press is deliberately suppressed. In the hand it
+      // was mostly a *failed navigation*: a pinch that never cleared
+      // `ZOOM_DEADZONE` and a pan under `TAP_SLOP` are both "a tap" by these
+      // measurements, so putting two fingers down to move the view and thinking
+      // better of it dropped a menu on the canvas. Reported plainly as "tapping
+      // with two fingers should not bring up the right click menu".
+      //
+      // A gesture that a user abandons must do nothing — that is the *opposite*
+      // failure to "no drag may silently do nothing" (docs/07-ui.md) and both
+      // are the same principle: the outcome has to be the one that was asked
+      // for. Long-press remains the touch context menu everywhere it is
+      // allowed; the widgets it is suppressed on are listed as a known gap in
+      // docs/14-input.md.
+      //
       // Ends the gesture only when this was the second-to-last finger; going
       // 3 → 2 re-baselines inside `remove` instead of jumping the view.
-      const ended = this.gesture.remove(e.pointerId);
-      if (ended && tap) {
-        const r = this.renderer.canvas.getBoundingClientRect();
-        this.openCtxAt(mid.x + r.left, mid.y + r.top);
-      }
+      this.gesture.remove(e.pointerId);
       this.drag = { kind: 'none' };
       return;
     }
@@ -3101,7 +3172,7 @@ export class Editor {
       // (modulate, latch, bundle) is suppressed while it is. So the port lit
       // up, you let go, and the cable went into a gripper — the drop
       // contradicting the promise the hover had just made.
-      const ph = portAt(doc.graph, p, theme.portRadius + 8);
+      const ph = portAt(doc.graph, p, this.portGrab(theme, 8, grabSlop(1, e)));
       if (ph && this.canConnect(d.wire, d.end, ph.block, ph.port)) {
         end.port = { blockId: ph.block.id, portId: ph.port.id };
         end.float = undefined;
@@ -4897,6 +4968,8 @@ export class Editor {
         const src = sel.length === 1 ? sel[0] : null;
         this.quickAdd(at, {
           hint: src ? `Placing after ${src.name}` : 'Placing at the pointer',
+          // Reached by keyboard, so the keyboard is what it hands over to.
+          focusSearch: true,
           onPlaced: (made) => {
             if (src) this.autoWireFrom(src, made);
           },

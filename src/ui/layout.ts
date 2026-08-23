@@ -48,7 +48,11 @@ const visualSize = (v: string): { w: number; h: number } =>
         : // Per-speaker bars need width per channel and room for labels.
           v === 'speakers'
           ? { w: 200, h: 104 }
-          : { w: 156, h: 88 };
+          : // The tuner prints a full-width scale (a needle sweep, a strobe band)
+            // AND a readout under it; at the shared 156 x 88 the two collide.
+            v === 'tuner'
+            ? { w: 176, h: 100 }
+            : { w: 156, h: 88 };
 
 /** Widget kinds that may be hot-swapped for one another (same drag semantics). */
 export const SWAPPABLE_WIDGETS: ReadonlySet<string> = new Set(['knob', 'fader', 'hfader']);

@@ -53,6 +53,7 @@ import { uiScale } from './uiscale';
 import { isSpeakerSilenced } from '../core/rig';
 import { fmtDuration, getCassette } from '../core/cassettes';
 import { getRollData, getRollMeta } from '../core/rolls';
+import { readNote } from '../core/pitch';
 import { drawFitted, imageBitmap } from './images';
 // LIVE VISUALS (src/ui/visuals) — optional animated layer. Every use below is
 // behind a `visuals()` flag; deleting the folder and the `V.`-guarded lines
@@ -421,6 +422,31 @@ export function levelStyle(theme: Theme, rms: number, peak: number): { color: st
   return { color, extra: norm * theme.wireLevelGain };
 }
 
+
+/**
+ * Per-face animation state for the Tuner (`drawTunerFace`).
+ *
+ * Not in the document: a needle's inertia, a strobe's phase and a few seconds
+ * of cents history are a *picture in progress*, not something a scene should
+ * carry, undo, or restore. Keyed by the visual's cache key (node + surface) so
+ * a block and its Dock clone animate independently, exactly as the spectrogram
+ * canvases do.
+ */
+interface TunerFace {
+  /** Smoothed cents for the pointer — display only; the printed number is not. */
+  needle: number;
+  /** Strobe scroll position, kept in 0..1 so it can run for ever. */
+  phase: number;
+  /** Cents history ring; NaN marks a column with no reading. */
+  hist: Float32Array;
+  hh: number;
+  /** ms of the last history column and of the last frame (for `dt`). */
+  hlast: number;
+  frame: number;
+  /** ms this face was last drawn — the eviction stamp. */
+  seen: number;
+}
+const TUNER_HIST = 120; // columns ≈ 4.8 s at 40 ms each
 export class Renderer {
   canvas: HTMLCanvasElement;
   g: CanvasRenderingContext2D;
@@ -429,7 +455,8 @@ export class Renderer {
   /** Render-on-demand: set true to request a repaint next frame. */
   dirty = true;
   private visualCanvases = new Map<string, HTMLCanvasElement>();
-  private peakHold = new Map<string, number>();
+  private peakHold = new Map<string, number>();  private tunerFaces = new Map<string, TunerFace>();
+
   private netStyleCache: { rev: number; byWire: Map<string, NetInfo> } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -2867,6 +2894,12 @@ export class Renderer {
       g.fillRect(x + 4, y + h - 6, ((w - 8) * c) / 100, 3);
       return;
     }
+    if (kind === 'tuner') {
+      // One number in ("<hz>\n<confidence>"), the whole instrument out — see
+      // `drawTunerFace`.
+      this.drawTunerFace(g, { x, y, w, h }, params, feed.text?.() ?? '', theme, cacheKey);
+      return;
+    }
     if (kind === 'spectrogram' && feed.freq) {
       let cv = this.visualCanvases.get(cacheKey);
       const cw = Math.max(8, Math.round(w));
@@ -2996,5 +3029,444 @@ export class Renderer {
         g.fillRect(x + 3, yy - 1, w - 6, 2);
       }
     }
+  }
+
+
+  /**
+   * Per-face tuner state, created on first paint.
+   *
+   * Evicted by idle time rather than by a live-block sweep, because the key is
+   * an ENGINE node id (plus surface), not a block id — `pruneFaceStates` walks
+   * the document and cannot answer for these. A face that has not been drawn
+   * for half a minute is not on screen; keeping its four numbers and a 120-slot
+   * ring alive for the session is the leak the prune functions exist to stop.
+   */
+  private tunerState(key: string, now: number): TunerFace {
+    let s = this.tunerFaces.get(key);
+    if (s) {
+      s.seen = now;
+      return s;
+    }
+    if (this.tunerFaces.size > 48)
+      for (const [k, v] of this.tunerFaces) if (now - v.seen > 30000) this.tunerFaces.delete(k);
+    s = {
+      needle: 0,
+      phase: 0,
+      hist: new Float32Array(TUNER_HIST).fill(NaN),
+      hh: 0,
+      hlast: 0,
+      frame: 0,
+      seen: now,
+    };
+    this.tunerFaces.set(key, s);
+    return s;
+  }
+  /**
+   * TUNER (`visual: 'tuner'`, block def in `src/blocks/defs.ts`).
+   *
+   * The engine sends one number — the measured frequency — and everything on
+   * the face is derived from it here, with `src/core/pitch.ts` doing the note
+   * arithmetic that the kernel's `cents`/`lock` outputs mirror. That is why the
+   * A4 knob and Transpose re-label the reading on the very next frame instead
+   * of waiting for an analysis pass, and why the face and the `lock` CV cannot
+   * disagree about where "in tune" is.
+   *
+   * Five displays, because they answer genuinely different questions and a
+   * tuner is used in more than one posture:
+   *
+   *   Needle   the meter you can read from across the room, on an instrument
+   *            you are holding.
+   *   Strobe   the one that resolves a cent: stripes drift at the beat rate,
+   *            and *stationary* is a far sharper judgement than *centred*.
+   *   Bars     an LED ladder — coarse, unambiguous, readable at any size.
+   *   Ring     compact; the block can be shrunk to a badge and still read.
+   *   History  cents against time: what a note DOES. Drift, vibrato and a
+   *            string settling after a bend are invisible to the other four.
+   *
+   * The needle carries a little visual inertia of its own. The estimate lands
+   * about eight times a second, and a pointer that teleports between those
+   * readings looks broken rather than lively — the smoothing is display only
+   * and never reaches the number printed underneath.
+   */
+  private drawTunerFace(
+    g: CanvasRenderingContext2D,
+    r: Rect,
+    params: Record<string, ParamValue>,
+    text: string,
+    theme: Theme,
+    cacheKey: string,
+  ): void {
+    const now = performance.now();
+    const st = this.tunerState(cacheKey, now);
+    const dt = Math.min(0.1, st.frame ? (now - st.frame) / 1000 : 0.016);
+    st.frame = now;
+
+    // "<hz>\n<confidence>" — the kernel's `visualText` / the unit's `visual.text`.
+    const nl = text.indexOf('\n');
+    const freq = nl < 0 ? 0 : +text.slice(0, nl) || 0;
+    const conf = nl < 0 ? 0 : +text.slice(nl + 1) || 0;
+    const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+    const numOf = (v: ParamValue | undefined, d: number): number => (typeof v === 'number' ? v : d);
+    const ref = clamp(numOf(params.ref, 440), 300, 600);
+    const tol = clamp(numOf(params.tol, 5), 0.5, 50);
+    const note = readNote(freq, ref, numOf(params.transpose, 0), params.spell === 'Flats');
+    const live = !!note && conf >= 0.15;
+    const cents = note ? note.cents : 0;
+
+    // Display-only inertia. It chases hard while there is something to chase
+    // and falls back to centre when the note stops, so a tuner nobody is
+    // playing sits at zero rather than frozen at the last error.
+    st.needle += ((live ? cents : 0) - st.needle) * (live ? 0.3 : 0.08);
+    const off = Math.abs(cents);
+    const accent = !live
+      ? theme.portLabelColor
+      : off <= tol
+        ? theme.wireGoodColor
+        : off <= tol * 3
+          ? theme.wireHotColor
+          : theme.wireClipColor;
+
+    const pad = 4;
+    const readH = Math.round(clamp(r.h * 0.3, 16, 30));
+    const dx = r.x + pad;
+    const dy = r.y + pad;
+    const dw = Math.max(8, r.w - pad * 2);
+    const dh = Math.max(8, r.h - readH - pad * 2);
+    const mode = typeof params.display === 'string' ? params.display : 'Needle';
+
+    g.save();
+    g.beginPath();
+    g.rect(dx, dy, dw, dh);
+    g.clip();
+    if (mode === 'Strobe') this.drawTunerStrobe(g, dx, dy, dw, dh, st, live, live ? cents : 0, dt, accent, theme);
+    else if (mode === 'Bars') this.drawTunerBars(g, dx, dy, dw, dh, st, live, tol, theme);
+    else if (mode === 'Ring') this.drawTunerRing(g, dx, dy, dw, dh, st, live, tol, accent, theme);
+    else if (mode === 'History') this.drawTunerHistory(g, dx, dy, dw, dh, st, live, tol, now, accent, theme);
+    else this.drawTunerNeedle(g, dx, dy, dw, dh, st, live, tol, accent, theme);
+    g.restore();
+
+    // ---- readout ----
+    // Primary is the thing you read at a glance; secondary is the number you
+    // look at when the primary has told you something is wrong.
+    const sign = (c: number): string => (c >= 0 ? '+' : '−') + Math.abs(c).toFixed(1);
+    const kind = typeof params.readout === 'string' ? params.readout : 'Note + cents';
+    let primary = '––';
+    let secondary = '';
+    if (!live) {
+      secondary = 'listening…';
+    } else if (kind === 'Hz') {
+      primary = freq.toFixed(2) + ' Hz';
+    } else if (kind === 'Cents') {
+      primary = sign(cents) + ' ¢';
+    } else if (kind === 'MIDI') {
+      primary = String(note!.midi);
+      secondary = sign(cents) + ' ¢';
+    } else {
+      primary = note!.label;
+      if (kind === 'Note + Hz') secondary = freq.toFixed(2) + ' Hz';
+      else if (kind !== 'Note') secondary = sign(cents) + ' ¢';
+    }
+    const big = Math.round(clamp(readH * 0.82, 11, 24));
+    const by = r.y + r.h - Math.round(readH * 0.22);
+    g.textBaseline = 'alphabetic';
+    g.fillStyle = live ? accent : theme.portLabelColor;
+    setFont(g, uiFont(big, '600'));
+    if (secondary) {
+      g.textAlign = 'left';
+      g.fillText(primary, r.x + 6, by);
+    } else {
+      g.textAlign = 'center';
+      g.fillText(primary, r.x + r.w / 2, by);
+    }
+    if (secondary) {
+      setFont(g, uiFont(Math.max(9, Math.round(big * 0.5))));
+      g.fillStyle = theme.portLabelColor;
+      g.textAlign = 'right';
+      g.fillText(secondary, r.x + r.w - 6, by);
+    }
+    g.textAlign = 'left';
+  }
+
+  /** Needle: a ±50 ¢ meter movement, with the in-tune window printed on it. */
+  private drawTunerNeedle(
+    g: CanvasRenderingContext2D,
+    dx: number, dy: number, dw: number, dh: number,
+    st: TunerFace, live: boolean, tol: number, accent: string, theme: Theme,
+  ): void {
+    const cx = dx + dw / 2;
+    const py = dy + dh - 1;
+    const rad = Math.max(6, Math.min(dh - 3, dw / 2 - 3));
+    const SPAN = 1.05; // radians either side of straight up (~60°)
+    const ang = (c: number): number => -Math.PI / 2 + Math.max(-1, Math.min(1, c / 50)) * SPAN;
+    // The in-tune window, drawn as a wedge rather than a pair of marks: the
+    // question is "am I inside it", and an area answers that faster than two
+    // lines you have to be between.
+    g.fillStyle = 'rgba(90, 220, 140, 0.16)';
+    g.beginPath();
+    g.moveTo(cx, py);
+    g.arc(cx, py, rad, ang(-tol), ang(tol));
+    g.closePath();
+    g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.22)';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.arc(cx, py, rad, ang(-50), ang(50));
+    g.stroke();
+    for (const c of [-50, -25, 0, 25, 50]) {
+      const a = ang(c);
+      const inner = c === 0 ? 0.72 : 0.84;
+      g.strokeStyle = c === 0 ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
+      g.beginPath();
+      g.moveTo(cx + Math.cos(a) * rad * inner, py + Math.sin(a) * rad * inner);
+      g.lineTo(cx + Math.cos(a) * rad, py + Math.sin(a) * rad);
+      g.stroke();
+    }
+    // Which way is which. A meter that does not say loses half its meaning.
+    if (rad > 22) {
+      setFont(g, uiFont(9));
+      g.fillStyle = theme.portLabelColor;
+      g.textBaseline = 'middle';
+      g.textAlign = 'left';
+      g.fillText('♭', cx + Math.cos(ang(-50)) * rad * 0.62 - 3, py + Math.sin(ang(-50)) * rad * 0.62);
+      g.textAlign = 'right';
+      g.fillText('♯', cx + Math.cos(ang(50)) * rad * 0.62 + 3, py + Math.sin(ang(50)) * rad * 0.62);
+      g.textAlign = 'left';
+    }
+    // Casing first, pointer over it. The in-tune wedge behind the needle is the
+    // same green the needle turns when it is inside it, so without the dark
+    // stroke the two merge into one triangle and the pointer disappears at the
+    // exact moment it matters most.
+    const a = ang(st.needle);
+    const tipX = cx + Math.cos(a) * rad * 0.93;
+    const tipY = py + Math.sin(a) * rad * 0.93;
+    g.lineCap = 'round';
+    g.strokeStyle = 'rgba(0,0,0,0.75)';
+    g.lineWidth = 4.5;
+    g.beginPath();
+    g.moveTo(cx, py);
+    g.lineTo(tipX, tipY);
+    g.stroke();
+    g.strokeStyle = accent;
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(cx, py);
+    g.lineTo(tipX, tipY);
+    g.stroke();
+    g.lineCap = 'butt';
+    g.fillStyle = 'rgba(0,0,0,0.75)';
+    g.beginPath();
+    g.arc(cx, py, 4, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = live ? accent : theme.portLabelColor;
+    g.beginPath();
+    g.arc(cx, py, 2.6, 0, Math.PI * 2);
+    g.fill();
+  }
+
+  /**
+   * Strobe: bars that drift at the beat rate and stand still when the note is
+   * right. The eye is far better at "is that moving" than at "is that centred",
+   * which is why a strobe resolves a cent and a needle does not.
+   */
+  private drawTunerStrobe(
+    g: CanvasRenderingContext2D,
+    dx: number, dy: number, dw: number, dh: number,
+    st: TunerFace, live: boolean, cents: number, dt: number, accent: string, theme: Theme,
+  ): void {
+    // 50 ¢ ≈ three bar widths a second: fast enough to read the sign at a
+    // glance, slow enough that a couple of cents is still visibly creeping.
+    st.phase += (cents / 50) * dt * 3;
+    if (!Number.isFinite(st.phase)) st.phase = 0;
+    st.phase -= Math.floor(st.phase); // keep it in 0..1 for ever
+    // The band is a printed TRACK with a lit drum behind it, not a row of
+    // free-floating blocks: without the lighter ground the stripes read as an
+    // LED ladder, which is the neighbouring mode.
+    const bandH = Math.max(8, Math.min(dh - 14, Math.round(dh * 0.62)));
+    const by = dy + (dh - bandH) / 2;
+    g.fillStyle = 'rgba(255,255,255,0.07)';
+    g.fillRect(dx, by, dw, bandH);
+    // Enough stripes that a slow drift is visible as movement ACROSS them
+    // rather than as one wide block sliding — the finer the pitch, the finer
+    // the reading, which is the whole idea of a strobe.
+    const bars = Math.max(6, Math.round(dw / 14));
+    const bw = dw / bars;
+    g.fillStyle = accent;
+    // Idle, the drum is barely lit. At full strength a stationary strobe with
+    // nothing playing looks exactly like a stationary strobe that is in tune.
+    g.globalAlpha = live ? 0.8 : 0.28;
+    for (let i = -1; i <= bars; i++) {
+      const sx = dx + (i + st.phase) * bw;
+      const x0 = Math.max(dx, sx);
+      const x1 = Math.min(dx + dw, sx + bw * 0.55);
+      if (x1 > x0) g.fillRect(x0, by, x1 - x0, bandH);
+    }
+    g.globalAlpha = 1;
+    // The fixed reference the stripes drift against — without it there is
+    // nothing for "still" to be still relative to. Drawn as two notches
+    // OUTSIDE the band, because a line across it is hidden by every stripe
+    // that passes under it.
+    g.fillStyle = '#fff';
+    const mx = dx + dw / 2;
+    for (const [ty, dir] of [[by - 1, -1], [by + bandH + 1, 1]] as const) {
+      g.beginPath();
+      g.moveTo(mx, ty);
+      g.lineTo(mx - 4, ty + dir * 5);
+      g.lineTo(mx + 4, ty + dir * 5);
+      g.closePath();
+      g.fill();
+    }
+    if (dh - bandH > 22) {
+      setFont(g, uiFont(9));
+      g.fillStyle = theme.portLabelColor;
+      g.textBaseline = 'top';
+      g.textAlign = 'left';
+      g.fillText('♭', dx + 1, by + bandH + 4);
+      g.textAlign = 'right';
+      g.fillText('♯', dx + dw - 1, by + bandH + 4);
+      g.textAlign = 'left';
+    }
+  }
+
+  /** Bars: an LED ladder either side of centre. The coarse, certain one. */
+  private drawTunerBars(
+    g: CanvasRenderingContext2D,
+    dx: number, dy: number, dw: number, dh: number,
+    st: TunerFace, live: boolean, tol: number, theme: Theme,
+  ): void {
+    const N = 5; // segments each side of centre
+    const seg = dw / (N * 2 + 1);
+    const gap = Math.min(2, seg * 0.18);
+    const idx = Math.max(-N, Math.min(N, Math.round((st.needle / 50) * N)));
+    const inTune = live && Math.abs(st.needle) <= tol;
+    const hFull = Math.max(6, Math.min(dh - 4, Math.round(dh * 0.78)));
+    for (let i = -N; i <= N; i++) {
+      const mid = i === 0;
+      const on = live && (mid ? inTune : i > 0 ? idx >= i : idx <= i);
+      const hh = mid ? hFull : hFull * 0.72;
+      const bx = dx + (i + N) * seg + gap / 2;
+      const byy = dy + (dh - hh) / 2;
+      g.fillStyle = mid ? theme.wireGoodColor : Math.abs(i) <= 2 ? theme.wireHotColor : theme.wireClipColor;
+      g.globalAlpha = on ? 1 : 0.13;
+      g.fillRect(bx, byy, seg - gap, hh);
+      g.globalAlpha = 1;
+    }
+  }
+
+  /** Ring: the same reading as a dial, for a block shrunk to a badge. */
+  private drawTunerRing(
+    g: CanvasRenderingContext2D,
+    dx: number, dy: number, dw: number, dh: number,
+    st: TunerFace, live: boolean, tol: number, accent: string, theme: Theme,
+  ): void {
+    const cx = dx + dw / 2;
+    const cy = dy + dh / 2;
+    const rad = Math.max(5, Math.min(dw, dh) / 2 - 4);
+    const SPAN = Math.PI * 0.8;
+    const top = -Math.PI / 2;
+    const ang = (c: number): number => top + Math.max(-1, Math.min(1, c / 50)) * SPAN;
+    const lw = Math.max(3, rad * 0.13);
+    g.lineWidth = lw;
+    g.strokeStyle = 'rgba(255,255,255,0.10)';
+    g.beginPath();
+    g.arc(cx, cy, rad, ang(-50), ang(50));
+    g.stroke();
+    g.strokeStyle = 'rgba(90, 220, 140, 0.5)';
+    g.beginPath();
+    g.arc(cx, cy, rad, ang(-tol), ang(tol));
+    g.stroke();
+    // The error, drawn as the arc SWEPT from centre rather than as a position:
+    // on a dial that small, "how much of the ring is filled, and on which
+    // side" reads at a glance where a lone dot does not.
+    const a = ang(st.needle);
+    g.strokeStyle = accent;
+    g.beginPath();
+    a < top ? g.arc(cx, cy, rad, a, top) : g.arc(cx, cy, rad, top, a);
+    g.stroke();
+    // Twelve o'clock, printed outside the ring so the pointer never hides it.
+    g.strokeStyle = 'rgba(255,255,255,0.5)';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(cx, cy - rad - lw * 0.6);
+    g.lineTo(cx, cy - rad - lw * 0.6 - 3);
+    g.stroke();
+    g.fillStyle = live ? accent : theme.portLabelColor;
+    g.beginPath();
+    g.arc(cx + Math.cos(a) * rad, cy + Math.sin(a) * rad, lw * 0.62, 0, Math.PI * 2);
+    g.fill();
+    if (rad > 24) {
+      // Outside the ring, but CLAMPED into the plot: a dial wider than it is
+      // tall puts the arc ends near the left and right edges, and a glyph
+      // half-eaten by the clip is worse than no glyph (visual-standard U3).
+      setFont(g, uiFont(9));
+      g.fillStyle = theme.portLabelColor;
+      g.textBaseline = 'middle';
+      g.textAlign = 'center';
+      const R2 = rad + lw + 5;
+      const put = (s: string, c: number): void =>
+        g.fillText(
+          s,
+          Math.max(dx + 6, Math.min(dx + dw - 6, cx + Math.cos(ang(c)) * R2)),
+          Math.max(dy + 6, Math.min(dy + dh - 6, cy + Math.sin(ang(c)) * R2)),
+        );
+      put('♭', -50);
+      put('♯', 50);
+      g.textAlign = 'left';
+    }
+  }
+
+  /**
+   * History: cents against the last few seconds.
+   *
+   * The only display here that shows what a note *does* rather than where it
+   * is — drift, vibrato, and a string settling after a bend all look identical
+   * to the other four (a pointer that will not sit still) and are three quite
+   * different things.
+   */
+  private drawTunerHistory(
+    g: CanvasRenderingContext2D,
+    dx: number, dy: number, dw: number, dh: number,
+    st: TunerFace, live: boolean, tol: number, now: number, accent: string, theme: Theme,
+  ): void {
+    // Fixed 40 ms a column, so the plot's time axis does not change meaning
+    // with the frame rate (and a hidden tab does not compress the picture).
+    if (now - st.hlast >= 40) {
+      st.hlast = now;
+      st.hist[st.hh] = live ? st.needle : NaN;
+      st.hh = (st.hh + 1) % st.hist.length;
+    }
+    const yOf = (c: number): number => dy + dh / 2 - (Math.max(-50, Math.min(50, c)) / 50) * (dh / 2 - 2);
+    g.fillStyle = 'rgba(90, 220, 140, 0.14)';
+    g.fillRect(dx, yOf(tol), dw, yOf(-tol) - yOf(tol));
+    g.strokeStyle = 'rgba(255,255,255,0.28)';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(dx, Math.round(yOf(0)) + 0.5);
+    g.lineTo(dx + dw, Math.round(yOf(0)) + 0.5);
+    g.stroke();
+    const n = st.hist.length;
+    g.strokeStyle = accent;
+    g.lineWidth = 1.4;
+    g.beginPath();
+    let drawing = false;
+    for (let i = 0; i < n; i++) {
+      const v = st.hist[(st.hh + i) % n];
+      if (!Number.isFinite(v)) {
+        drawing = false;
+        continue;
+      }
+      const px = dx + (i / (n - 1)) * dw;
+      const py = yOf(v);
+      if (drawing) g.lineTo(px, py);
+      else g.moveTo(px, py);
+      drawing = true;
+    }
+    g.stroke();
+    setFont(g, uiFont(8));
+    g.fillStyle = theme.portLabelColor;
+    g.textBaseline = 'top';
+    g.textAlign = 'left';
+    g.fillText('+50', dx + 2, dy + 1);
+    g.textBaseline = 'bottom';
+    g.fillText('−50', dx + 2, dy + dh - 1);
   }
 }

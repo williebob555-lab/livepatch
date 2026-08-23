@@ -1,8 +1,9 @@
 # 06 — Audio IO, Clock Drift, and Latency
 
-_Last verified: 2026-08-01. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
+_Last verified: 2026-08-20. Files: `engine/src/io.ts`, `engine/src/bridge.ts`,
 `engine/src/midi.ts`, `scripts/midi-latency.cjs`, `scripts/ring-latency.cjs`,
-`scripts/out-meter-test.cjs`, `scripts/speaker-cal-test.cjs`._
+`scripts/asio-queue-test.cjs`, `scripts/out-meter-test.cjs`,
+`scripts/speaker-cal-test.cjs`._
 
 This is the most performance- and correctness-sensitive code in the app, and the
 place where the subtlest bugs have lived. **Read all of it before touching
@@ -190,10 +191,56 @@ when a buffer was actually popped.
 
 `asioPump` therefore estimates the queue depth from **wall clock** (the audio
 thread consumes exactly one quantum per quantum-duration of real time, whatever
-the event loop is doing) and, above `ASIO_MAX_LEAD` (2 quanta), runs the DSP but
-**skips the write**. Each skip drains one buffer; audio keeps flowing from the
-queue while it drains, so the correction is dropped-fresh-material rather than
-silence, and it self-limits.
+the event loop is doing) and, above `AsioQueue.MAX_LEAD` (2 quanta), runs the
+DSP but **skips the write**. Each skip drains one buffer; audio keeps flowing
+from the queue while it drains, so the correction is dropped-fresh-material
+rather than silence, and it self-limits.
+
+#### The estimator must not double-count the pop (2026-08-20)
+
+**The fix above shipped with a stray decrement and spent a release only half
+working.** The skip path did `asioQueue -= 1` *as well as* subtracting the
+wall-clock pop at the top of the callback, counting the same consumed buffer
+twice. The estimate then fell at 2 quanta per callback while the real queue fell
+at 1, so it reached the lead — and the skipping stopped — while the driver still
+held **half the backlog**.
+
+It does the most damage in the startup burst it exists to clean up. Those N
+callbacks arrive in a single tick with `elapsed ≈ 0` between them, so instead of
+saturating above the lead and skipping all N, the estimate oscillated write→2,
+skip→1, write→2 … and wrote **every other one**. Writes and pops are 1:1
+forever, so nothing drained those, and the stream came up carrying **half the
+stall as permanent output delay, independent of buffer size**.
+
+- **Skipping a write is the absence of the `+= 1`, and nothing else.** The
+  consumption is already accounted for by the wall-clock term.
+- The three transitions are now the whole of `AsioQueue` (`step` / `wrote` /
+  reset) rather than three fields on `IoManager`, because what failed here was a
+  stray *statement*, not wrong logic — the only thing that catches that is a
+  test that drives the entire loop. `scripts/asio-queue-test.cjs` asserts the
+  estimate tracks a truthful model of the queue **exactly** (drift 0.00 q, at
+  128/256/512 frames, across stalls of 0.4–3 s), and its teeth check re-adds the
+  decrement and requires it to still reproduce the failure — 803 ms of standing
+  delay from a 1.6 s stall, reported as 1.0 quanta.
+- `AsioQueue` tracks "has a previous reading" with a flag, **not** `lastNs ===
+  0n`. That sentinel is indistinguishable from a real timestamp of zero and
+  costs the first quantum after a reset its drain, leaving the estimate
+  permanently one buffer high. Harmless against `process.hrtime.bigint()`, but
+  it is exactly the latent off-by-one the class exists to make impossible.
+
+**Nothing in the status said a word about it while it happened**, which is why
+it survived. `late` was 0, `jitterQ` ~1, `xruns` 0, `load` low — all honest: the
+pump *was* on time, the audio was merely old. And `midiToDacMs` derived its lead
+from `masterWriteMode`, which is only set by `primeMaster` — a call the duplex
+ASIO path deliberately never makes — so it returned a hardcoded **0** on the one
+path that can accumulate hundreds of quanta. It now reports `asioQ.depth` for
+that path, so the standing lead is visible instead of invented.
+
+**A standing backlog is invisible to every health counter there is.** When
+latency is the complaint and the plumbing numbers all read clean, that is not
+evidence the IO layer is fine — measure the round trip (Options → *Measure
+round-trip latency…*, which returns quantum / capture-buffer / driver-reported
+as separate lines) rather than inferring from status.
 
 - **The graph still runs on a skipped quantum.** Only the write is dropped, so
   recorders, sequencers and the input rings do not skip a beat.

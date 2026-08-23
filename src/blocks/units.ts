@@ -13,6 +13,7 @@ import { parseSliceKeys, parseSlicePoints, sliceEdges, sliceForNote, velAmp } fr
 import { crossIndex, matrixPorts, parseMatrix } from '../core/matrix';
 import { ENT_MAX, parseRoute } from '../core/entangle';
 import { SYM_CENTS, SYM_MAX, SYM_RATIOS, parseBank } from '../core/sympathy';
+import { centsOff } from '../core/pitch';
 
 /**
  * The narrowest a film may be allowed to be — and therefore the WIDEST its
@@ -1255,6 +1256,212 @@ registerUnit('spectrogram', (_p, env) => analyserUnit(env, 2048));
 registerUnit('spectrum', (_p, env) => analyserUnit(env, 1024));
 registerUnit('scope', (_p, env) => analyserUnit(env, 2048));
 registerUnit('meter', (_p, env) => analyserUnit(env, 1024));
+/**
+ * Tuner (web engine) — the same YIN detector as the `tuner` kernel in
+ * `engine/src/dsp.ts`, run at the control rate instead of on the audio thread.
+ *
+ * **The two must agree numerically**, so the constants and the four steps below
+ * are a deliberate transcription of that kernel and not a second design; the
+ * long explanation of *why* each step is there lives beside it. What differs is
+ * only the shape imposed by the engine:
+ *
+ *   - There is no audio thread to protect here, so the sweep runs whole in one
+ *     `tick` rather than a slice per quantum. It is throttled to ~11 Hz, which
+ *     is close to the kernel's ~8 sweeps a second and keeps it off the frame
+ *     budget — the renderer's single rAF loop is also the CV path (docs/10).
+ *   - The samples come from an `AnalyserNode` window rather than a running
+ *     ring, so the anti-alias filter starts from rest on each pass and the
+ *     window is taken at twice the length actually needed; the first half is
+ *     the filter settling, and only the last `WIN` decimated samples are used.
+ *   - The CV outs are `ConstantSourceNode`s written at the control rate. A
+ *     pitch that only changes when the note does needs nothing faster, and it
+ *     is the same divergence the Sympathy unit's `pitch` output already makes.
+ *
+ * Android has no native engine at all (docs/05), so "web engine" here means
+ * "the tuner on a phone" — which is the device most likely to be pointed at an
+ * instrument. It is not a preview stub.
+ */
+registerUnit('tuner', (params, env) => {
+  const ctx = env.ctx;
+  const inG = ctx.createGain();
+  const outG = ctx.createGain();
+  inG.connect(outG);
+  const pitchCS = ctx.createConstantSource();
+  const centsCS = ctx.createConstantSource();
+  const lockCS = ctx.createConstantSource();
+  for (const cs of [pitchCS, centsCS, lockCS]) {
+    cs.offset.value = 0;
+    cs.start();
+  }
+
+  // ---- mirrored from the `tuner` kernel (engine/src/dsp.ts) ----
+  const WIN = 2048;
+  const MASK = WIN - 1;
+  const TERMS = 1024;
+  const MAXLAG = 1000;
+  const MINLAG = 10;
+  const THRESH = 0.12;
+  const DEC_TARGET = 24000;
+  const GATE = 1.5e-4;
+
+  const sr = ctx.sampleRate;
+  const dec = Math.max(1, Math.min(8, Math.round(sr / DEC_TARGET)));
+  const wsr = sr / dec;
+  const lpK = 1 - Math.exp((-2 * Math.PI * (wsr * 0.2)) / sr);
+  // Twice what the analysis needs: the first half is the filter settling from
+  // rest, which the kernel never has to pay because its filter runs forever.
+  let fft = 2048;
+  while (fft < WIN * dec * 2 && fft < 32768) fft *= 2;
+
+  const an = ctx.createAnalyser();
+  an.fftSize = fft;
+  an.smoothingTimeConstant = 0;
+  inG.connect(an);
+
+  const raw = new Float32Array(fft);
+  const ring = new Float32Array(WIN);
+  const work = new Float32Array(WIN);
+  const dif = new Float32Array(MAXLAG + 1);
+  const cmn = new Float32Array(MAXLAG + 1);
+
+  const P: Record<string, ParamValue> = { ...params };
+  let freq = 0;
+  let conf = 0;
+  let since = 0; // seconds since the last sweep
+
+  const parab = (arr: Float32Array, L: number): number => {
+    if (L <= 0 || L >= MAXLAG) return L;
+    const a = arr[L - 1];
+    const b = arr[L];
+    const c = arr[L + 1];
+    const den = a - 2 * b + c;
+    if (!(Math.abs(den) > 1e-12)) return L;
+    const off = (0.5 * (a - c)) / den;
+    return off > -1 && off < 1 ? L + off : L;
+  };
+
+  /** One whole detection: window → filter → decimate → YIN → published Hz. */
+  const detect = (): void => {
+    an.getFloatTimeDomainData(raw);
+    let a = 0;
+    let b = 0;
+    let dp = 0;
+    let w = 0;
+    let lvl = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const x = raw[i];
+      a += (x - a) * lpK;
+      b += (a - b) * lpK;
+      const ax = x < 0 ? -x : x;
+      lvl += (ax - lvl) * 0.0004;
+      if (++dp >= dec) {
+        dp = 0;
+        ring[w & MASK] = b;
+        w++;
+      }
+    }
+    if (!(lvl > GATE)) {
+      conf *= 0.75;
+      if (conf < 0.02) {
+        conf = 0;
+        freq = 0;
+      }
+      return;
+    }
+    for (let i = 0; i < WIN; i++) work[i] = ring[(w + i) & MASK];
+    for (let L = 1; L <= MAXLAG; L++) {
+      let s = 0;
+      for (let i = 0; i < TERMS; i++) {
+        const d = work[i] - work[i + L];
+        s += d * d;
+      }
+      dif[L] = s;
+    }
+    let run = 0;
+    cmn[0] = 1;
+    for (let L = 1; L <= MAXLAG; L++) {
+      run += dif[L];
+      cmn[L] = run > 1e-12 ? (dif[L] * L) / run : 1;
+    }
+    let best = -1;
+    for (let L = MINLAG; L <= MAXLAG; L++) {
+      if (cmn[L] >= THRESH) continue;
+      while (L + 1 <= MAXLAG && cmn[L + 1] < cmn[L]) L++;
+      best = L;
+      break;
+    }
+    if (best < 0) {
+      let m = Infinity;
+      for (let L = MINLAG; L <= MAXLAG; L++)
+        if (cmn[L] < m) {
+          m = cmn[L];
+          best = L;
+        }
+    }
+    const q = best >= MINLAG ? cmn[best] : 1;
+    const c = q >= 0.55 ? 0 : q <= 0.1 ? 1 : (0.55 - q) / 0.45;
+    conf = conf * 0.5 + c * 0.5;
+    if (best < MINLAG || c < 0.1) return;
+    let period = parab(cmn, best);
+    const k = period > 0 ? Math.min(8, Math.floor(MAXLAG / period)) : 0;
+    if (k >= 2) {
+      let L = Math.round(period * k);
+      if (L > 1 && L < MAXLAG) {
+        for (let s = -2; s <= 2; s++) {
+          const j = L + s;
+          if (j > 1 && j < MAXLAG && dif[j] < dif[L]) L = j;
+        }
+        const cand = parab(dif, L) / k;
+        if (cand > 0 && Math.abs(cand - period) < period * 0.03) period = cand;
+      }
+    }
+    const f = period > 0 ? wsr / period : 0;
+    if (!(f > 0) || !Number.isFinite(f)) return;
+    const rate = 0.08 + 0.85 * Math.max(0, Math.min(1, num(P.avg, 0.5)));
+    if (!freq || Math.abs(f - freq) > freq * 0.15) freq = f;
+    else freq += (f - freq) * rate;
+  };
+
+  return {
+    inlet: () => inG,
+    outlet: (port) =>
+      port === 'pitch' ? pitchCS : port === 'cents' ? centsCS : port === 'lock' ? lockCS : outG,
+    setParam: (id, v) => {
+      P[id] = v;
+    },
+    visual: { text: () => (freq > 0 ? freq.toFixed(4) : '0') + '\n' + conf.toFixed(3) },
+    tick: (dt) => {
+      since += dt;
+      if (since < 0.09) return;
+      since = 0;
+      detect();
+      const ref = Math.max(300, Math.min(600, num(P.ref, 440)));
+      const tol = Math.max(0.5, Math.min(50, num(P.tol, 5)));
+      let pv = 0;
+      let cv = 0;
+      let lk = 0;
+      if (freq > 0) {
+        pv = Math.log2(freq / 261.6255653);
+        const cents = centsOff(freq, ref);
+        cv = cents < -50 ? -1 : cents > 50 ? 1 : cents / 50;
+        lk = conf >= 0.35 && Math.abs(cents) <= tol ? 1 : 0;
+      }
+      smooth(pitchCS.offset, ctx, Number.isFinite(pv) ? pv : 0, 0.02);
+      smooth(centsCS.offset, ctx, Number.isFinite(cv) ? cv : 0, 0.02);
+      smooth(lockCS.offset, ctx, lk, 0.004);
+    },
+    dispose: () => {
+      for (const cs of [pitchCS, centsCS, lockCS]) {
+        cs.stop();
+        cs.disconnect();
+      }
+      inG.disconnect();
+      outG.disconnect();
+      an.disconnect();
+    },
+  };
+});
+
 
 /**
  * Per-speaker monitoring on the web engine.
