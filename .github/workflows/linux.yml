@@ -104,7 +104,7 @@ jobs:
         run: |
           [ -f /tmp/ci.log ] || exit 0
           # Annotations are cut at ~4 KB: send the error lines, then the tail.
-          grep -iE 'error|fatal|undefined reference|FAILED|cannot|not found' /tmp/ci.log | grep -v ' -W' | tail -n 25 | tr -d '\r' | cut -c1-220 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} 1' > /tmp/err.txt || true
+          grep -iE 'build-audify-linux|error|fatal|undefined reference|FAILED|cannot|not found' /tmp/ci.log | grep -v ' -W' | tail -n 25 | tr -d '\r' | cut -c1-220 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} 1' > /tmp/err.txt || true
           tail -n 12 /tmp/ci.log | tr -d '\r' | cut -c1-220 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} 1' > /tmp/tail.txt
           echo "::error title=errors::$(cat /tmp/err.txt)"
           echo "::error title=tail::$(cat /tmp/tail.txt)"
