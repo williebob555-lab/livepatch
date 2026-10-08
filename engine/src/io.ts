@@ -19,6 +19,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { DeviceInfo, send } from './protocol';
 import { disablePowerThrottling } from './winqos';
+import { apiFor, openApi, PRO_NAME, SYS_NAME } from './platform';
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 // audify's enums aren't exported through its .d.ts — bind at runtime.
@@ -65,10 +66,12 @@ interface RtAudioLike {
   getApi(): string;
 }
 
+// Role → RtAudio API for this host (WASAPI/ASIO/DS on Windows, Pulse/JACK/ALSA
+// on Linux). The role names stay Windows-flavored throughout; see platform.ts.
 const API: Record<'wasapi' | 'asio' | 'ds', number> = {
-  wasapi: audify.RtAudioApi.WINDOWS_WASAPI,
-  asio: audify.RtAudioApi.WINDOWS_ASIO,
-  ds: audify.RtAudioApi.WINDOWS_DS,
+  wasapi: apiFor(audify, 'wasapi'),
+  asio: apiFor(audify, 'asio'),
+  ds: apiFor(audify, 'ds'),
 };
 const F32 = audify.RtAudioFormat.RTAUDIO_FLOAT32;
 const RT_FLAGS =
@@ -1085,7 +1088,8 @@ export class IoManager {
     const out: DeviceInfo[] = [];
     for (const api of ['wasapi', 'asio', 'ds'] as const) {
       try {
-        const rt = new audify.RtAudio(API[api]);
+        const rt = openApi(audify, api);
+        if (!rt) continue; // not compiled into this build (Linux) — see platform.ts
         for (const d of rt.getDevices()) {
           out.push({
             api,
@@ -1278,7 +1282,7 @@ export class IoManager {
           this.needs = { ...saved, asio: null };
           this.setupInner();
           this.needs = saved;
-          this.apiInUse += ' (ASIO unavailable — WASAPI fallback)';
+          this.apiInUse += ` (${PRO_NAME} unavailable — ${SYS_NAME} fallback)`;
           this.sendRunning();
           return;
         } catch {
@@ -1327,7 +1331,7 @@ export class IoManager {
       const rt = new audify.RtAudio(API.asio);
       const dev =
         this.findDevice('asio', needs.asio.device, 'out') ?? this.findDevice('asio', needs.asio.device, 'in');
-      if (!dev) throw new Error('no ASIO device found');
+      if (!dev) throw new Error(`no ${PRO_NAME} device found`);
       // Open a generous span so channel switches / added blocks never force a
       // driver reopen: the whole device when it's ≤32 channels, else the need
       // rounded up to a multiple of 8 (grow-only — see masterNeedsReopen).
@@ -1359,16 +1363,16 @@ export class IoManager {
       if (frames > MAXQ) {
         rt.closeStream();
         frames = openAsio(MAXQ);
-        send({ op: 'status', info: `ASIO buffer capped to ${frames} frames` });
+        send({ op: 'status', info: `${PRO_NAME} buffer capped to ${frames} frames` });
       }
-      if (this.refuseOversize(rt, frames, 'ASIO', dev.name)) return;
+      if (this.refuseOversize(rt, frames, PRO_NAME, dev.name)) return;
       this.frames = frames || 256;
       this.masterIsAsio = true;
       this.masterDevice = dev.name;
       this.masterOutChans = outSpan;
       this.asioInSpan = inSpan;
       this.asioOutSpan = outSpan;
-      this.apiInUse = 'ASIO: ' + dev.name;
+      this.apiInUse = `${PRO_NAME}: ` + dev.name;
       this.asioIn = Array.from({ length: Math.max(1, inSpan) }, () => new Float32Array(MAXQ));
       this.asioOut = Array.from({ length: outSpan }, () => new Float32Array(MAXQ));
       // A fresh stream starts with an empty output queue and no history.
@@ -1423,7 +1427,7 @@ export class IoManager {
         frames = openWasapi(MAXQ);
         send({ op: 'status', info: `output buffer capped to ${frames} frames (${MAXQ} max at ${this.sampleRate} Hz)` });
       }
-      if (this.refuseOversize(rt, frames, 'WASAPI', dev.name)) return;
+      if (this.refuseOversize(rt, frames, SYS_NAME, dev.name)) return;
       this.frames = frames || 256;
       this.masterIsAsio = false;
       this.masterDevice = dev.name;
@@ -1432,7 +1436,7 @@ export class IoManager {
       this.mix = Array.from({ length: mChans }, () => new Float32Array(MAXQ));
       this.asioInSpan = 0;
       this.asioOutSpan = 0;
-      this.apiInUse = `WASAPI: ${dev.name}${mChans > 2 ? ` (${mChans}ch)` : ''}`;
+      this.apiInUse = `${SYS_NAME}: ${dev.name}${mChans > 2 ? ` (${mChans}ch)` : ''}`;
       this.allocScratch(mChans);
       this.master = rt;
       this.sampleRate = rt.getStreamSampleRate() || this.sampleRate;
@@ -1955,7 +1959,7 @@ export class IoManager {
       this.asioSkips++;
       if (!this.asioTrimmed) {
         this.asioTrimmed = true;
-        send({ op: 'status', info: 'ASIO output backlog trimmed (event-loop stall at stream start)' });
+        send({ op: 'status', info: `${PRO_NAME} output backlog trimmed (event-loop stall at stream start)` });
       }
       this.feedSecondaries(n);
       return;
@@ -2642,7 +2646,7 @@ export class IoManager {
     const avail = this.outChannels(outDevice, asioOut);
     if (avail <= 0)
       return fail(
-        `no ${asioOut ? 'ASIO' : 'output'} stream is open — put a Speaker Rig block in the patch and turn audio on`,
+        `no ${asioOut ? PRO_NAME : 'output'} stream is open — put a Speaker Rig block in the patch and turn audio on`,
       );
     let widest = 0;
     for (const s of opts.speakers) if (s.ch > widest) widest = s.ch;

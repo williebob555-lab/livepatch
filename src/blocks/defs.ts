@@ -7,6 +7,7 @@
 // compiled IR). See docs/07-ui.md.
 // ============================================================================
 import { registerBlock, ParamSpec } from '../core/registry';
+import { DRIVER_LABELS, PRO_API, SYS_API } from '../core/platform';
 import { EQ_MAX_BANDS, EQ_TYPES, EQ_CHANNELS, EQ_MODES, EQ_DEF_FREQS } from '../ui/widgets';
 
 const knob = (id: string, name: string, min: number, max: number, def: number, opts: object = {}) => ({
@@ -65,7 +66,7 @@ registerBlock({
   category: 'I/O & Hardware',
   group: 'Capture',
   alsoIn: [{ category: 'Surround', group: 'Capture' }],
-  desc: 'Multichannel capture onto one wide wire — WASAPI or ASIO (native engine)',
+  desc: `Multichannel capture onto one wide wire — ${SYS_API} or ${PRO_API} (native engine)`,
   inputs: [],
   outputs: [{ id: 'out', name: 'channels', kind: 'audio', dir: 'out', chans: 8 }],
   params: [
@@ -79,6 +80,7 @@ registerBlock({
       def: 'Windows',
       widget: 'select',
       options: ['Windows', 'ASIO'],
+      optionLabels: DRIVER_LABELS,
       face: false,
     },
     { id: 'device', name: 'Device', type: 'string', def: '', widget: 'select', face: false },
@@ -775,6 +777,7 @@ registerBlock({
       def: 'ASIO',
       widget: 'select',
       options: ['ASIO', 'Windows'],
+      optionLabels: DRIVER_LABELS,
       face: false,
     },
     // What happens when the rig is wider than the device. This used to be an
@@ -837,33 +840,33 @@ registerBlock({
 // blocks share one driver (device) — ASIO is single-client.
 registerBlock({
   type: 'asio-in',
-  title: 'ASIO In',
+  title: `${PRO_API} In`,
   category: 'I/O & Hardware',
-  group: 'ASIO',
-  desc: 'ASIO hardware input — channel-addressed, mono or stereo pair (native engine)',
+  group: PRO_API,
+  desc: `${PRO_API} hardware input — channel-addressed, mono or stereo pair (native engine)`,
   inputs: [],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
     { id: 'channel', name: 'Channel', type: 'int', min: 1, max: 128, def: 1, widget: 'knob', step: 1 },
     { id: 'stereo', name: 'Stereo pair', type: 'bool', def: true, widget: 'toggle' },
-    { id: 'device', name: 'ASIO Device', type: 'string', def: '', widget: 'select', face: false },
+    { id: 'device', name: `${PRO_API} Device`, type: 'string', def: '', widget: 'select', face: false },
   ],
   stubbed: true,
   style: { shape: 'chamfer', stroke: '#b9873d' },
 });
 registerBlock({
   type: 'asio-out',
-  title: 'ASIO Out',
+  title: `${PRO_API} Out`,
   category: 'I/O & Hardware',
-  group: 'ASIO',
+  group: PRO_API,
   alsoIn: [{ category: 'Surround', group: 'Output' }],
-  desc: 'ASIO hardware output — channel-addressed, mono or stereo pair (native engine)',
+  desc: `${PRO_API} hardware output — channel-addressed, mono or stereo pair (native engine)`,
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [],
   params: [
     { id: 'channel', name: 'Channel', type: 'int', min: 1, max: 128, def: 1, widget: 'knob', step: 1 },
     { id: 'stereo', name: 'Stereo pair', type: 'bool', def: true, widget: 'toggle' },
-    { id: 'device', name: 'ASIO Device', type: 'string', def: '', widget: 'select', face: false },
+    { id: 'device', name: `${PRO_API} Device`, type: 'string', def: '', widget: 'select', face: false },
   ],
   stubbed: true,
   style: { shape: 'chamfer', stroke: '#b9873d' },

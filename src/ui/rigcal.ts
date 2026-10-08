@@ -18,6 +18,7 @@
 // ============================================================================
 import { Block, Rig, Speaker } from '../core/types';
 import { doc } from '../core/graph';
+import { IS_LINUX, PRO_API, SYS_API } from '../core/platform';
 import {
   MicCal,
   SWEEP_SECONDS,
@@ -67,7 +68,7 @@ function findOutRoute(): OutRoute | null {
     return {
       asio,
       device,
-      label: asio ? `ASIO · ${device || '(default driver)'}` : `Windows · ${device || '(default endpoint)'}`,
+      label: asio ? `${PRO_API} · ${device || '(default driver)'}` : `${IS_LINUX ? SYS_API : 'Windows'} · ${device || '(default endpoint)'}`,
     };
   }
   return null;
@@ -155,7 +156,7 @@ export function openCalibrateDialog(onlyId?: string): void {
   const masterIsAsio = /^ASIO/i.test(native.status.api ?? '');
   const dflt = document.createElement('option');
   dflt.value = '';
-  dflt.textContent = masterIsAsio ? 'ASIO master input' : 'Default input';
+  dflt.textContent = masterIsAsio ? `${PRO_API} master input` : 'Default input';
   inSel.appendChild(dflt);
   for (const name of native.deviceOptions('audio-in')) {
     const o = document.createElement('option');

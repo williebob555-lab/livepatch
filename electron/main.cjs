@@ -11,6 +11,7 @@ const { spawn } = require('child_process');
 // once `startLanServer` is called, which the app never does at boot.
 const lan = require('./lanserver.cjs');
 const keys = require('./keys.cjs');
+const platform = require('./platform.cjs');
 
 const SCENE_EXT = '.lps'; // LivePatch Scene (JSON)
 
@@ -59,6 +60,11 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // `document.visibilityState`, and a patch has no reason to care whether some
 // other window happens to be in front of this one.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+// Linux / Wayland: `globalShortcut` (the key-in block) cannot grab keys on a
+// Wayland session — no client can. It works through the XDG GlobalShortcuts
+// portal instead, which KDE Plasma implements (the user approves the bindings
+// once, in a system dialog). Harmless on X11, where Electron grabs directly.
+if (platform.IS_LINUX) app.commandLine.appendSwitch('enable-features', 'GlobalShortcutsPortal');
 
 // ============================================================================
 // No application menu at all.
@@ -517,13 +523,9 @@ function spawnEngine() {
 // The LivePatch window HWND as a plain number (for the engine to own plugin
 // editor windows to it). undefined until the window exists.
 function hostHwndNum() {
-  try {
-    if (engineWin && !engineWin.isDestroyed())
-      return Number(engineWin.getNativeWindowHandle().readBigUInt64LE(0));
-  } catch {
-    /* window not ready */
-  }
-  return undefined;
+  // HWND on Windows, X window ID on X11/XWayland, undefined on native Wayland
+  // (editors then open un-owned). See platform.cjs.
+  return platform.nativeWindowNum(engineWin);
 }
 
 // The VST3 host addon (native/vsthost). Dev builds sit in the repo; packaged
@@ -633,7 +635,7 @@ function createWindow() {
     // Packaged builds take the icon from the .exe resources; only the dev run
     // needs it set explicitly, and build/ isn't shipped, so don't look for it
     // there when packaged.
-    ...(app.isPackaged ? {} : { icon: path.join(__dirname, '..', 'build', 'icon.ico') }),
+    ...platform.windowIcon(app),
     // There is no menu to hide — see `Menu.setApplicationMenu(null)` above.
     // Set anyway so a window created before that call could never flash one.
     autoHideMenuBar: true,
@@ -766,7 +768,7 @@ function createDockWindow() {
     minHeight: 220,
     backgroundColor: '#14161a',
     title: 'LivePatch — Dock',
-    ...(app.isPackaged ? {} : { icon: path.join(__dirname, '..', 'build', 'icon.ico') }),
+    ...platform.windowIcon(app),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -866,7 +868,7 @@ if (!app.requestSingleInstanceLock()) {
   // costs nothing and turns "the app won't start" into "kill the stale process".
   process.stderr.write(
     'LivePatch: another instance already owns this profile — raising it and exiting.\n' +
-      'If no window appears, a previous run is still alive: taskkill /IM electron.exe /F\n',
+      `If no window appears, a previous run is still alive: ${platform.killHint}\n`,
   );
   app.quit();
   // `quit()` unwinds asynchronously — returning here would let the rest of this
@@ -987,10 +989,10 @@ app.whenReady().then(() => {
   // vst3 filter, and expose the folder picker separately for bundles.
   ipcMain.handle('dialog:openVstPlugin', async (e) => {
     const win = BrowserWindow.fromWebContents(e.sender);
-    const def = 'C:\\Program Files\\Common Files\\VST3';
+    const def = platform.defaultVstDirs().find((d) => fs.existsSync(d));
     const r = await dialog.showOpenDialog(win, {
       title: 'Choose VST3 Plugin',
-      defaultPath: fs.existsSync(def) ? def : undefined,
+      defaultPath: def,
       filters: [{ name: 'VST3 Plugin', extensions: ['vst3'] }],
       // treatPackageAsDirectory keeps macOS bundles openable; on Windows the
       // filter surfaces .vst3 bundle folders as selectable items.
@@ -1138,11 +1140,10 @@ app.whenReady().then(() => {
     // Plugin-editor overlay placement: the renderer cannot know the native
     // window handle, so it is injected here in transit.
     if (msg && (msg.op === 'vst-ui-rect' || msg.op === 'vst-ui') && engineWin && !engineWin.isDestroyed()) {
-      try {
-        msg.parentHwnd = Number(engineWin.getNativeWindowHandle().readBigUInt64LE(0));
-      } catch {
-        /* leave unset — engine ignores rects without a parent */
-      }
+      // Left unset when there is no usable handle — the engine ignores rects
+      // without a parent.
+      const h = platform.nativeWindowNum(engineWin);
+      if (h !== undefined) msg.parentHwnd = h;
     }
     engineSendRaw(msg);
     return true;
@@ -1350,7 +1351,11 @@ app.whenReady().then(() => {
         else if (ent.isDirectory() && depth < 4) walk(p, depth + 1);
       }
     };
-    for (const d of Array.isArray(dirs) && dirs.length ? dirs : ['C:\\Program Files\\Common Files\\VST3']) walk(d, 0);
+    // The host's standard folders are always scanned (the renderer only knows
+    // the Windows one — on Linux they live under $HOME and /usr), plus whatever
+    // the user added. A folder that doesn't exist just walks nothing.
+    const roots = new Set([...platform.defaultVstDirs(), ...(Array.isArray(dirs) ? dirs : [])]);
+    for (const d of roots) walk(d, 0);
 
     const { spawn } = require('child_process');
     const plugins = [];

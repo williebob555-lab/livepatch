@@ -17,6 +17,7 @@ import { IoManager } from './io';
 import { initHardwareMidi, midiDirectAvailable, onHardwareMidi, sendMidiOut } from './midi';
 import { dispatchVstUi, setVstAddonPath, setVstHostWindow, setVstRateProvider } from './vst';
 import { disablePowerThrottling } from './winqos';
+import { raisePriority } from './platform';
 
 const assets = new AssetStore();
 const io = new IoManager();
@@ -43,12 +44,9 @@ const graph = new GraphExec(services);
 io.onQuantum = (n, sr) => graph.render(n, sr);
 setVstRateProvider(() => io.sampleRate || 48000);
 
-// Raise process priority — the DSP pump shares this event loop.
-try {
-  os.setPriority(os.constants.priority.PRIORITY_HIGHEST);
-} catch {
-  /* not fatal */
-}
+// Raise process priority — the DSP pump shares this event loop. Reported, since
+// on Linux it depends on the user's rlimits (see platform.ts).
+send({ op: 'status', info: raisePriority(os) });
 // …and opt out of Windows power throttling (EcoQoS). Priority is not enough:
 // when the LivePatch window is backgrounded, Windows runs this process at
 // reduced execution speed regardless of priority class. See winqos.ts.

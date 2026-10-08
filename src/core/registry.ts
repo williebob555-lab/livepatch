@@ -94,6 +94,10 @@ export interface ParamSpec {
    *  (eq-curve bands: the 'eq' visual is the face UI for all of them). */
   face?: boolean;
   options?: string[];
+  /** Display text per stored option, where they differ (e.g. the stored
+   *  'ASIO' reads "JACK" on Linux — src/core/platform.ts). Stored values are
+   *  the file format and never change; only what is shown does. */
+  optionLabels?: Record<string, string>;
   /** For 'xy' widgets: id of the param carrying the Y axis. */
   yParam?: string;
   /**

@@ -96,6 +96,53 @@ function parseAccel(accel) {
   return key === null ? null : { mods, key };
 }
 
+// ------------------------------------------------------- linux injection --
+//
+// Wayland has no SendInput: a client may not synthesize input for others. The
+// only route that works on KDE Plasma's Wayland session AND on X11 is the
+// kernel's uinput device, which `ydotool` drives (Fedora: `dnf install
+// ydotool`, then run `ydotoold` — see docs/14-input.md "Linux"). It takes evdev
+// key codes, so the Win32 VKs parseAccel produces are mapped here. A process
+// per keystroke is fine on Linux (fork+exec is ~1 ms; it was PowerShell's
+// startup that made that unaffordable on Windows).
+
+/** Win32 VK → Linux evdev KEY_* code (linux/input-event-codes.h). */
+const EVDEV = (() => {
+  const m = {
+    0xb3: 164, 0xb0: 163, 0xb1: 165, 0xb2: 166, // play/pause, next, previous, stop
+    0xaf: 115, 0xae: 114, 0xad: 113, // volume up, down, mute
+    0x20: 57, 0x1b: 1, 0x0d: 28, 0x09: 15, 0x08: 14, 0x2e: 111,
+    0x25: 105, 0x26: 103, 0x27: 106, 0x28: 108, 0x21: 104, 0x22: 109, 0x24: 102, 0x23: 107,
+    0x11: 29, 0x12: 56, 0x10: 42, 0x5b: 125, // ctrl, alt, shift, super
+    0x30: 11, 0x7a: 87, 0x7b: 88, // 0, F11, F12
+  };
+  for (let i = 1; i <= 9; i++) m[0x30 + i] = 1 + i; // 1..9 → 2..10
+  for (let i = 0; i < 10; i++) m[0x70 + i] = 59 + i; // F1..F10
+  for (let i = 0; i < 12; i++) m[0x7c + i] = 183 + i; // F13..F24
+  const rows = [['QWERTYUIOP', 16], ['ASDFGHJKL', 30], ['ZXCVBNM', 44]];
+  for (const [row, base] of rows) for (let i = 0; i < row.length; i++) m[row.charCodeAt(i)] = base + i;
+  return m;
+})();
+
+let ydotoolMissing = false;
+
+function sendKeyLinux(parsed) {
+  if (ydotoolMissing) return false;
+  const codes = [...parsed.mods, parsed.key].map((vk) => EVDEV[vk]);
+  if (codes.some((c) => c === undefined)) return false;
+  const seq = [...codes.map((c) => `${c}:1`), ...codes.reverse().map((c) => `${c}:0`)];
+  try {
+    const child = spawn('ydotool', ['key', ...seq], { stdio: 'ignore' });
+    child.on('error', () => {
+      // ENOENT: not installed. Remember, so every press doesn't fork a failure.
+      ydotoolMissing = true;
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------- injection --
 
 let ps = null;
@@ -174,6 +221,8 @@ while ($true) {
 function sendKey(accel) {
   const parsed = parseAccel(accel);
   if (!parsed) return false;
+  if (process.platform === 'linux') return sendKeyLinux(parsed);
+  if (process.platform !== 'win32') return false;
   if (!ps) startInjector();
   if (!ps || !psReady) return false;
   try {
@@ -251,4 +300,4 @@ function disposeKeys() {
   }
 }
 
-module.exports = { setWatchedKeys, sendKey, disposeKeys, parseAccel, PRESET_TO_ACCEL, VK };
+module.exports = { setWatchedKeys, sendKey, disposeKeys, parseAccel, PRESET_TO_ACCEL, VK, EVDEV };

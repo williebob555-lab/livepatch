@@ -3,6 +3,9 @@ const { contextBridge, ipcRenderer } = require('electron');
 // Native bridge. The renderer checks for `window.livepatchNative` and falls
 // back to localStorage / browser file pickers when absent (plain-browser dev).
 contextBridge.exposeInMainWorld('livepatchNative', {
+  // Host OS ('win32' | 'linux'), read synchronously at module load by
+  // src/core/platform.ts to pick driver names (ASIO ↔ JACK, WASAPI ↔ PipeWire).
+  platform: process.platform,
   // Diagnostics log (one file per run, written by the main process only).
   diagLog: (kind, data) => ipcRenderer.invoke('diag:log', kind, data),
   diagPath: () => ipcRenderer.invoke('diag:path'),

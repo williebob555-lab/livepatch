@@ -20,6 +20,7 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 import * as net from 'net';
 import * as os from 'os';
+import { apiFor, IS_WIN, PRO_NAME, raisePriority } from './platform';
 const audify = require('audify');
 
 const [, , driverName, srArg, framesArg, maxChArg, portArg] = process.argv;
@@ -48,11 +49,9 @@ const maxCh = Math.max(1, Math.min(8, Number(maxChArg) || 8));
  * Set before RtAudio is touched, and it writes nothing — the "no stderr near
  * stream open" rule below is untouched.
  */
-try {
-  os.setPriority(os.constants.priority.PRIORITY_HIGHEST);
-} catch {
-  /* not fatal — a bridge at normal priority still works on an idle machine */
-}
+// Not fatal if refused — a bridge at normal priority still works on an idle
+// machine. Result deliberately unreported (no stderr before `live`).
+raisePriority(os);
 
 const say = (obj: object): void => {
   try {
@@ -124,10 +123,13 @@ try {
       reportedCaptured = captured;
     }
   }, 20);
-  const rt = new audify.RtAudio(audify.RtAudioApi.WINDOWS_ASIO);
+  // ASIO on Windows, JACK on Linux (a second JACK client — JACK is
+  // multi-client, so the bridge is not strictly needed there, but it keeps one
+  // code path). See platform.ts.
+  const rt = new audify.RtAudio(apiFor(audify, 'asio'));
   const dev = rt.getDevices().find((d: { name: string; inputChannels: number }) => d.name === driverName);
   if (!dev || !dev.inputChannels) {
-    say({ ok: false, error: `ASIO driver not found or has no inputs: ${driverName}` });
+    say({ ok: false, error: `${PRO_NAME} device not found or has no inputs: ${driverName}` });
     process.exit(1);
   }
   const chans = Math.min(maxCh, dev.inputChannels);
@@ -188,9 +190,9 @@ try {
   );
   rt.start();
   setTimeout(() => {
-    say({ ok: true, chans, frames: frames || 0, sampleRate: rt.getStreamSampleRate() || sr, hotLoop: true });
+    say({ ok: true, chans, frames: frames || 0, sampleRate: rt.getStreamSampleRate() || sr, hotLoop: IS_WIN });
     live = true;
-    keepLoopHot();
+    if (IS_WIN) keepLoopHot();
   }, 1500);
   /**
    * **Keep this process's event loop from parking — the fix for "audio garbles

@@ -16,6 +16,7 @@ import { syncRolls } from '../core/rolls';
 import { runtime } from '../engine/runtime';
 import type { LatencyResult } from '../engine/native';
 import { EngineName, prefs, resetPrefs, setPrefs } from '../core/prefs';
+import { PRO_API, SYS_API } from '../core/platform';
 import { dock } from './dock';
 import { doExportPlayer } from './exportplayer';
 import { drawQr, encodeQr } from './qr';
@@ -164,7 +165,7 @@ async function measureLatencyFlow(): Promise<void> {
     const inDev = runtime.native.devices.find((d) => d.api === 'wasapi' && d.inputChannels > 0);
     device = inDev?.name ?? '';
   }
-  const where = asio ? 'the ASIO input' : `"${device || 'the default input'}"`;
+  const where = asio ? `the ${PRO_API} input` : `"${device || 'the default input'}"`;
   const go = await confirmModal(
     'Measure round-trip latency',
     `Plays a short click on the master output and listens for it returning on ${where}. ` +
@@ -267,7 +268,7 @@ function optionsMenu(): void {
   const p = prefs();
   const ENGINES: Array<[EngineName, string]> = [
     ['webaudio', 'Web Audio (in-app)'],
-    ['native', 'Native engine (ASIO / WASAPI)'],
+    ['native', `Native engine (${PRO_API} / ${SYS_API})`],
     ['native-stub', 'Protocol stub (no audio)'],
   ];
   // Android runs one engine and has no ASIO, so the device pickers and the
@@ -281,8 +282,8 @@ function optionsMenu(): void {
     deviceMenu('Audio out', 'audio-out', p.deviceOut, (v) => setPrefs({ deviceOut: v })),
     ...(desktop
       ? [
-          deviceMenu('ASIO in', 'asio-in', p.asioIn, (v) => setPrefs({ asioIn: v })),
-          deviceMenu('ASIO out', 'asio-out', p.asioOut, (v) => setPrefs({ asioOut: v })),
+          deviceMenu(`${PRO_API} in`, 'asio-in', p.asioIn, (v) => setPrefs({ asioIn: v })),
+          deviceMenu(`${PRO_API} out`, 'asio-out', p.asioOut, (v) => setPrefs({ asioOut: v })),
         ]
       : []),
     { sep: true },
@@ -501,9 +502,9 @@ export function initShell(editor: Editor): void {
     // Removed rather than disabled, because a greyed row invites a second try.
     const desktopOnly = !isAndroidApp();
     showContextMenu(r.left, r.bottom + 2, [
-      { label: 'Web Audio (in-app, WASAPI shared)', action: () => setEngine('webaudio') },
+      { label: `Web Audio (in-app, ${SYS_API} shared)`, action: () => setEngine('webaudio') },
       ...(desktopOnly
-        ? [{ label: 'Native engine (hardware ASIO / WASAPI, dedicated process)', action: () => setEngine('native') }]
+        ? [{ label: `Native engine (hardware ${PRO_API} / ${SYS_API}, dedicated process)`, action: () => setEngine('native') }]
         : []),
       ...(desktopOnly
         ? [

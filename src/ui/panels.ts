@@ -1729,7 +1729,7 @@ function buildProperties(body: HTMLElement): { refresh: () => void } {
             for (const o of spec.options ?? []) {
               const op = document.createElement('option');
               op.value = o;
-              op.textContent = o;
+              op.textContent = spec.optionLabels?.[o] ?? o;
               sel.appendChild(op);
             }
             sel.value = String(v);
