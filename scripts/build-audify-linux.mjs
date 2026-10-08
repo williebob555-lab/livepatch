@@ -12,7 +12,7 @@
 // Fails loudly if the result has no JACK — a quiet fallback is the bug this
 // script exists to prevent. No-op off Linux.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -106,3 +106,26 @@ if (!apis.includes('RtApiJack')) {
   );
   process.exit(1);
 }
+
+// Make the output shippable. node_modules/audify is copied into the app
+// verbatim (asar: false), and electron-builder's copier failed on the soname
+// symlink chains CMake leaves in build/Release (libopus.so → libopus.so.0 →
+// libopus.so.0.x: "ENOENT … ensureSymlink 'libopus.so.0'"). So each symlink is
+// replaced by a real copy of its target — the loader finds libopus.so.0 /
+// librtaudio.so.8 by name through audify.node's $ORIGIN rpath either way —
+// and everything else the build left (CMake/ninja trees, the private libjack
+// link above, which points at the BUILD machine's /usr) is removed.
+const release = path.join(audifyDir, 'build', 'Release');
+for (const name of readdirSync(release)) {
+  const p = path.join(release, name);
+  if (lstatSync(p).isSymbolicLink()) {
+    const real = realpathSync(p);
+    rmSync(p);
+    copyFileSync(real, p);
+  }
+}
+for (const name of readdirSync(path.join(audifyDir, 'build'))) {
+  if (name !== 'Release') rmSync(path.join(audifyDir, 'build', name), { recursive: true, force: true });
+}
+rmSync(path.join(audifyDir, 'build-jacklink'), { recursive: true, force: true });
+console.log(`[build-audify-linux] shipped files: ${readdirSync(release).join(', ')}`);
