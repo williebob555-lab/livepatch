@@ -25,10 +25,24 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const audifyDir = path.join(root, 'node_modules', 'audify');
 const cmakeJsBin = path.join(root, 'node_modules', 'cmake-js', 'bin', 'cmake-js');
 
+// Fedora's pipewire-jack keeps libjack.so in a private directory
+// (/usr/lib64/pipewire-0.3/jack) that pkg-config reports via -L — but RtAudio's
+// CMake links `${jack_LIBRARIES}` (just "jack") and drops the directory, so the
+// link failed with "cannot find -ljack". Put the directory on the linker's
+// search path. At RUNTIME the same directory is found through the ld.so.conf.d
+// entry pipewire-jack installs, so nothing needs an rpath.
+const env = { ...process.env };
+const pc = spawnSync('pkg-config', ['--variable=libdir', 'jack'], { encoding: 'utf8' });
+const jackLibDir = pc.status === 0 ? pc.stdout.trim() : '';
+if (jackLibDir) {
+  env.LIBRARY_PATH = env.LIBRARY_PATH ? `${jackLibDir}:${env.LIBRARY_PATH}` : jackLibDir;
+  console.log(`[build-audify-linux] libjack from ${jackLibDir}`);
+}
+
 const r = spawnSync(
   process.execPath,
   [cmakeJsBin, 'rebuild', '--directory', audifyDir, '--CDRTAUDIO_API_JACK=ON', '--CDRTAUDIO_API_PULSE=ON', '--CDRTAUDIO_API_ALSA=ON'],
-  { cwd: audifyDir, stdio: 'inherit' },
+  { cwd: audifyDir, stdio: 'inherit', env },
 );
 if (r.status !== 0) process.exit(r.status ?? 1);
 
