@@ -1,8 +1,9 @@
 # 17 — Linux (Fedora KDE)
 
-_Last verified: 2026-10-08 — against the code and a Windows build only. **No
-Linux machine has run this yet**: the first compile, load and package happen in
-`.github/workflows/linux.yml`. Update this line with the first real Fedora run.
+_Last verified: 2026-10-08 — Fedora CI (container, no audio hardware or display):
+audify with JACK, the VST3 host and the engine build, load and boot; AppImage and
+rpm package (run 37832148958). **No Fedora KDE desktop has run the app yet** —
+see "Not verified yet". Update this line with the first real install.
 Files: `engine/src/platform.ts`, `src/core/platform.ts`, `electron/platform.cjs`,
 `native/vsthost/src/uithread_linux.cc`, `scripts/build-audify-linux.mjs`,
 `scripts/native-smoke.mjs`, `electron-builder.yml` (`linux:` / `rpm:`)._
@@ -64,6 +65,26 @@ a second time under the JACK role. It checks `getApi()` and returns null.
 
 Missing system libraries fail at `require('audify')` with a bare dlopen error;
 `io.ts` rethrows it with the `dnf install` line that fixes it.
+
+### What the first Fedora builds taught (2026-10-08)
+
+- **pipewire-jack keeps `libjack.so` in `/usr/lib64/pipewire-0.3/jack`**, and
+  RtAudio's CMake links bare `-ljack` without that directory: "cannot find
+  -ljack". Putting pkg-config's libdir on `LIBRARY_PATH` alone did not fix it;
+  `build-audify-linux.mjs` now finds the library on disk and passes `-L`
+  explicitly. At runtime it resolves through pipewire-jack's `ld.so.conf.d`.
+- **electron-builder cannot copy CMake's soname symlink chains**
+  (`ENOENT … ensureSymlink 'libopus.so.0'`). The script replaces each symlink in
+  `node_modules/audify/build/Release` with a real copy and deletes the rest of
+  the build tree — including the private libjack link, which points into the
+  build machine's `/usr`.
+- **fpm refuses an rpm without a maintainer email** → `linux.maintainer`.
+- **CI job logs need a signed-in user**; annotations do not. The workflow
+  publishes error lines as annotations so a failure is readable from the API.
+- **`tempo-kernel-test.cjs` fails its heapUsed allocation check** intermittently
+  in CI and every time with `--expose-gc` on Windows — pre-existing, not a
+  Linux issue (docs 10 explains why before/after heapUsed is unreliable). CI
+  runs the regression tests after packaging so it cannot withhold the build.
 
 ## Audio specifics
 
