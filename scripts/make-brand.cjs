@@ -9,6 +9,7 @@
 // Outputs:
 //   brand/png/*.png   raster exports of every SVG
 //   build/icon.ico    multi-size Windows icon (electron-builder picks this up)
+//   build/icon.png    Linux app icon (copy of brand/png/mark-square-1024.png)
 //
 // The .ico stores PNG-compressed entries at every size, which is what
 // png-to-ico and friends emit and what rcedit/NSIS/Explorer all read.
@@ -157,6 +158,9 @@ async function main() {
 
   const ico = path.join(BUILD, 'icon.ico');
   fs.writeFileSync(ico, buildIco(entries));
+  // Linux app icon (electron-builder linux.icon + the runtime window icon):
+  // the 1024 px square mark, copied so it can never drift from the export.
+  fs.copyFileSync(path.join(PNG_OUT, 'mark-square-1024.png'), path.join(BUILD, 'icon.png'));
   try {
     // The whole per-run directory, not just the file inside it.
     fs.rmSync(TMP_DIR, { recursive: true, force: true });

@@ -14,10 +14,11 @@
 // clock. The master/secondary/resampler topology in io.ts is unchanged.
 //
 // RtAudio silently falls back to ANOTHER compiled API when the one requested
-// was not compiled in (audify's Linux prebuild only has JACK/Pulse if their
-// headers were present on its build machine), and the fallback's devices would
-// then be listed twice under the wrong role. `openApi` checks what it actually
-// got and returns null instead. See docs/06-audio-io-and-latency.md "Linux".
+// was not compiled in, and the fallback's devices would then be listed twice
+// under the wrong role. `openApi` checks what it actually got and returns null
+// instead. This is not hypothetical: audify's published Linux prebuild has
+// Pulse + ALSA and NO JACK — scripts/build-audify-linux.mjs rebuilds it with
+// JACK for packaged builds. See docs/06-audio-io-and-latency.md "Linux".
 // ============================================================================
 
 export type ApiRole = 'wasapi' | 'asio' | 'ds';
@@ -54,6 +55,11 @@ export function openApi<T extends { getApi(): string }>(
   audify: AudifyApis & { RtAudio: new (api?: number) => T },
   role: ApiRole,
 ): T | null {
+  // Linux 'ds' (raw ALSA) is not offered: under PipeWire every device is
+  // already reachable through Pulse and JACK, while the raw hw: devices are
+  // held by PipeWire and fail with "device busy" — a list of choices that
+  // mostly don't work, duplicating ones that do.
+  if (IS_LINUX && role === 'ds') return null;
   const rt = new audify.RtAudio(apiFor(audify, role));
   if (IS_WIN) return rt;
   try {

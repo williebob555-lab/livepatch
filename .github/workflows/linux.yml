@@ -1,0 +1,91 @@
+# Linux (Fedora) build, smoke test and packages.
+#
+# WHY THIS EXISTS: the Linux port (Fedora KDE target) was written on a Windows
+# machine with no Linux to compile on. This job is the first place the native
+# pieces — audify rebuilt with JACK, the VST3 host addon with its X11 editor
+# thread — are actually compiled and loaded on Linux, so it is the gate for
+# them. It runs in a Fedora container, not on Ubuntu, because Fedora is the
+# target and its package names are what docs/11-packaging.md tells users to
+# install.
+#
+# Two npm 11 traps it works around, both of which also bite a developer on
+# Linux (docs/11-packaging.md "Linux"):
+#   * install scripts are NOT run for unapproved packages, so Electron never
+#     downloads its binary — `node node_modules/electron/install.js` does it;
+#   * audify's install never runs either, and its tarball ships only WINDOWS
+#     binaries — `npm run build:audify:linux` builds it, with JACK.
+name: Linux (Fedora)
+
+on:
+  push:
+    branches: [main, 'linux-*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Toolchain and audio/X11 headers
+        run: >
+          dnf install -y --setopt=install_weak_deps=False
+          git tar xz gzip findutils which
+          gcc-c++ make cmake pkgconf-pkg-config
+          libX11-devel
+          pipewire-jack-audio-connection-kit-devel pulseaudio-libs-devel alsa-lib-devel
+          rpm-build libxcrypt-compat
+
+      - uses: actions/checkout@v5
+
+      # An OFFICIAL Node build (self-contained). bundle-node ships this binary
+      # inside the app and refuses Fedora's libnode-linked one.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          node node_modules/electron/install.js
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: audify with JACK
+        run: npm run build:audify:linux
+
+      - name: VST3 host addon
+        run: npm run build:vsthost
+
+      - name: Build renderer + engine
+        run: npm run build
+
+      - name: Native smoke test
+        run: node scripts/native-smoke.mjs
+
+      - name: Engine regression tests (hardware-free)
+        run: |
+          set -e
+          node --expose-gc scripts/audio-alloc-test.cjs
+          node scripts/cv-indicator-test.mjs
+          node scripts/web-parity-test.mjs
+          for t in scripts/*-kernel-test.cjs; do echo "== $t"; node "$t"; done
+
+      - name: Package (AppImage + rpm)
+        run: |
+          npm run bundle:node
+          npx electron-builder --linux --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: livepatch-linux
+          path: |
+            release/*.AppImage
+            release/*.rpm
+          if-no-files-found: error

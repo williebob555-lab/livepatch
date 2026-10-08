@@ -19,11 +19,26 @@ import * as net from 'net';
 import * as path from 'path';
 import { DeviceInfo, send } from './protocol';
 import { disablePowerThrottling } from './winqos';
-import { apiFor, openApi, PRO_NAME, SYS_NAME } from './platform';
+import { apiFor, IS_LINUX, openApi, PRO_NAME, SYS_NAME } from './platform';
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 // audify's enums aren't exported through its .d.ts — bind at runtime.
-const audify = require('audify') as {
+//
+// On Linux its RtAudio links libjack/libpulse/libasound dynamically, so a
+// missing system library fails HERE with a bare dlopen error. Name the fix.
+const loadAudify = (): unknown => {
+  try {
+    return require('audify');
+  } catch (e) {
+    if (IS_LINUX && /lib(jack|pulse|asound)/.test(String(e)))
+      throw new Error(
+        `${String(e)}\nThe native engine needs the system audio libraries: ` +
+          'sudo dnf install pipewire-jack-audio-connection-kit-libs pulseaudio-libs alsa-lib',
+      );
+    throw e;
+  }
+};
+const audify = loadAudify() as {
   RtAudio: new (api?: number) => RtAudioLike;
   RtAudioApi: Record<string, number>;
   RtAudioFormat: Record<string, number>;
@@ -1340,6 +1355,21 @@ export class IoManager {
       const outSpan = spanFor(Math.max(2, needs.asio.outSpan), Math.max(2, dev.outputChannels));
       const inSpan = dev.inputChannels > 0 ? spanFor(Math.max(1, needs.asio.inSpan), dev.inputChannels) : 0;
       this.sampleRate = this.requestedRate || dev.preferredSampleRate || 48000;
+      if (IS_LINUX) {
+        // JACK runs at the server's (PipeWire graph's) rate and RtAudio refuses
+        // any other — a mismatch would throw and drop us to the shared
+        // fallback. Take the server rate and say so if it isn't what was asked.
+        const server = dev.preferredSampleRate || this.sampleRate;
+        if (this.requestedRate && this.requestedRate !== server)
+          send({ op: 'status', info: `${PRO_NAME} runs at the PipeWire rate ${server} Hz (requested ${this.requestedRate})` });
+        this.sampleRate = server;
+        // pipewire-jack takes its quantum from PIPEWIRE_LATENCY when the client
+        // opens; the frameSize argument is ignored. An explicit request is
+        // passed through; none leaves PipeWire to choose (rule 5 — no constant).
+        const want = clampFrames(this.requestedFrames);
+        if (want) process.env.PIPEWIRE_LATENCY = `${want}/${this.sampleRate}`;
+        else delete process.env.PIPEWIRE_LATENCY;
+      }
       const openAsio = (want: number): number =>
         rt.openStream(
           { deviceId: dev.id, nChannels: outSpan, firstChannel: 0 },
