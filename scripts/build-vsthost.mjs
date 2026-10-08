@@ -1,12 +1,31 @@
-// Build the native VST3 host addon (native/vsthost) with cmake-js, using the
-// CMake and Ninja that ship inside Visual Studio — no standalone cmake install
-// needed. Produces native/vsthost/build/Release/vsthost.node.
+// Build the native VST3 host addon (native/vsthost) with cmake-js. Produces
+// native/vsthost/build/Release/vsthost.node.
+//
+// Windows: uses the CMake and Ninja that ship inside Visual Studio — no
+// standalone cmake install needed.
+// Linux: uses the system toolchain (Fedora: `sudo dnf install gcc-c++ cmake
+// libX11-devel`). See docs/13-vst-hosting.md "Linux".
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Invoke cmake-js's bin directly with node — npx via a shell mangles paths
+// containing spaces (the project lives in "C:\SurroundApp 2").
+const cmakeJsBin = path.join(root, 'node_modules', 'cmake-js', 'bin', 'cmake-js');
+const verb = process.argv.includes('--rebuild') ? 'rebuild' : 'compile';
+
+if (process.platform === 'linux') {
+  // cmake-js picks the system cmake and its default generator. No --arch: the
+  // addon is built for the Node that runs this script, which is the Node that
+  // bundle-node ships (scripts/bundle-node.mjs) — they must match.
+  const r = spawnSync(process.execPath, [cmakeJsBin, verb, '--directory', path.join(root, 'native/vsthost')], {
+    cwd: root,
+    stdio: 'inherit',
+  });
+  process.exit(r.status ?? 1);
+}
 
 function findVs() {
   const vswhere = path.join(
@@ -34,11 +53,8 @@ const generators = { 17: 'Visual Studio 17 2022', 18: 'Visual Studio 18 2026' };
 const generator = generators[vsVersion] ?? 'Visual Studio 18 2026';
 
 const env = { ...process.env, PATH: `${cmakeBin};${ninjaBin};${process.env.PATH}` };
-// Invoke cmake-js's bin directly with node — npx via a shell mangles paths
-// containing spaces (the project lives in "C:\SurroundApp 2").
-const cmakeJsBin = path.join(root, 'node_modules', 'cmake-js', 'bin', 'cmake-js');
 const args = [
-  cmakeJsBin, process.argv.includes('--rebuild') ? 'rebuild' : 'compile',
+  cmakeJsBin, verb,
   '--directory', path.join(root, 'native/vsthost'),
   '--generator', generator,
   '--arch', 'x64',

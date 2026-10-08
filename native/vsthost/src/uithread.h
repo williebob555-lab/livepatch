@@ -1,16 +1,16 @@
-// Dedicated Win32 UI thread for VST3 plugin editors.
+// Dedicated UI thread for VST3 plugin editors (and plugin construction).
+// Implementations: uithread_win.cc (Win32 message loop) and uithread_linux.cc
+// (X11 + the VST3 Linux::IRunLoop the host must provide).
 //
 // Why: plugin GUIs need a pumped message loop and node's event loop doesn't
-// pump Win32 messages — and the engine's JS thread is also the audio pump, so
-// GUI work must never run there. One shared thread hosts every editor window.
+// pump one — and the engine's JS thread is also the audio pump, so GUI work
+// must never run there. One shared thread hosts every editor window.
 //
-// Capture model ("the block face IS the plugin"): the editor attaches to a
-// DWM-cloaked top-level window — composed by the OS but invisible — and a UI
-// -thread timer blits it with PrintWindow(PW_RENDERFULLCONTENT) into a shared
-// -memory frame (double-buffer + sequence counter). Electron reads the mapping
-// by name and paints it onto the block face. Pixel-identical to the real GUI
-// because it IS the real GUI. Popup mode uncloaks the same window for direct
-// interaction.
+// Editors open as plain top-level windows (the SDK editorhost model). The
+// capture-to-block-face path (FrameHeader, input(), setCaptureFps(), embed())
+// is retired: plugins render with their own GPU context into a real visible
+// window and anything else renders black. Those entry points remain as no-ops
+// for ABI stability.
 //
 // Thread contract:
 // - JS/audio thread → UI thread: commands (open/close/input) go through a
@@ -20,7 +20,19 @@
 //   drained in process(). The audio path never takes a lock.
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <thread>
+// Linux stand-ins so the shared interface keeps its Windows spelling (the
+// implementation is uithread_linux.cc):
+//   HANDLE — an opaque completion event from postCall (a ref-counted event,
+//            so a waiter that timed out can never be signalled after free);
+//   HWND   — an X11 Window ID carried as a pointer-sized value.
+using HANDLE = void*;
+using HWND = void*;
+namespace Steinberg { namespace Linux { class IRunLoop; } }
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -178,14 +190,27 @@ class UiThread {
   void embed(VstInstance* inst, HWND parent, int x, int y, int w, int h,
              int clipX, int clipY, int clipW, int clipH, bool visible);
 
+#ifndef _WIN32
+  /**
+   * The host run loop (Linux only). VST3 on Linux has no global event loop, so
+   * the HOST must give plugins one to register fds and timers with — through
+   * IPlugFrame and the host context. This thread's poll() loop is it.
+   */
+  Steinberg::Linux::IRunLoop* runLoop();
+#endif
+
  private:
   UiThread() = default;
   void ensureStarted();
-  static DWORD WINAPI threadProc(LPVOID self);
   void pump();
-
+#ifdef _WIN32
+  static DWORD WINAPI threadProc(LPVOID self);
   HANDLE thread_ = nullptr;
   DWORD threadId_ = 0;
+#else
+  std::thread thread_;
+  int wakeFd_ = -1; // eventfd: post() wakes the poll() loop
+#endif
   std::atomic<bool> running_{false};
   /** LivePatch window HWND (owner of editor windows). uintptr_t so it's a
    *  trivially-atomic pointer written from JS thread, read on the UI thread. */

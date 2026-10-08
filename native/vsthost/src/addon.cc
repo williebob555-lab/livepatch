@@ -3,7 +3,9 @@
 // the engine's JS thread; the process() path must stay allocation-free on the
 // native side (see host.h for the performance contract).
 #include <napi.h>
+#ifdef _WIN32
 #include <objbase.h>
+#endif
 
 #include <unordered_map>
 
@@ -30,7 +32,9 @@ class CreateWorker : public Napi::AsyncWorker {
   void Execute() override {
     // Plugins (iZotope especially) use COM internally; init per pool thread.
     // Deliberately never uninitialized — the uv pool thread is reused.
+#ifdef _WIN32
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
     inst_ = std::make_unique<lp::VstInstance>();
     // Construct on the addon's UI thread (not this worker): plugin GUI
     // toolkits bind to the creating thread and need its message loop, or the
@@ -621,7 +625,14 @@ Napi::Value UiInput(const Napi::CallbackInfo& info) {
 
 // ---- shared-memory frame reader (used by the Electron MAIN process, which
 // loads this same addon just for these two functions) ----
+//
+// Belongs to the retired capture path (see uithread.h): nothing writes these
+// frames any more. Linux never had it — there both always report "no frame".
 
+#ifndef _WIN32
+Napi::Value FrameRead(const Napi::CallbackInfo& info) { return info.Env().Null(); }
+Napi::Value FrameClose(const Napi::CallbackInfo& info) { return info.Env().Undefined(); }
+#else
 struct FrameView {
   HANDLE file;
   const uint8_t* mem;
@@ -681,6 +692,7 @@ Napi::Value FrameClose(const Napi::CallbackInfo& info) {
   }
   return info.Env().Undefined();
 }
+#endif
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("version", Napi::Function::New(env, Version));

@@ -1,8 +1,14 @@
 #include "host.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
@@ -17,7 +23,7 @@ namespace lp {
 // Opt-in teardown tracing (LPVST_UI_TRACE=1) — plugin shutdown is the most
 // crash-prone moment when hosting third-party code.
 static bool tdTrace() {
-  static const bool on = GetEnvironmentVariableA("LPVST_UI_TRACE", nullptr, 0) > 0;
+  static const bool on = std::getenv("LPVST_UI_TRACE") != nullptr;
   return on;
 }
 #define TD_TRACE(...) do { if (tdTrace()) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
@@ -52,8 +58,29 @@ static Vst::SpeakerArrangement arrangementFor(int32 chans) {
 
 // ---------------------------------------------------------------- host context
 
+#ifdef _WIN32
+using HostApp = Vst::HostApplication;
+#else
+/**
+ * Linux: the host context must also answer for Linux::IRunLoop. Plugins look
+ * for it there (IPlugFactory3::setHostContext) to run timers and fd handlers
+ * with no editor open — the frame only exists while one is. Both hand out the
+ * same loop: the UI thread's (uithread_linux.cc).
+ */
+class HostApp : public Vst::HostApplication {
+ public:
+  tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+    if (FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid)) {
+      *obj = UiThread::instance().runLoop();
+      return kResultOk;
+    }
+    return Vst::HostApplication::queryInterface(iid, obj);
+  }
+};
+#endif
+
 static Vst::HostApplication* hostApp() {
-  static Vst::HostApplication app;
+  static HostApp app;
   static bool registered = false;
   if (!registered) {
     Vst::PluginContextFactory::instance().setPluginContext(&app);
@@ -333,7 +360,12 @@ bool VstInstance::openUi(bool popup) {
   uiWanted_.store(true);
   if (shmName_.empty()) {
     static std::atomic<uint32_t> counter{0};
-    shmName_ = "Local\\lpvst_" + std::to_string(GetCurrentProcessId()) + "_" +
+#ifdef _WIN32
+    const unsigned long pid = GetCurrentProcessId();
+#else
+    const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+    shmName_ = "Local\\lpvst_" + std::to_string(pid) + "_" +
                std::to_string(counter.fetch_add(1));
   }
   editorEverOpened_ = true;
@@ -348,7 +380,8 @@ void VstInstance::closeUi(bool wait) {
     // Block until the UI thread released the view — the instance is about to
     // die and the editor holds pointers into it. UI thread is responsive
     // (15 ms pump); cap the wait so a wedged GUI can't hang teardown forever.
-    for (int i = 0; i < 200 && uiHostAlive_.load(); i++) Sleep(5);
+    for (int i = 0; i < 200 && uiHostAlive_.load(); i++)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 }
 
@@ -371,13 +404,21 @@ void VstInstance::embedUi(uintptr_t parentHwnd, int x, int y, int w, int h,
 
 // SEH guard. __try/__except cannot live in a frame that constructs C++ objects
 // needing unwinding, so it only wraps a call to the real body.
+// Linux has no SEH: a fault here ends the engine process, which Electron
+// restarts. The editor-was-opened leak path above still avoids the riskiest
+// teardowns, exactly as on Windows.
 static bool guardedTeardown(VstInstance* self, void (VstInstance::*body)()) {
+#ifdef _WIN32
   __try {
     (self->*body)();
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+#else
+  (self->*body)();
+  return true;
+#endif
 }
 
 void VstInstance::teardown() {
