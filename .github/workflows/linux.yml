@@ -30,6 +30,10 @@ jobs:
     permissions:
       contents: read
 
+    # bash -o pipefail so a `| tee` keeps the real exit status.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Toolchain and audio/X11 headers
         run: >
@@ -58,16 +62,16 @@ jobs:
         run: npm run typecheck
 
       - name: audify with JACK
-        run: npm run build:audify:linux
+        run: npm run build:audify:linux 2>&1 | tee -a /tmp/ci.log
 
       - name: VST3 host addon
-        run: npm run build:vsthost
+        run: npm run build:vsthost 2>&1 | tee -a /tmp/ci.log
 
       - name: Build renderer + engine
         run: npm run build
 
       - name: Native smoke test
-        run: node scripts/native-smoke.mjs
+        run: node scripts/native-smoke.mjs 2>&1 | tee -a /tmp/ci.log
 
       - name: Engine regression tests (hardware-free)
         run: |
@@ -89,3 +93,13 @@ jobs:
             release/*.AppImage
             release/*.rpm
           if-no-files-found: error
+
+      # Job logs need a signed-in GitHub user to download, annotations do not.
+      # On failure, publish the tail of the build output as one annotation so
+      # the failure can be read from the public API / run page.
+      - name: Surface failure output
+        if: failure()
+        run: |
+          [ -f /tmp/ci.log ] || exit 0
+          tail -n 80 /tmp/ci.log | tr -d '\r' | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} 1' > /tmp/tail.txt
+          echo "::error title=build output (last 80 lines)::$(cat /tmp/tail.txt)"
