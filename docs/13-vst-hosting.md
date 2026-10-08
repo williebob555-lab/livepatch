@@ -372,3 +372,26 @@ allowed. `LPVST_UI_TRACE=1` adds the verbose (success-path) trace.
 - Scanner: pipe a JSON path array into `node dist-engine/vstscan.js <addon>`.
 - Engine protocol: spawn `node dist-engine/main.js`, send a `set-graph` with a
   vst node, expect `vst-info` (see 12-testing-checklist.md).
+
+## Linux (2026-10-08)
+
+`uithread.cc` is now `uithread_win.cc` (unchanged); `uithread_linux.cc` is
+its Linux twin with the same command queue and the same hide-never-destroy and
+leak-if-GUI-opened rules. What Linux adds, each a crash or blank editor if
+missed:
+
+- **The host provides `Linux::IRunLoop`** — through the plug frame AND the
+  host context (`HostApp` in `host.cc`). Toolkit GUIs paint only from its
+  fd/timer callbacks.
+- **Editors are X11** (XWayland on KDE Wayland), `WM_TRANSIENT_FOR` the app
+  window when Electron has an X id.
+- **Xlib's default error handler exits the process** — replaced with a logging
+  one.
+- **No SEH**: `guardedTeardown` is a plain call; a fault ends the engine
+  process and Electron restarts it.
+- `HANDLE` from `postCall` is a ref-counted event, so a timed-out waiter is
+  never signalled after free.
+
+Build: `sudo dnf install gcc-c++ cmake libX11-devel` then `npm run
+build:vsthost`. Windows rebuilt and `vsthost-smoke.mjs` passed (Raum,
+DecentSampler, Ozone) after the split. Details: [`17-linux.md`](17-linux.md).

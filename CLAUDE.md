@@ -37,6 +37,11 @@ specifically to prevent re-introducing bugs that were expensive to find.
     plugin-GUI thread, no PrintWindow on editors, no SetParent into Electron.
     Read [`docs/13-vst-hosting.md`](docs/13-vst-hosting.md) before touching
     `native/vsthost` or `engine/src/vst.ts`.
+11. **Driver values in scenes are a file format; names are per-platform UI.**
+    `'Windows'`/`'ASIO'` (and the engine roles `wasapi`/`asio`) are stored and
+    compared as-is on Linux too, where they mean PipeWire/JACK. Never rename the
+    values — change labels through `src/core/platform.ts` / `optionLabels`, and
+    keep Windows behavior identical. (`docs/17-linux.md`)
 
 ## `dev/` is the human's only inbox — keep it current
 

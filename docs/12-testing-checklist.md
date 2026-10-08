@@ -2019,3 +2019,15 @@ under test was fine both times.
 The fix was to feed one chunk per message from the output tap, which arrives on
 the audio thread's schedule and is throttled by nothing. Clock any such harness
 off something the audio thread drives, never off a timer.
+
+## Linux / cross-platform changes (`*/platform.*`, `uithread_linux.cc`, `electron-builder.yml`)
+
+- [ ] Windows still behaves identically: labels read ASIO/WASAPI/Windows, the
+      stored `api` values are still `'Windows'`/`'ASIO'`, and
+      `node scripts/native-smoke.mjs` passes.
+- [ ] `npm run package:dir` still puts `node.exe` and `vsthost.node` in
+      `release/win-unpacked/resources`.
+- [ ] `.github/workflows/linux.yml` is green (audify has JACK, vsthost builds
+      and loads, engine boots, packages build).
+- [ ] On Fedora KDE: the items under "Not verified yet" in
+      [`17-linux.md`](17-linux.md) that your change touches.

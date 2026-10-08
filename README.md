@@ -1,7 +1,8 @@
 <img src="brand/png/banner-readme-1280x280.png" alt="LivePatch — block-and-wire audio patching for Windows" width="100%">
 
-Block-and-wire audio patching environment for Windows: build signal chains between
-Windows audio, ASIO hardware, and VST plugins with an Unreal-style node editor.
+Block-and-wire audio patching environment for Windows and Linux (Fedora KDE): build
+signal chains between system audio, ASIO / JACK hardware, and VST3 plugins with an
+Unreal-style node editor.
 
 The frontend (this app) is complete and runs today with a **live Web Audio engine** —
 patches make real sound, wires color themselves by signal level, spectrograms animate
@@ -26,6 +27,26 @@ npm run dev        # browser mode: localStorage scenes, browser file pickers
 
 To hot-reload inside Electron: `npm run dev` in one terminal, then
 `$env:LIVEPATCH_DEV_URL='http://localhost:5199'; npx electron .` in another.
+
+### Linux (Fedora KDE)
+
+Same app; ASIO's role is played by JACK and Windows audio's by PipeWire, and
+scenes open on either platform unchanged. On Linux the native pieces must be
+built locally once (npm 11 skips their install scripts, and audify's published
+Linux build lacks JACK):
+
+```
+sudo dnf install gcc-c++ make cmake pkgconf-pkg-config libX11-devel \
+  pipewire-jack-audio-connection-kit-devel pulseaudio-libs-devel alsa-lib-devel
+npm ci
+node node_modules/electron/install.js
+npm run build:audify:linux && npm run build:vsthost
+npm start
+```
+
+Packages (AppImage + rpm): `npm run package:linux`. Everything Linux-specific,
+including what has not been verified on real hardware yet, is in
+[`docs/17-linux.md`](docs/17-linux.md).
 
 ## Using the editor
 

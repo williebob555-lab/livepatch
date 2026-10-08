@@ -957,3 +957,25 @@ meant to be real, set the endpoint (or use ASIO, where the driver owns it).
    audify preserves the initial write/consume lead forever, so an unbounded
    queue turns one event-loop stall at stream start into permanent delay (the
    ASIO section above).
+
+## Linux (2026-10-08)
+
+The roles above keep their Windows names on Linux: `wasapi` is RtAudio's
+**PulseAudio** API (PipeWire via pipewire-pulse), `asio` is **JACK** (PipeWire
+via pipewire-jack), and `ds` (raw ALSA) is not offered. The topology —
+master stream, secondary rings, drift resampler, the bridge — is unchanged.
+`engine/src/platform.ts` holds the mapping. Linux-only rules:
+
+- The JACK master opens at the **server rate** (RtAudio refuses any other) and
+  says so if that is not the requested rate.
+- A requested buffer size reaches PipeWire through `PIPEWIRE_LATENCY`; no
+  request leaves it unset (rule 5 — never a constant).
+- audify's published Linux build has **no JACK**; packaged builds rebuild it
+  (`npm run build:audify:linux`). `openApi` refuses an API RtAudio silently
+  substituted, so a missing JACK can never list Pulse devices twice.
+- The bridge's `keepLoopHot` spin is Windows-only (it answers Windows' 15.6 ms
+  background timer coalescing).
+- Process priority is walked down from nice −20 to what the rlimits allow and
+  reported; add the user to the `pipewire` group for −19.
+
+Full detail and what is still unverified: [`17-linux.md`](17-linux.md).

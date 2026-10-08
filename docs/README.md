@@ -229,7 +229,7 @@ avoid stepping on the invariants that keep it fast and correct.
 | 03 | [`03-document-model.md`](03-document-model.md) | `GraphDoc`, editing, undo, subgraphs, custom blocks |
 | 04 | [`04-web-engine.md`](04-web-engine.md) | `WebAudioEngine`: units, reconcile, CV, metering |
 | 05 | [`05-native-engine.md`](05-native-engine.md) | The engine process, protocol, `GraphExec`, DSP kernels |
-| 06 | [`06-audio-io-and-latency.md`](06-audio-io-and-latency.md) | `IoManager`, clock drift, resampling, ASIO/WASAPI/bridge, MIDI |
+| 06 | [`06-audio-io-and-latency.md`](06-audio-io-and-latency.md) | `IoManager`, clock drift, resampling, ASIO/WASAPI/bridge (JACK/PipeWire on Linux), MIDI |
 | 07 | [`07-ui.md`](07-ui.md) | Renderer, editor, widgets, layout, panel manager, **the Dock**, UI scale |
 | 08 | [`08-extending.md`](08-extending.md) | **How to add blocks, widgets, kernels, visuals** |
 | 09 | [`09-persistence-and-assets.md`](09-persistence-and-assets.md) | Scenes, session, cassettes, custom blocks, the tape system |
@@ -240,6 +240,7 @@ avoid stepping on the invariants that keep it fast and correct.
 | 14 | [`14-dynamic-blocks.md`](14-dynamic-blocks.md) | The "alive" blocks — visual rules, per-block specs, and what building all seven taught. **Read before drawing any block face.** |
 | 15 | [`15-minions.md`](15-minions.md) | Characters that live in the patch: the pixel-art rules, the planted-foot walk, and the IK branch that cost 17 units. **Read before touching `src/ui/minions/`.** |
 | 14 | [`14-input.md`](14-input.md) | **Touch / trackpad / mouse / pen — the input standard (normative)** |
+| 17 | [`17-linux.md`](17-linux.md) | **Linux (Fedora KDE)**: the role/label split that keeps scenes portable, PipeWire/JACK, the VST3 run loop, packaging, and what is still unverified |
 | 16 | [`16-virus.md`](16-virus.md) | Modulation that spreads downstream through the patch: habitat, strains, the fitness function that was wrong twice, and the broken-ring indicator |
 
 ## Keeping this current

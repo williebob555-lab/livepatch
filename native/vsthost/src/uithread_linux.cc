@@ -22,9 +22,6 @@
 //   hide-never-destroy rule below keeps that path rare, exactly as on Windows.
 #include "uithread.h"
 
-#include <X11/Xatom.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -40,6 +37,12 @@
 #include "host.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
+
+// Xlib LAST: it #defines None, Status, Bool, Success, Always… which would
+// rewrite identifiers in any SDK or standard header included after it.
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
 
 using namespace Steinberg;
 
@@ -229,6 +232,17 @@ class RunLoop : public Linux::IRunLoop {
   struct Fd { Linux::IEventHandler* h; int fd; };
   struct Timer { Linux::ITimerHandler* h; std::chrono::milliseconds every; Clock::time_point next; uint64_t gen; };
 
+ public:
+  /** An fd handler may be unregistered by an earlier callback in the same
+   *  poll round; it is kept alive by the round's reference but must not run. */
+  bool stillRegistered(Linux::IEventHandler* h) {
+    std::lock_guard<std::mutex> lock(m_);
+    for (auto& f : fds_)
+      if (f.h == h) return true;
+    return false;
+  }
+
+ private:
   bool stillRegistered(Linux::ITimerHandler* h, uint64_t gen) {
     std::lock_guard<std::mutex> lock(m_);
     for (auto& t : timers_)
@@ -569,7 +583,8 @@ void UiThread::pump() {
         (void)r;
       }
       for (size_t i = 0; i < handlers.size(); i++)
-        if (pfds[pluginBase + i].revents & (POLLIN | POLLHUP | POLLERR)) handlers[i]->onFDIsSet(pfds[pluginBase + i].fd);
+        if ((pfds[pluginBase + i].revents & (POLLIN | POLLHUP | POLLERR)) && runLoopImpl().stillRegistered(handlers[i]))
+          handlers[i]->onFDIsSet(pfds[pluginBase + i].fd);
     }
     for (auto* h : handlers) h->release();
   }

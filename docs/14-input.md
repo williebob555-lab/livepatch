@@ -797,3 +797,16 @@ injecting it cannot disturb the machine.
 Verified 2026-08-01: 7/7, including `fired=1` for an injected keystroke and a
 clean unregister (a stale global registration swallows that shortcut for every
 other app until reboot).
+
+### Linux (2026-10-08)
+
+- **Listening** on a Wayland session goes through the XDG GlobalShortcuts
+  portal (`--enable-features=GlobalShortcutsPortal`, set in `main.cjs`); KDE
+  Plasma asks the user to approve the bindings once. X11 grabs directly.
+- **Sending** uses `ydotool` (kernel uinput — the only injection path that
+  works on Wayland). `electron/keys.cjs` maps the Win32 VKs to evdev codes
+  (`EVDEV`; every VK in `VK` is mapped — checked). One process per keystroke
+  is fine here: fork+exec is ~1 ms. Needs `ydotoold` running; without
+  `ydotool` installed, `sendKey` returns false and stops retrying.
+
+The F13 smoke check above is Windows-only. Details: [`17-linux.md`](17-linux.md).

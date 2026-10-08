@@ -956,3 +956,24 @@ DPAPI rather than at the actual cause:
   build. Guard with `import.meta.url === pathToFileURL(process.argv[1]).href` —
   string-built `file:///` URLs do not match Node's escaping for a path with a
   space in it, which this repo's does have.
+
+## Linux (2026-10-08)
+
+| script | does |
+|--------|------|
+| `npm run build:audify:linux` | rebuild audify from source **with JACK**; fails if JACK is missing |
+| `npm run package:linux` | audify + vsthost + build + `bundle:node` + `electron-builder --linux` (AppImage + rpm) |
+| `npm run package:linux:dir` | same, unpacked (`release/linux-unpacked`) |
+| `npm run release:linux` | same as `package:linux`, plus uploads to GitHub Releases |
+
+Build on Linux, with an **official** Node (bundle-node refuses Fedora's
+libnode-linked `nodejs`). npm 11 skips unapproved install scripts, so run
+`node node_modules/electron/install.js` after `npm ci` — Electron's binary is
+otherwise never downloaded (this also bites Windows: `electronDist` then
+points at a missing `node_modules/electron/dist`).
+
+The node runtime moved from the top-level `extraResources` to `win:` /
+`linux:` (`node.exe` / `node`); verified 2026-10-08 that `release/win-unpacked/
+resources` still holds `node.exe` and `vsthost.node`. The rpm depends on
+library sonames, not package names. CI: `.github/workflows/linux.yml`.
+Details: [`17-linux.md`](17-linux.md).
