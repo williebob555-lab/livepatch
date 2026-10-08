@@ -7,7 +7,7 @@
 // compiled IR). See docs/07-ui.md.
 // ============================================================================
 import { registerBlock, ParamSpec } from '../core/registry';
-import { DRIVER_LABELS, PRO_API, SYS_API } from '../core/platform';
+import { DRIVER_LABELS, IS_LINUX, PRO_API, SYS_API } from '../core/platform';
 import { EQ_MAX_BANDS, EQ_TYPES, EQ_CHANNELS, EQ_MODES, EQ_DEF_FREQS } from '../ui/widgets';
 
 const knob = (id: string, name: string, min: number, max: number, def: number, opts: object = {}) => ({
@@ -30,7 +30,7 @@ registerBlock({
   title: 'Audio In',
   category: 'I/O & Hardware',
   group: 'Capture',
-  desc: 'Windows audio input — pick any capture device; rename the block to label it',
+  desc: `${IS_LINUX ? 'PipeWire' : 'Windows'} audio input — pick any capture device; rename the block to label it`,
   inputs: [],
   outputs: [{ id: 'out', name: 'out', kind: 'audio', dir: 'out' }],
   params: [
@@ -44,7 +44,7 @@ registerBlock({
   title: 'Audio Out',
   category: 'I/O & Hardware',
   group: 'Playback',
-  desc: 'Windows audio output — pick any playback device (native engine)',
+  desc: `${IS_LINUX ? 'PipeWire' : 'Windows'} audio output — pick any playback device (native engine)`,
   inputs: [{ id: 'in', name: 'in', kind: 'audio', dir: 'in' }],
   outputs: [],
   params: [

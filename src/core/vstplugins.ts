@@ -11,6 +11,7 @@
 // (`params.plugin`) carried alongside as the load hint — the UID is the stable
 // identity, the path can be re-resolved from this registry when it moves.
 // ============================================================================
+import { IS_LINUX } from './platform';
 
 export interface VstPluginRecord {
   cid: string;
@@ -58,7 +59,10 @@ interface Registry {
 }
 
 const KEY = 'livepatch.vstplugins.v1';
-export const DEFAULT_VST3_DIR = 'C:\\Program Files\\Common Files\\VST3';
+/** The Windows standard folder. Linux's standard folders live under $HOME and
+ *  /usr, which only the main process knows — it always adds every host default
+ *  itself (electron/platform.cjs defaultVstDirs), so this is empty there. */
+export const DEFAULT_VST3_DIR = IS_LINUX ? '' : 'C:\\Program Files\\Common Files\\VST3';
 
 const native = (window as any).livepatchNative as VstScanNative | undefined;
 
@@ -147,7 +151,7 @@ export async function scanVstPlugins(): Promise<string | null> {
   scanning = true;
   for (const cb of listeners) cb();
   try {
-    const res = await native.vstScan([DEFAULT_VST3_DIR, ...reg.extraDirs]);
+    const res = await native.vstScan([DEFAULT_VST3_DIR, ...reg.extraDirs].filter(Boolean));
     if (res.noHost) hostAvailable = false;
     else if (res.plugins) hostAvailable = true;
     if (res.error) return res.error;

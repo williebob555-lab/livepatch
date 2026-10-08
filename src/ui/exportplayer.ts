@@ -10,6 +10,7 @@
 // the warnings are shown before the write, not buried in a log after it.
 // ============================================================================
 import { buildModal } from './menus';
+import { IS_LINUX } from '../core/platform';
 import { doc } from '../core/graph';
 import { bakeScene, bakeWarnings, defaultChrome, formatBytes, PlayerChrome, BakeNote } from '../core/bake';
 
@@ -143,7 +144,9 @@ export async function doExportPlayer(): Promise<void> {
         r.kind === 'exe'
           ? `Wrote a standalone player — ${formatBytes(r.bytes)} — to ${r.path}`
           : `Wrote a player bundle (${formatBytes(r.bytes)}) to ${r.path}. ` +
-            `Build the exe template with "node scripts/build-player.mjs" to get a standalone .exe instead.`;
+            (IS_LINUX
+              ? 'The standalone player is a Windows .exe; on Linux the bundle is what exports.'
+              : `Build the exe template with "node scripts/build-player.mjs" to get a standalone .exe instead.`);
       go.textContent = 'Done';
       cancel.textContent = 'Close';
       cancel.disabled = false;

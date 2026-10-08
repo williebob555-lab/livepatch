@@ -1035,7 +1035,8 @@ app.whenReady().then(() => {
     // and identical for every scene; baking a second scene must copy a file and
     // write a tail, not re-run a build.
     const template = path.join(__dirname, '..', 'build', 'player', 'livepatch-player.exe');
-    const canExe = !!(opts && opts.singleExe) && fs.existsSync(template);
+    // The template is a Windows PE image; Linux always writes the bundle.
+    const canExe = platform.IS_WIN && !!(opts && opts.singleExe) && fs.existsSync(template);
     const ext = canExe ? 'exe' : 'lpplayer';
     const r = await dialog.showSaveDialog(win, {
       title: 'Export as Player',
