@@ -55,8 +55,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm ci
-          node node_modules/electron/install.js
+          npm ci 2>&1 | tee -a /tmp/ci.log
+          # Electron's download is the flaky part of a fresh install; retry it.
+          for i in 1 2 3; do node node_modules/electron/install.js 2>&1 | tee -a /tmp/ci.log && break; sleep 10; done
+          test -d node_modules/electron/dist
 
       - name: Typecheck
         run: npm run typecheck
