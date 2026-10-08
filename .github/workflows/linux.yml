@@ -75,16 +75,6 @@ jobs:
       - name: Native smoke test
         run: node scripts/native-smoke.mjs 2>&1 | tee -a /tmp/ci.log
 
-      - name: Engine regression tests (hardware-free)
-        run: |
-          fails=0
-          run() { echo "== $*" >> /tmp/ci.log; if ! "$@" >> /tmp/ci.log 2>&1; then echo "TESTFAIL $*" | tee -a /tmp/ci.log; fails=$((fails+1)); fi; }
-          run node --expose-gc scripts/audio-alloc-test.cjs
-          run node scripts/cv-indicator-test.mjs
-          run node scripts/web-parity-test.mjs
-          for t in scripts/*-kernel-test.cjs; do run node "$t"; done
-          [ "$fails" -eq 0 ]
-
       - name: Package (AppImage + rpm)
         run: |
           npm run bundle:node 2>&1 | tee -a /tmp/ci.log
@@ -97,6 +87,20 @@ jobs:
             release/*.AppImage
             release/*.rpm
           if-no-files-found: error
+
+      # After packaging, so a regression still fails the run (red) but cannot
+      # withhold the downloadable build. tempo-kernel-test's heapUsed check is
+      # known-fragile (docs/10-performance.md: before/after heapUsed cannot see
+      # boxing reliably) and fails intermittently on CI with code that is fine.
+      - name: Engine regression tests (hardware-free)
+        run: |
+          fails=0
+          run() { echo "== $*" >> /tmp/ci.log; if ! "$@" >> /tmp/ci.log 2>&1; then echo "TESTFAIL $*" | tee -a /tmp/ci.log; fails=$((fails+1)); fi; }
+          run node --expose-gc scripts/audio-alloc-test.cjs
+          run node scripts/cv-indicator-test.mjs
+          run node scripts/web-parity-test.mjs
+          for t in scripts/*-kernel-test.cjs; do run node "$t"; done
+          [ "$fails" -eq 0 ]
 
       # Job logs need a signed-in GitHub user to download, annotations do not.
       # On failure, publish the tail of the build output as one annotation so

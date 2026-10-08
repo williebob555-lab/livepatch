@@ -31,7 +31,37 @@ To hot-reload inside Electron: `npm run dev` in one terminal, then
 ### Linux (Fedora KDE)
 
 Same app; ASIO's role is played by JACK and Windows audio's by PipeWire, and
-scenes open on either platform unchanged. On Linux the native pieces must be
+scenes open on either platform unchanged.
+
+#### Install on Fedora (prebuilt)
+
+Every push to `main` or a `linux-*` branch builds Linux packages in CI
+(`.github/workflows/linux.yml`). They are not GitHub Releases yet, so the
+in-app updater neither offers nor updates them.
+
+1. Open the repository's **Actions** tab → **Linux (Fedora)** → the newest run
+   with a green **Package** step, and download the **`livepatch-linux`**
+   artifact (signed in to GitHub). Unzip it.
+2. Install the rpm — dnf pulls in the PipeWire/JACK, PulseAudio, ALSA and X11
+   libraries the engine links against:
+   ```
+   sudo dnf install ./LivePatch-*.rpm
+   ```
+   Or run without installing: `chmod +x LivePatch-*.AppImage` and start it.
+3. For glitch-free audio under load, let your user raise audio priority
+   (Fedora's pipewire package grants the `pipewire` group real-time limits),
+   then **log out and back in**; `ulimit -r` should then print `95`:
+   ```
+   sudo usermod -aG pipewire $USER
+   ```
+4. Optional: the `key-out` block needs `ydotool` (`sudo dnf install ydotool`,
+   with `ydotoold` running); plugin editors stay above the app window when it
+   is started with `--ozone-platform=x11`. See
+   [`docs/17-linux.md`](docs/17-linux.md).
+
+#### Build from source
+
+On Linux the native pieces must be
 built locally once (npm 11 skips their install scripts, and audify's published
 Linux build lacks JACK):
 
